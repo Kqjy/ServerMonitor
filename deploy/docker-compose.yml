@@ -40,8 +40,8 @@ services:
       TRUST_PROXY_TLS: ${TRUST_PROXY_TLS:-}
       INSECURE_ALLOW_HTTP: ${INSECURE_ALLOW_HTTP:-}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
 
   backup:
     image: timescale/timescaledb:latest-pg16
