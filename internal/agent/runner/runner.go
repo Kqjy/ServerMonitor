@@ -1,0 +1,178 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/shirou/gopsutil/v4/host"
+
+	"servermonitor/internal/agent/collectors"
+	"servermonitor/internal/agent/config"
+	"servermonitor/internal/agent/transport"
+	"servermonitor/pkg/wire"
+)
+
+var ErrDeregistered = errors.New("host deregistered by server")
+
+const Version = "0.1.0"
+
+type Runner struct {
+	cfg        *config.Config
+	client     *transport.Client
+	logger     *slog.Logger
+	collectors []collectors.Collector
+	intervalCh chan time.Duration
+}
+
+func New(cfg *config.Config, client *transport.Client, logger *slog.Logger) *Runner {
+	return &Runner{
+		cfg:        cfg,
+		client:     client,
+		logger:     logger,
+		collectors: collectors.Filtered(cfg.Enabled, cfg.Disabled),
+		intervalCh: make(chan time.Duration, 1),
+	}
+}
+
+func (r *Runner) SetInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	select {
+	case r.intervalCh <- d:
+	default:
+	}
+}
+
+func (r *Runner) HostInfo() wire.HostInfo {
+	hn, _ := os.Hostname()
+	var kernel string
+	if info, err := host.Info(); err == nil {
+		kernel = info.KernelVersion
+	}
+	names := make([]string, 0, len(r.collectors))
+	for _, c := range r.collectors {
+		names = append(names, c.Name())
+	}
+	return wire.HostInfo{
+		Hostname:     hn,
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		Kernel:       kernel,
+		AgentVersion: Version,
+		Collectors:   names,
+		Tags:         r.cfg.Tags,
+	}
+}
+
+func (r *Runner) Run(ctx context.Context) error {
+	interval := r.cfg.Interval()
+	r.logger.Info("agent started",
+		"interval", interval,
+		"collectors", len(r.collectors),
+		"server", r.cfg.ServerURL)
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	dereg := r.client.Deregistered()
+
+	r.tick(ctx)
+	select {
+	case <-dereg:
+		return ErrDeregistered
+	default:
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-dereg:
+			return ErrDeregistered
+		case d := <-r.intervalCh:
+			if d != interval {
+				interval = d
+				t.Reset(d)
+				r.logger.Info("interval updated", "interval", d)
+			}
+		case <-t.C:
+			r.tick(ctx)
+			select {
+			case <-dereg:
+				return ErrDeregistered
+			default:
+			}
+		}
+	}
+}
+
+func (r *Runner) tick(ctx context.Context) {
+	batch := &wire.Batch{
+		Host: r.HostInfo(),
+		Sent: time.Now(),
+	}
+
+	tickCtx, cancel := context.WithTimeout(ctx, r.cfg.Interval()-100*time.Millisecond)
+	defer cancel()
+
+	var (
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		procs []wire.Process
+		conts []wire.Container
+	)
+
+	for _, c := range r.collectors {
+		wg.Add(1)
+		go func(col collectors.Collector) {
+			defer wg.Done()
+			points, err := col.Collect(tickCtx)
+			if err != nil {
+				r.logger.Warn("collector error", "name", col.Name(), "err", err)
+				return
+			}
+			mu.Lock()
+			batch.Points = append(batch.Points, points...)
+			mu.Unlock()
+
+			if pc, ok := col.(collectors.ProcessCollector); ok {
+				ps, err := pc.CollectProcesses(tickCtx, r.cfg.ProcessTopN)
+				if err != nil {
+					r.logger.Warn("collect processes", "err", err)
+				} else {
+					mu.Lock()
+					procs = append(procs, ps...)
+					mu.Unlock()
+				}
+			}
+			if cc, ok := col.(collectors.ContainerCollector); ok {
+				if cs, err := cc.CollectContainers(tickCtx); err == nil {
+					mu.Lock()
+					conts = append(conts, cs...)
+					mu.Unlock()
+				}
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	batch.Processes = procs
+	batch.Containers = conts
+
+	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 {
+		return
+	}
+
+	sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer sendCancel()
+	if err := r.client.Send(sendCtx, batch); err != nil {
+		r.logger.Error("send failed", "err", err, "points", len(batch.Points))
+		return
+	}
+	r.logger.Debug("send ok", "points", len(batch.Points), "procs", len(procs), "containers", len(conts))
+}

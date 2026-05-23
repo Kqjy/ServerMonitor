@@ -1,0 +1,58 @@
+@import 'tailwindcss';
+@import 'uplot/dist/uPlot.min.css';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-bg: oklch(0.16 0 0);
+  --color-surface: oklch(0.2 0 0);
+  --color-border: oklch(0.27 0 0);
+  --color-text: oklch(0.93 0 0);
+  --color-muted: oklch(0.64 0 0);
+  --color-good: oklch(0.78 0.16 162);
+  --color-warn: oklch(0.83 0.18 85);
+  --color-bad: oklch(0.7 0.21 22);
+  --color-accent: oklch(0.7 0.18 240);
+}
+
+html, body { font-feature-settings: 'cv11', 'ss01', 'ss03'; }
+html { -webkit-text-size-adjust: 100%; }
+
+.numeric { font-variant-numeric: tabular-nums; }
+
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+.scroll-shadow-x {
+  background:
+    linear-gradient(to right, var(--color-bg) 0%, transparent 16px),
+    linear-gradient(to left, var(--color-bg) 0%, transparent 16px),
+    radial-gradient(farthest-side at 0 50%, oklch(0 0 0 / 0.4), transparent),
+    radial-gradient(farthest-side at 100% 50%, oklch(0 0 0 / 0.4), transparent);
+  background-position: 0 0, 100% 0, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  background-size: 24px 100%, 24px 100%, 12px 100%, 12px 100%;
+  background-attachment: local, local, scroll, scroll;
+}
+
+.uplot,
+.uplot *,
+.uplot *::before,
+.uplot *::after { box-sizing: border-box; }
+
+.uplot .u-axis { color: oklch(0.64 0 0); }
+.uplot .u-legend { color: oklch(0.83 0 0); font-family: var(--font-mono); font-size: 11px; }
+.uplot .u-cursor-x, .uplot .u-cursor-y { background: oklch(0.93 0 0); opacity: 0.25; }
+.uplot .u-select { background: oklch(0.7 0.18 240 / 0.16); border-left: 1px solid oklch(0.7 0.18 240 / 0.6); border-right: 1px solid oklch(0.7 0.18 240 / 0.6); }
+
+::selection { background: oklch(0.55 0.18 240 / 0.4); }
+
+.shimmer {
+  background: linear-gradient(90deg, transparent, oklch(0.27 0 0 / 0.6), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}

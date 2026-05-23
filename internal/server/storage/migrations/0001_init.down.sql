@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS archive_manifests;
+DROP TABLE IF EXISTS dashboards;
+DROP TABLE IF EXISTS alert_history;
+DROP TABLE IF EXISTS alert_states;
+DROP TABLE IF EXISTS alert_rules;
+DROP TABLE IF EXISTS notification_channels;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS containers;
+DROP TABLE IF EXISTS processes;
+DROP MATERIALIZED VIEW IF EXISTS metric_points_5m;
+DROP TABLE IF EXISTS metric_points;
+DROP TABLE IF EXISTS hosts;
