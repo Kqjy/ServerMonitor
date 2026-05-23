@@ -21,10 +21,11 @@ import (
 )
 
 type Config struct {
-	Bucket string
-	Region string
-	Prefix string
-	Cutoff time.Duration
+	Bucket        string
+	Region        string
+	Prefix        string
+	Cutoff        time.Duration
+	UsePathStyle  bool
 }
 
 type Archiver struct {
@@ -61,11 +62,15 @@ func New(pool *pgxpool.Pool, cfg Config, logger *slog.Logger) (*Archiver, error)
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
+	s3Opts := []func(*s3.Options){}
+	if cfg.UsePathStyle {
+		s3Opts = append(s3Opts, func(o *s3.Options) { o.UsePathStyle = true })
+	}
 	return &Archiver{
 		pool:   pool,
 		cfg:    cfg,
 		logger: logger,
-		s3:     s3.NewFromConfig(awsCfg),
+		s3:     s3.NewFromConfig(awsCfg, s3Opts...),
 	}, nil
 }
 

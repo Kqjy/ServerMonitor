@@ -18,6 +18,7 @@ type Config struct {
 	S3Bucket             string
 	S3Region             string
 	S3Prefix             string
+	S3UsePathStyle       bool
 	IngestRateLimit      int
 	IngestBurst          int
 	BatcherMaxRows       int
@@ -47,6 +48,7 @@ func Load() (*Config, error) {
 		S3Bucket:             getenv("S3_BUCKET", ""),
 		S3Region:             getenv("S3_REGION", ""),
 		S3Prefix:             getenv("S3_PREFIX", "metrics"),
+		S3UsePathStyle:       getenvBool("S3_USE_PATH_STYLE", false),
 		IngestRateLimit:      getenvInt("INGEST_RATE_LIMIT", 10),
 		IngestBurst:          getenvInt("INGEST_BURST", 30),
 		BatcherMaxRows:       getenvInt("BATCHER_MAX_ROWS", 50000),

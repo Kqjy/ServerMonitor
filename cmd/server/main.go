@@ -104,9 +104,10 @@ func main() {
 	var archiveScheduler *tasks.ArchiveScheduler
 	if cfg.S3Bucket != "" {
 		archiver, err = archive.New(db.Pool, archive.Config{
-			Bucket: cfg.S3Bucket,
-			Region: cfg.S3Region,
-			Prefix: cfg.S3Prefix,
+			Bucket:       cfg.S3Bucket,
+			Region:       cfg.S3Region,
+			Prefix:       cfg.S3Prefix,
+			UsePathStyle: cfg.S3UsePathStyle,
 		}, logger)
 		if err != nil {
 			logger.Warn("archive disabled", "err", err)
