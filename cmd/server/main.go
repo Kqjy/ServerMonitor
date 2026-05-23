@@ -144,6 +144,7 @@ func main() {
 		WebHandler:     webHandler,
 		TrustedProxies: cfg.TrustedProxies,
 		SecureCookies:  cfg.SecureBrowserSide(),
+		TrustProxyTLS:  cfg.TrustProxyTLS,
 		Retention: api.RetentionConfig{
 			Raw:               cfg.RetentionRaw,
 			Aggregate5m:       cfg.RetentionAggregate5m,

@@ -77,9 +77,9 @@ func downloadAgentHandler(hosts *storage.Hosts) http.HandlerFunc {
 	}
 }
 
-func installScriptHandler(kind string, trusted []*net.IPNet) http.HandlerFunc {
+func installScriptHandler(kind string, trusted []*net.IPNet, trustProxyTLS bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		serverURL := canonicalServerURL(r, trusted)
+		serverURL := canonicalServerURL(r, trusted, trustProxyTLS)
 		var body string
 		switch kind {
 		case "sh":
@@ -103,22 +103,23 @@ type serverInfoDTO struct {
 	Hostname string `json:"hostname,omitempty"`
 }
 
-func serverInfoHandler(version string, trusted []*net.IPNet) http.HandlerFunc {
+func serverInfoHandler(version string, trusted []*net.IPNet, trustProxyTLS bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, serverInfoDTO{
-			URL:     canonicalServerURL(r, trusted),
+			URL:     canonicalServerURL(r, trusted, trustProxyTLS),
 			Version: version,
 		})
 	}
 }
 
-func canonicalServerURL(r *http.Request, trusted []*net.IPNet) string {
+func canonicalServerURL(r *http.Request, trusted []*net.IPNet, trustProxyTLS bool) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
 	host := r.Host
-	if len(trusted) > 0 && ipInNets(net.ParseIP(remoteIP(r)), trusted) {
+	trustForwarded := trustProxyTLS || (len(trusted) > 0 && ipInNets(net.ParseIP(remoteIP(r)), trusted))
+	if trustForwarded {
 		if v := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); v != "" {
 			if i := strings.Index(v, ","); i >= 0 {
 				v = strings.TrimSpace(v[:i])

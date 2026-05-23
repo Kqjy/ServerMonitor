@@ -37,6 +37,7 @@ type Deps struct {
 	Retention      RetentionConfig
 	TrustedProxies []*net.IPNet
 	SecureCookies  bool
+	TrustProxyTLS  bool
 }
 
 func New(d Deps) *Router {
@@ -51,13 +52,13 @@ func New(d Deps) *Router {
 	timeout := middleware.Timeout(30 * time.Second)
 
 	r.Get("/healthz", healthHandler)
-	r.With(timeout).Get("/install.sh", installScriptHandler("sh", d.TrustedProxies))
-	r.With(timeout).Get("/install.ps1", installScriptHandler("ps1", d.TrustedProxies))
+	r.With(timeout).Get("/install.sh", installScriptHandler("sh", d.TrustedProxies, d.TrustProxyTLS))
+	r.With(timeout).Get("/install.ps1", installScriptHandler("ps1", d.TrustedProxies, d.TrustProxyTLS))
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.With(timeout).Get("/auth/status", authStatusHandler(d.Auth))
 		r.With(timeout).Get("/agent/binary", downloadAgentHandler(d.Hosts))
-		r.With(timeout).Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies))
+		r.With(timeout).Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies, d.TrustProxyTLS))
 		r.Group(func(r chi.Router) {
 			r.Use(timeout)
 			r.Use(authRateLimiter(d.TrustedProxies))
