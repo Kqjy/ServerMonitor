@@ -58,7 +58,6 @@ func New(d Deps) *Router {
 	r.Route("/api/v1", func(r chi.Router) {
 		r.With(timeout).Get("/auth/status", authStatusHandler(d.Auth))
 		r.With(timeout).Get("/agent/binary", downloadAgentHandler(d.Hosts))
-		r.With(timeout).Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies, d.TrustProxyTLS))
 		r.Group(func(r chi.Router) {
 			r.Use(timeout)
 			r.Use(authRateLimiter(d.TrustedProxies))
@@ -87,6 +86,7 @@ func New(d Deps) *Router {
 				r.Post("/auth/password", changePasswordHandler(d.Auth, d.SecureCookies))
 				r.Post("/admin/hosts", registerHostHandler(d.Hosts))
 				r.Patch("/admin/hosts/{id}", updateHostHandler(d.DB, d.Hosts))
+				r.Post("/admin/hosts/{id}/upgrade", requestHostUpgradeHandler(d.DB, d.Hosts))
 				r.Delete("/admin/hosts/{id}", deleteHostHandler(d.Hosts))
 				r.Get("/hosts", listHostsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}", getHostHandler(d.DB, d.Hosts))
@@ -100,6 +100,7 @@ func New(d Deps) *Router {
 				r.Get("/stats", statsHandler(d.Batcher))
 				r.Get("/retention", retentionHandler(d.Retention))
 				r.Get("/agent/platforms", listPlatformsHandler())
+				r.Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies, d.TrustProxyTLS))
 
 				r.Get("/alerts", listAlertRulesHandler(d.DB.Pool))
 				r.Post("/alerts", createAlertRuleHandler(d.DB.Pool))

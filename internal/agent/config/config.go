@@ -9,18 +9,19 @@ import (
 )
 
 type Config struct {
-	ServerURL      string        `toml:"server_url"`
-	Token          string        `toml:"token"`
-	IntervalS      int           `toml:"interval_s"`
-	Enabled        []string      `toml:"enabled"`
-	Disabled       []string      `toml:"disabled"`
-	ProcessTopN    int           `toml:"process_top_n"`
-	BatchMaxAgeS   int           `toml:"batch_max_age_s"`
-	BatchMaxPoints int           `toml:"batch_max_points"`
-	SpoolPath      string        `toml:"spool_path"`
-	SpoolMaxBytes  int64         `toml:"spool_max_bytes"`
-	HTTPTimeout    time.Duration `toml:"http_timeout"`
-	InsecureSkip   bool          `toml:"insecure_skip_verify"`
+	ServerURL      string            `toml:"server_url"`
+	Token          string            `toml:"token"`
+	IntervalS      int               `toml:"interval_s"`
+	Enabled        []string          `toml:"enabled"`
+	Disabled       []string          `toml:"disabled"`
+	ProcessTopN    int               `toml:"process_top_n"`
+	BatchMaxAgeS   int               `toml:"batch_max_age_s"`
+	BatchMaxPoints int               `toml:"batch_max_points"`
+	SpoolPath      string            `toml:"spool_path"`
+	SpoolMaxBytes  int64             `toml:"spool_max_bytes"`
+	HTTPTimeout    time.Duration     `toml:"http_timeout"`
+	InsecureSkip   bool              `toml:"insecure_skip_verify"`
+	AutoUpgrade    *bool             `toml:"auto_upgrade"`
 	Tags           map[string]string `toml:"tags"`
 }
 
@@ -54,6 +55,13 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) Interval() time.Duration {
 	return time.Duration(c.IntervalS) * time.Second
+}
+
+func (c *Config) AutoUpgradeEnabled() bool {
+	if c.AutoUpgrade == nil {
+		return true
+	}
+	return *c.AutoUpgrade
 }
 
 func (c *Config) BatchMaxAge() time.Duration {

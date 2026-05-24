@@ -32,6 +32,14 @@ type Client struct {
 	intervalCh       chan int
 	appliedMu        sync.Mutex
 	appliedIntervalS int
+
+	controlCh chan ControlUpdate
+}
+
+type ControlUpdate struct {
+	LatestVersion string
+	AutoUpgrade   *bool
+	UpgradeNow    bool
 }
 
 var ErrDeregistered = errors.New("host deregistered by server")
@@ -51,7 +59,12 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 		spool:          sp,
 		deregisteredCh: make(chan struct{}),
 		intervalCh:     make(chan int, 1),
+		controlCh:      make(chan ControlUpdate, 1),
 	}
+}
+
+func (c *Client) ControlUpdates() <-chan ControlUpdate {
+	return c.controlCh
 }
 
 func (c *Client) IntervalUpdates() <-chan int {
@@ -172,7 +185,10 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 		ackBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_, _ = io.Copy(io.Discard, resp.Body)
 		var ack struct {
-			IntervalS int `json:"interval_s"`
+			IntervalS          int    `json:"interval_s"`
+			LatestAgentVersion string `json:"latest_agent_version"`
+			AutoUpgrade        *bool  `json:"auto_upgrade"`
+			UpgradeNow         bool   `json:"upgrade_now"`
 		}
 		if len(ackBytes) > 0 {
 			_ = json.Unmarshal(ackBytes, &ack)
@@ -187,6 +203,25 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 			if ack.IntervalS != cur {
 				select {
 				case c.intervalCh <- ack.IntervalS:
+				default:
+				}
+			}
+		}
+		if ack.LatestAgentVersion != "" || ack.UpgradeNow || ack.AutoUpgrade != nil {
+			upd := ControlUpdate{
+				LatestVersion: ack.LatestAgentVersion,
+				AutoUpgrade:   ack.AutoUpgrade,
+				UpgradeNow:    ack.UpgradeNow,
+			}
+			select {
+			case c.controlCh <- upd:
+			default:
+				select {
+				case <-c.controlCh:
+				default:
+				}
+				select {
+				case c.controlCh <- upd:
 				default:
 				}
 			}

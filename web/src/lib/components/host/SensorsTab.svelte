@@ -67,6 +67,7 @@
       chartZoom = null;
       frozenWindow = null;
       loading = true;
+      temps = [];
     }
     prevRange = current;
   });
@@ -96,6 +97,9 @@
   function handleReset() {
     chartZoom = null;
     frozenWindow = null;
+    const b = rangeBoundsMs(range);
+    fromMs = b.fromMs;
+    toMs = b.toMs;
   }
 </script>
 

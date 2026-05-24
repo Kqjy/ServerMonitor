@@ -57,10 +57,13 @@ type Batch struct {
 }
 
 type IngestAck struct {
-	Accepted  int    `json:"accepted"`
-	HostID    int64  `json:"host_id"`
-	Message   string `json:"message,omitempty"`
-	IntervalS int    `json:"interval_s,omitempty"`
+	Accepted           int    `json:"accepted"`
+	HostID             int64  `json:"host_id"`
+	Message            string `json:"message,omitempty"`
+	IntervalS          int    `json:"interval_s,omitempty"`
+	LatestAgentVersion string `json:"latest_agent_version,omitempty"`
+	AutoUpgrade        *bool  `json:"auto_upgrade,omitempty"`
+	UpgradeNow         bool   `json:"upgrade_now,omitempty"`
 }
 
 type RegisterRequest struct {

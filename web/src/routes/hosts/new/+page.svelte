@@ -26,6 +26,12 @@
   let poll: ReturnType<typeof setInterval> | null = null;
   let copied = $state<string | null>(null);
 
+  let enableDocker = $state(false);
+  let enableSmart = $state(false);
+  let enableGpu = $state(false);
+  let enableNetwork = $state(false);
+  let adminService = $state(false);
+
   async function loadMeta() {
     try {
       const [ps, info] = await Promise.all([api.agentPlatforms(), api.serverInfo()]);
@@ -89,12 +95,20 @@
 
   const baseUrl = $derived(serverInfo?.url ?? (typeof window !== 'undefined' ? window.location.origin : ''));
 
-  const shellOneLiner = $derived(
-    `SM_INTERVAL=${interval} sudo --preserve-env=SM_INTERVAL bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
-  );
-  const pwshOneLiner = $derived(
-    `$env:SM_INTERVAL="${interval}"; iex (iwr -useb ${baseUrl}/install.ps1).Content`
-  );
+  const shellOneLiner = $derived.by(() => {
+    const vars = [`SM_INTERVAL=${interval}`];
+    if (enableDocker)  vars.push('SM_ENABLE_DOCKER=1');
+    if (enableSmart)   vars.push('SM_ENABLE_SMART=1');
+    if (enableGpu)     vars.push('SM_ENABLE_GPU=1');
+    if (enableNetwork) vars.push('SM_ENABLE_NETWORK=1');
+    const preserve = vars.map((v) => v.split('=')[0]).join(',');
+    return `${vars.join(' ')} sudo --preserve-env=${preserve} bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
+  });
+  const pwshOneLiner = $derived.by(() => {
+    const parts = [`$env:SM_INTERVAL="${interval}"`];
+    if (adminService) parts.push('$env:SM_ADMIN_SERVICE="1"');
+    return `${parts.join('; ')}; iex (iwr -useb ${baseUrl}/install.ps1).Content`;
+  });
 
   const tomlSnippet = $derived(
     `server_url = "${baseUrl}"
@@ -286,6 +300,14 @@ Lock-Path $cfg
               {/each}
             </div>
           {:else if active.startsWith('windows')}
+            <div class="space-y-2 pb-3 border-b border-zinc-800/60">
+              <div class="text-[11px] uppercase tracking-wider text-zinc-500">Optional capabilities</div>
+              <p class="text-[11px] text-zinc-600 -mt-1">Off by default. Default install runs as a virtual <span class="font-mono">NT SERVICE\sm-agent</span> account.</p>
+              <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                <input type="checkbox" bind:checked={adminService} class="mt-0.5 accent-emerald-500" />
+                <span><span class="text-zinc-100">Admin service</span> <span class="text-zinc-500">— runs as <span class="font-mono">LocalSystem</span> (needed for SMART and full process visibility)</span></span>
+              </label>
+            </div>
             <p class="text-xs text-zinc-500">Open PowerShell as Administrator on <span class="font-mono text-zinc-300">{platformLabel(active)}</span> and paste — the installer will prompt for the token shown above:</p>
             <div class="relative">
               <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200">{pwshOneLiner}</pre>
@@ -300,6 +322,28 @@ Lock-Path $cfg
               </div>
             </details>
           {:else}
+            {#if active.startsWith('linux')}
+              <div class="space-y-2 pb-3 border-b border-zinc-800/60">
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Optional capabilities</div>
+                <p class="text-[11px] text-zinc-600 -mt-1">Off by default. Each grants extra privilege to <span class="font-mono">sm-agent</span> for that collector.</p>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enableDocker} class="mt-0.5 accent-emerald-500" />
+                  <span><span class="text-zinc-100">Docker containers</span> <span class="text-zinc-500">— joins <span class="font-mono">docker</span> group (effectively root on host)</span></span>
+                </label>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enableSmart} class="mt-0.5 accent-emerald-500" />
+                  <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— joins <span class="font-mono">disk</span> group + grants <span class="font-mono">CAP_SYS_RAWIO</span></span></span>
+                </label>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enableGpu} class="mt-0.5 accent-emerald-500" />
+                  <span><span class="text-zinc-100">GPU (nvidia)</span> <span class="text-zinc-500">— joins <span class="font-mono">video</span> group</span></span>
+                </label>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enableNetwork} class="mt-0.5 accent-emerald-500" />
+                  <span><span class="text-zinc-100">Privileged network</span> <span class="text-zinc-500">— grants <span class="font-mono">CAP_NET_ADMIN</span> + <span class="font-mono">CAP_NET_RAW</span></span></span>
+                </label>
+              </div>
+            {/if}
             <p class="text-xs text-zinc-500">SSH to <span class="font-mono text-zinc-300">{platformLabel(active)}</span> and run — the installer will prompt for the token shown above:</p>
             <div class="relative">
               <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200">{shellOneLiner}</pre>

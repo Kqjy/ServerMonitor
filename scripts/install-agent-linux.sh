@@ -106,6 +106,8 @@ install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
 
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
+install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
+install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
 
 ARGS=(--server "$SERVER_URL" --interval "$INTERVAL")
 [[ -n "$HOSTNAME_OVERRIDE" ]] && ARGS+=(--hostname "$HOSTNAME_OVERRIDE")
@@ -131,9 +133,11 @@ Type=simple
 User=sm-agent
 Group=sm-agent
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/local/bin/sm-agent --config /etc/servermonitor/agent.toml
-Restart=on-failure
+ExecStart=/opt/servermonitor/sm-agent --config /etc/servermonitor/agent.toml
+Restart=always
 RestartSec=5
+SuccessExitStatus=78 75
+RestartPreventExitStatus=78
 LimitNOFILE=4096
 
 AmbientCapabilities=$CAPS
@@ -142,7 +146,7 @@ CapabilityBoundingSet=$CAPS
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/servermonitor /var/lib/servermonitor
+ReadWritePaths=/etc/servermonitor /var/lib/servermonitor /opt/servermonitor
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

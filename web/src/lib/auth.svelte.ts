@@ -6,10 +6,12 @@ type Status = 'unknown' | 'needs-setup' | 'guest' | 'authed';
 class AuthState {
   user = $state<Me | null>(null);
   status = $state<Status>('unknown');
+  serverVersion = $state<string>('');
 
   async refresh(): Promise<Status> {
     try {
       const s = await api.authStatus();
+      if (s.version) this.serverVersion = s.version;
       if (!s.initialized) {
         this.user = null;
         this.status = 'needs-setup';

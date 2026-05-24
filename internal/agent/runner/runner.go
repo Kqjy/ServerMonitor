@@ -14,12 +14,13 @@ import (
 	"servermonitor/internal/agent/collectors"
 	"servermonitor/internal/agent/config"
 	"servermonitor/internal/agent/transport"
+	"servermonitor/pkg/version"
 	"servermonitor/pkg/wire"
 )
 
 var ErrDeregistered = errors.New("host deregistered by server")
 
-const Version = "0.1.0"
+const Version = version.Version
 
 type Runner struct {
 	cfg        *config.Config

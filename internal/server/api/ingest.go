@@ -13,6 +13,7 @@ import (
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
+	"servermonitor/pkg/version"
 	"servermonitor/pkg/wire"
 )
 
@@ -132,11 +133,22 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, logger
 		hub.Broadcast(hostID, batch.Points)
 
 		ack := wire.IngestAck{
-			Accepted: len(batch.Points),
-			HostID:   hostID,
+			Accepted:           len(batch.Points),
+			HostID:             hostID,
+			LatestAgentVersion: version.Version,
 		}
-		if host, hErr := hosts.Get(r.Context(), hostID); hErr == nil && host.SampleIntervalS > 0 {
-			ack.IntervalS = host.SampleIntervalS
+		if host, hErr := hosts.Get(r.Context(), hostID); hErr == nil {
+			if host.SampleIntervalS > 0 {
+				ack.IntervalS = host.SampleIntervalS
+			}
+			auto := host.AutoUpgrade
+			ack.AutoUpgrade = &auto
+			if host.UpgradeRequestedAt != nil && version.IsNewer(version.Version, batch.Host.AgentVersion) {
+				ack.UpgradeNow = true
+				if clrErr := hosts.ClearUpgradeRequest(r.Context(), hostID); clrErr != nil {
+					logger.Warn("clear upgrade request", "host", hostID, "err", clrErr)
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, ack)
 	}

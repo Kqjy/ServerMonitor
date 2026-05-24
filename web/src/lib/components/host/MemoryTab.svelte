@@ -89,6 +89,11 @@
       chartZoom = null;
       frozenWindow = null;
       loading = true;
+      used = [];
+      cached = [];
+      buffers = [];
+      free = [];
+      swapUsed = [];
     }
     prevRange = current;
   });
@@ -119,6 +124,9 @@
   function handleReset() {
     chartZoom = null;
     frozenWindow = null;
+    const b = rangeBoundsMs(range);
+    fromMs = b.fromMs;
+    toMs = b.toMs;
   }
 </script>
 

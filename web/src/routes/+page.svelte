@@ -135,13 +135,20 @@
            class="group rounded-lg border border-zinc-800 hover:border-zinc-700 bg-zinc-900/40 hover:bg-zinc-900/70 p-4 transition-colors block">
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <StatusDot status={s} />
                 <span class="font-medium text-zinc-100 truncate">{h.hostname}</span>
                 {#if firing > 0}
                   <span class="shrink-0 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider tabular-nums {severityClass(h.firing_severity ?? '', 'chip')}">
                     <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
                     {firing} {firing === 1 ? 'alert' : 'alerts'}
+                  </span>
+                {/if}
+                {#if h.update_available}
+                  <span class="shrink-0 inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 text-sky-300 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider tabular-nums"
+                        title={h.latest_agent_version ? `agent ${h.agent_version ?? '?'} → ${h.latest_agent_version}` : 'agent update available'}>
+                    <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+                    update
                   </span>
                 {/if}
               </div>

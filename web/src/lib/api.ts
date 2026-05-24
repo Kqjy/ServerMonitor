@@ -5,6 +5,11 @@ export interface Host {
   arch?: string;
   kernel?: string;
   agent_version?: string;
+  latest_agent_version?: string;
+  update_available?: boolean;
+  auto_upgrade: boolean;
+  supports_remote_upgrade: boolean;
+  upgrade_pending?: boolean;
   sample_interval_s: number;
   enabled_collectors?: string[];
   tags?: Record<string, string>;
@@ -133,6 +138,7 @@ export interface IngestStats {
 
 export interface AuthStatus {
   initialized: boolean;
+  version?: string;
 }
 
 export interface AgentPlatform {
@@ -334,12 +340,14 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostname, sample_interval_s })
     }),
-  updateHost: (id: number, patch: { hostname?: string; sample_interval_s?: number }) =>
+  updateHost: (id: number, patch: { hostname?: string; sample_interval_s?: number; auto_upgrade?: boolean }) =>
     request<Host>(`/api/v1/admin/hosts/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch)
     }),
+  requestHostUpgrade: (id: number) =>
+    request<Host>(`/api/v1/admin/hosts/${id}/upgrade`, { method: 'POST' }),
   deleteHost: (id: number) =>
     request<void>(`/api/v1/admin/hosts/${id}`, { method: 'DELETE' }),
   agentPlatforms: () => request<AgentPlatform[]>('/api/v1/agent/platforms'),

@@ -101,6 +101,14 @@
       chartZoom = null;
       frozenWindow = null;
       loading = true;
+      rx = [];
+      tx = [];
+      rxPkts = [];
+      txPkts = [];
+      rxErr = [];
+      txErr = [];
+      rxDrop = [];
+      txDrop = [];
     }
     prevRange = current;
   });
@@ -130,6 +138,9 @@
   function handleReset() {
     chartZoom = null;
     frozenWindow = null;
+    const b = rangeBoundsMs(range);
+    fromMs = b.fromMs;
+    toMs = b.toMs;
   }
 
   function lastSum(entries: SeriesEntry[]): number {

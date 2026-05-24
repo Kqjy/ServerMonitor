@@ -18,36 +18,56 @@ import (
 	"servermonitor/internal/server/alerting"
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/metrics"
+	"servermonitor/pkg/version"
 )
 
 type hostDTO struct {
-	ID                int64             `json:"id"`
-	Hostname          string            `json:"hostname"`
-	OS                string            `json:"os,omitempty"`
-	Arch              string            `json:"arch,omitempty"`
-	Kernel            string            `json:"kernel,omitempty"`
-	AgentVersion      string            `json:"agent_version,omitempty"`
-	SampleIntervalS   int               `json:"sample_interval_s"`
-	EnabledCollectors []string          `json:"enabled_collectors,omitempty"`
-	Tags              map[string]string `json:"tags,omitempty"`
-	LastSeenISO       string            `json:"last_seen,omitempty"`
-	CreatedAtISO      string            `json:"created_at"`
-	FiringAlerts      int               `json:"firing_alerts,omitempty"`
-	FiringSeverity    string            `json:"firing_severity,omitempty"`
+	ID                    int64             `json:"id"`
+	Hostname              string            `json:"hostname"`
+	OS                    string            `json:"os,omitempty"`
+	Arch                  string            `json:"arch,omitempty"`
+	Kernel                string            `json:"kernel,omitempty"`
+	AgentVersion          string            `json:"agent_version,omitempty"`
+	LatestAgentVersion    string            `json:"latest_agent_version,omitempty"`
+	UpdateAvailable       bool              `json:"update_available,omitempty"`
+	AutoUpgrade           bool              `json:"auto_upgrade"`
+	SupportsRemoteUpgrade bool              `json:"supports_remote_upgrade"`
+	UpgradePending        bool              `json:"upgrade_pending,omitempty"`
+	SampleIntervalS       int               `json:"sample_interval_s"`
+	EnabledCollectors     []string          `json:"enabled_collectors,omitempty"`
+	Tags                  map[string]string `json:"tags,omitempty"`
+	LastSeenISO           string            `json:"last_seen,omitempty"`
+	CreatedAtISO          string            `json:"created_at"`
+	FiringAlerts          int               `json:"firing_alerts,omitempty"`
+	FiringSeverity        string            `json:"firing_severity,omitempty"`
+}
+
+const minRemoteUpgradeVersion = "0.1.1"
+
+func supportsRemoteUpgrade(agentVersion string) bool {
+	if agentVersion == "" {
+		return false
+	}
+	return !version.IsNewer(minRemoteUpgradeVersion, agentVersion)
 }
 
 func toDTO(h storage.Host) hostDTO {
 	d := hostDTO{
-		ID:                h.ID,
-		Hostname:          h.Hostname,
-		OS:                h.OS,
-		Arch:              h.Arch,
-		Kernel:            h.Kernel,
-		AgentVersion:      h.AgentVersion,
-		SampleIntervalS:   h.SampleIntervalS,
-		EnabledCollectors: h.EnabledCollectors,
-		Tags:              h.Tags,
-		CreatedAtISO:      h.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		ID:                    h.ID,
+		Hostname:              h.Hostname,
+		OS:                    h.OS,
+		Arch:                  h.Arch,
+		Kernel:                h.Kernel,
+		AgentVersion:          h.AgentVersion,
+		LatestAgentVersion:    version.Version,
+		UpdateAvailable:       h.AgentVersion != "" && version.IsNewer(version.Version, h.AgentVersion),
+		AutoUpgrade:           h.AutoUpgrade,
+		SupportsRemoteUpgrade: supportsRemoteUpgrade(h.AgentVersion),
+		UpgradePending:        h.UpgradeRequestedAt != nil,
+		SampleIntervalS:       h.SampleIntervalS,
+		EnabledCollectors:     h.EnabledCollectors,
+		Tags:                  h.Tags,
+		CreatedAtISO:          h.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 	}
 	if h.LastSeen != nil {
 		d.LastSeenISO = h.LastSeen.UTC().Format("2006-01-02T15:04:05Z")
@@ -282,6 +302,7 @@ func registerHostHandler(hosts *storage.Hosts) http.HandlerFunc {
 type updateHostRequest struct {
 	Hostname        *string `json:"hostname,omitempty"`
 	SampleIntervalS *int    `json:"sample_interval_s,omitempty"`
+	AutoUpgrade     *bool   `json:"auto_upgrade,omitempty"`
 }
 
 func updateHostHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
@@ -314,6 +335,7 @@ func updateHostHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
 		if err := hosts.Update(r.Context(), id, storage.HostUpdate{
 			Hostname:        req.Hostname,
 			SampleIntervalS: req.SampleIntervalS,
+			AutoUpgrade:     req.AutoUpgrade,
 		}); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "host not found")
@@ -327,6 +349,50 @@ func updateHostHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
 			return
 		}
 		h, err := hosts.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		d := toDTO(h)
+		attachFiring(r.Context(), db.Pool, []*hostDTO{&d})
+		writeJSON(w, http.StatusOK, d)
+	}
+}
+
+func requestHostUpgradeHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		h, err := hosts.Get(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !supportsRemoteUpgrade(h.AgentVersion) {
+			writeError(w, http.StatusPreconditionFailed, "agent version "+h.AgentVersion+" does not support remote upgrade; manually re-install to "+minRemoteUpgradeVersion+" or later")
+			return
+		}
+		if !version.IsNewer(version.Version, h.AgentVersion) {
+			writeError(w, http.StatusConflict, "agent is already running the latest version")
+			return
+		}
+		if err := hosts.RequestUpgrade(r.Context(), id); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		h, err = hosts.Get(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

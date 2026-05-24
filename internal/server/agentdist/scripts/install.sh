@@ -82,7 +82,9 @@ done
 
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
+install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
 install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
+install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
 
 INSECURE_LINE=false
 [ "$INSECURE" = "1" ] && [ "$PERSIST_INSECURE" = "1" ] && INSECURE_LINE=true
@@ -100,7 +102,7 @@ chmod 0600 "$TMP_CFG"
 chown sm-agent:sm-agent "$TMP_CFG"
 mv -f "$TMP_CFG" /etc/servermonitor/agent.toml
 
-CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
+CAPS="CAP_DAC_READ_SEARCH"
 [ "$ENABLE_SMART" = "1" ]   && CAPS="$CAPS CAP_SYS_RAWIO"
 [ "$ENABLE_NETWORK" = "1" ] && CAPS="$CAPS CAP_NET_ADMIN CAP_NET_RAW"
 
@@ -115,9 +117,11 @@ Type=simple
 User=sm-agent
 Group=sm-agent
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/local/bin/sm-agent --config /etc/servermonitor/agent.toml
-Restart=on-failure
+ExecStart=/opt/servermonitor/sm-agent --config /etc/servermonitor/agent.toml
+Restart=always
 RestartSec=5
+SuccessExitStatus=78 75
+RestartPreventExitStatus=78
 LimitNOFILE=4096
 
 AmbientCapabilities=$CAPS
@@ -126,7 +130,7 @@ CapabilityBoundingSet=$CAPS
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/servermonitor /var/lib/servermonitor
+ReadWritePaths=/etc/servermonitor /var/lib/servermonitor /opt/servermonitor
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

@@ -125,6 +125,16 @@
       chartZoom = null;
       frozenWindow = null;
       loading = true;
+      cpu = [];
+      cpuUser = [];
+      cpuSystem = [];
+      cpuIowait = [];
+      cpuSteal = [];
+      cpuCores = [];
+      load1Series = [];
+      load5Series = [];
+      load15Series = [];
+      memPct = [];
     }
     prevRange = current;
   });
@@ -225,6 +235,9 @@
   function handleReset() {
     chartZoom = null;
     frozenWindow = null;
+    const b = rangeBoundsMs(range);
+    fromMs = b.fromMs;
+    toMs = b.toMs;
   }
 </script>
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"servermonitor/internal/server/auth"
+	"servermonitor/pkg/version"
 )
 
 const sessionCookie = auth.SessionCookie
@@ -24,7 +25,8 @@ type meResponse struct {
 }
 
 type statusResponse struct {
-	Initialized bool `json:"initialized"`
+	Initialized bool   `json:"initialized"`
+	Version     string `json:"version"`
 }
 
 func authStatusHandler(svc *auth.Service) http.HandlerFunc {
@@ -34,7 +36,7 @@ func authStatusHandler(svc *auth.Service) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, statusResponse{Initialized: has})
+		writeJSON(w, http.StatusOK, statusResponse{Initialized: has, Version: version.Version})
 	}
 }
 

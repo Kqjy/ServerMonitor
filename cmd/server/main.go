@@ -26,9 +26,10 @@ import (
 	"servermonitor/internal/server/storage"
 	"servermonitor/internal/server/tasks"
 	"servermonitor/internal/server/web"
+	"servermonitor/pkg/version"
 )
 
-const Version = "0.1.0"
+const Version = version.Version
 
 func main() {
 	if len(os.Args) > 1 {

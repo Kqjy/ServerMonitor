@@ -93,7 +93,5 @@
         </button>
       </form>
     </div>
-
-    <p class="mt-6 text-center text-[11px] text-zinc-600 numeric">v0.1.0</p>
   </div>
 </div>

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +25,8 @@ import (
 	"servermonitor/internal/agent/runner"
 	"servermonitor/internal/agent/spool"
 	"servermonitor/internal/agent/transport"
+	"servermonitor/internal/agent/upgrade"
+	"servermonitor/pkg/version"
 )
 
 func main() {
@@ -118,6 +121,78 @@ func main() {
 		}
 	}()
 
+	var upgradeStaged atomic.Bool
+	var upgradeInflight atomic.Bool
+	go func() {
+		var (
+			failedVersion string
+			failedCount   int
+			nextAttempt   time.Time
+		)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case upd, ok := <-client.ControlUpdates():
+				if !ok {
+					return
+				}
+				latest := upd.LatestVersion
+				if latest == "" || !version.IsNewer(latest, runner.Version) {
+					continue
+				}
+				autoUpgrade := cfg.AutoUpgradeEnabled()
+				if upd.AutoUpgrade != nil {
+					autoUpgrade = *upd.AutoUpgrade
+				}
+				forced := upd.UpgradeNow
+				if !autoUpgrade && !forced {
+					logger.Info("agent upgrade available (auto_upgrade=false; not applying)",
+						"current", runner.Version,
+						"latest", latest)
+					continue
+				}
+				if failedVersion != latest {
+					failedVersion = ""
+					failedCount = 0
+					nextAttempt = time.Time{}
+				}
+				if !forced && !nextAttempt.IsZero() && time.Now().Before(nextAttempt) {
+					continue
+				}
+				if !upgradeInflight.CompareAndSwap(false, true) {
+					continue
+				}
+				logger.Info("agent upgrade available, downloading",
+					"current", runner.Version,
+					"latest", latest,
+					"forced", forced)
+				err := upgrade.Run(ctx, upgrade.Options{
+					ServerURL:    cfg.ServerURL,
+					Token:        cfg.Token,
+					InsecureSkip: cfg.InsecureSkip,
+					Logger:       logger,
+				})
+				if err != nil {
+					failedVersion = latest
+					failedCount++
+					delay := upgradeBackoff(failedCount)
+					nextAttempt = time.Now().Add(delay)
+					logger.Error("agent upgrade failed",
+						"err", err,
+						"latest", latest,
+						"attempt", failedCount,
+						"retry_after", delay)
+					upgradeInflight.Store(false)
+					continue
+				}
+				upgradeStaged.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+
 	if err := r.Run(ctx); err != nil {
 		if errors.Is(err, runner.ErrDeregistered) {
 			logger.Error("host deregistered by server, agent shutting down",
@@ -135,9 +210,32 @@ func main() {
 		logger.Error("runner", "err", err)
 		os.Exit(1)
 	}
+	if upgradeStaged.Load() {
+		logger.Info("exiting for service manager to restart with upgraded binary",
+			"exit_code", exitCodeUpgrade)
+		os.Exit(exitCodeUpgrade)
+	}
 }
 
 const exitCodeDeregistered = 78
+const exitCodeUpgrade = 75
+
+func upgradeBackoff(attempt int) time.Duration {
+	const base = time.Minute
+	const ceiling = time.Hour
+	if attempt < 1 {
+		return base
+	}
+	shift := attempt - 1
+	if shift > 30 {
+		return ceiling
+	}
+	d := base << shift
+	if d <= 0 || d > ceiling {
+		return ceiling
+	}
+	return d
+}
 
 func deregisteredSentinelPath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "deregistered")

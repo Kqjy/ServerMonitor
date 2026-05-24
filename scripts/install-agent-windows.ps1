@@ -88,14 +88,20 @@ function Lock-Acl {
 
 $installDir = Join-Path $env:ProgramFiles 'ServerMonitor'
 $configDir  = Join-Path $env:ProgramData 'ServerMonitor'
+$runtimeDir = Join-Path $configDir 'bin'
 if (-not (Test-Path $installDir)) { New-Item -ItemType Directory -Path $installDir | Out-Null }
 if (-not (Test-Path $configDir))  { New-Item -ItemType Directory -Path $configDir  | Out-Null }
+if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir | Out-Null }
 Lock-Acl -Path $installDir -ServiceAccess Read
 Lock-Acl -Path $configDir  -ServiceAccess Modify
+Lock-Acl -Path $runtimeDir -ServiceAccess Modify
 
-$exe = Join-Path $installDir 'sm-agent.exe'
+$exe        = Join-Path $installDir 'sm-agent.exe'
+$runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
 Copy-Item -Force -Path $BinaryPath -Destination $exe
-Lock-Acl -Path $exe -ServiceAccess Read
+Copy-Item -Force -Path $BinaryPath -Destination $runtimeExe
+Lock-Acl -Path $exe        -ServiceAccess Read
+Lock-Acl -Path $runtimeExe -ServiceAccess Modify
 
 $cfgPath = Join-Path $configDir 'agent.toml'
 
@@ -135,7 +141,7 @@ if ($svc) {
     Start-Sleep -Seconds 1
 }
 
-$bin = "`"$exe`" --config `"$cfgPath`""
+$bin = "`"$runtimeExe`" --config `"$cfgPath`""
 & sc.exe create sm-agent binPath= $bin start= auto obj= $svcAccount DisplayName= 'ServerMonitor Agent' | Out-Null
 & sc.exe description sm-agent 'Reports system metrics to ServerMonitor' | Out-Null
 & sc.exe failure sm-agent reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null

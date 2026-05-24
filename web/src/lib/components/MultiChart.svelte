@@ -65,6 +65,7 @@
   let suppressBroadcast = false;
   let lastAppliedFromS = 0;
   let lastAppliedToS = 0;
+  let lastHadData = false;
 
   function currentFromS(): number {
     return (fromMs ?? 0) / 1000;
@@ -210,10 +211,13 @@
       if (plot.width !== desiredW || plot.height !== height) {
         plot.setSize({ width: desiredW, height });
       }
-      const data = hasData(series)
+      const nowHasData = hasData(series);
+      const data = nowHasData
         ? alignData(series)
         : ([[], ...series.map(() => [])] as unknown as uPlot.AlignedData);
-      plot.setData(data, false);
+      const dataRefilled = nowHasData && !lastHadData;
+      plot.setData(data, dataRefilled);
+      lastHadData = nowHasData;
       if (targetFromS !== lastAppliedFromS || targetToS !== lastAppliedToS) {
         lastAppliedFromS = targetFromS;
         lastAppliedToS = targetToS;
@@ -223,6 +227,7 @@
       }
     } else if (hasData(series)) {
       build(alignData(series));
+      lastHadData = true;
     }
   });
 

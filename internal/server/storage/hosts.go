@@ -19,18 +19,20 @@ var (
 )
 
 type Host struct {
-	ID                int64
-	Hostname          string
-	OS                string
-	Arch              string
-	Kernel            string
-	AgentVersion      string
-	SampleIntervalS   int
-	EnabledCollectors []string
-	Tags              map[string]string
-	LastSeen          *time.Time
-	CreatedAt         time.Time
-	DeletedAt         *time.Time
+	ID                 int64
+	Hostname           string
+	OS                 string
+	Arch               string
+	Kernel             string
+	AgentVersion       string
+	SampleIntervalS    int
+	EnabledCollectors  []string
+	Tags               map[string]string
+	LastSeen           *time.Time
+	CreatedAt          time.Time
+	DeletedAt          *time.Time
+	AutoUpgrade        bool
+	UpgradeRequestedAt *time.Time
 }
 
 func tokenHash(token string) []byte {
@@ -81,18 +83,20 @@ func (h *Hosts) Register(ctx context.Context, hostname, token string, intervalS 
 type HostUpdate struct {
 	Hostname        *string
 	SampleIntervalS *int
+	AutoUpgrade     *bool
 }
 
 func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
-	if u.Hostname == nil && u.SampleIntervalS == nil {
+	if u.Hostname == nil && u.SampleIntervalS == nil && u.AutoUpgrade == nil {
 		return nil
 	}
 	res, err := h.db.Pool.Exec(ctx, `
 		UPDATE hosts SET
 		  hostname = COALESCE($2, hostname),
-		  sample_interval_s = COALESCE($3, sample_interval_s)
+		  sample_interval_s = COALESCE($3, sample_interval_s),
+		  auto_upgrade = COALESCE($4, auto_upgrade)
 		WHERE id = $1 AND deleted_at IS NULL
-	`, id, u.Hostname, u.SampleIntervalS)
+	`, id, u.Hostname, u.SampleIntervalS, u.AutoUpgrade)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -102,6 +106,33 @@ func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
 	}
 	if res.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	h.invalidate()
+	return nil
+}
+
+func (h *Hosts) RequestUpgrade(ctx context.Context, id int64) error {
+	res, err := h.db.Pool.Exec(ctx, `
+		UPDATE hosts SET upgrade_requested_at = now()
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	h.invalidate()
+	return nil
+}
+
+func (h *Hosts) ClearUpgradeRequest(ctx context.Context, id int64) error {
+	_, err := h.db.Pool.Exec(ctx, `
+		UPDATE hosts SET upgrade_requested_at = NULL
+		WHERE id = $1 AND upgrade_requested_at IS NOT NULL
+	`, id)
+	if err != nil {
+		return err
 	}
 	h.invalidate()
 	return nil
@@ -175,7 +206,8 @@ func (h *Hosts) refresh(ctx context.Context) error {
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, hostname, agent_token_hash, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(kernel,''), COALESCE(agent_version,''),
-		       sample_interval_s, enabled_collectors, tags, last_seen, created_at, deleted_at
+		       sample_interval_s, enabled_collectors, tags, last_seen, created_at, deleted_at,
+		       auto_upgrade, upgrade_requested_at
 		FROM hosts
 	`)
 	if err != nil {
@@ -196,6 +228,7 @@ func (h *Hosts) refresh(ctx context.Context) error {
 			&host.Kernel, &host.AgentVersion,
 			&host.SampleIntervalS, &host.EnabledCollectors, &tags,
 			&host.LastSeen, &host.CreatedAt, &host.DeletedAt,
+			&host.AutoUpgrade, &host.UpgradeRequestedAt,
 		); err != nil {
 			return err
 		}

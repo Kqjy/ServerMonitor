@@ -10,6 +10,7 @@
 
   let name = $state(untrack(() => host.hostname));
   let interval = $state(untrack(() => host.sample_interval_s || 10));
+  let autoUpgrade = $state(untrack(() => host.auto_upgrade));
   let error = $state<string | null>(null);
   let busy = $state(false);
 
@@ -25,10 +26,11 @@
     busy = true;
     error = null;
     try {
-      const patch: { hostname?: string; sample_interval_s?: number } = {};
+      const patch: { hostname?: string; sample_interval_s?: number; auto_upgrade?: boolean } = {};
       if (trimmed !== host.hostname) patch.hostname = trimmed;
       if (interval !== (host.sample_interval_s || 10)) patch.sample_interval_s = interval;
-      if (!patch.hostname && !patch.sample_interval_s) {
+      if (autoUpgrade !== host.auto_upgrade) patch.auto_upgrade = autoUpgrade;
+      if (patch.hostname === undefined && patch.sample_interval_s === undefined && patch.auto_upgrade === undefined) {
         onclose();
         return;
       }
@@ -86,6 +88,22 @@
             </button>
           {/each}
         </div>
+      </div>
+      <div>
+        <div class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Auto-update agent</div>
+        <label class="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            bind:checked={autoUpgrade}
+            class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-emerald-500 focus:ring-emerald-500/40 focus:ring-offset-0"
+          />
+          <span class="text-xs text-zinc-300 leading-relaxed">
+            {autoUpgrade ? 'On' : 'Off'} — when on, this agent installs new versions automatically after the server is upgraded.
+            {#if !host.supports_remote_upgrade && host.agent_version}
+              <span class="block mt-1 text-amber-400">Agent v{host.agent_version} does not support remote upgrades; re-install to v0.1.1+ first.</span>
+            {/if}
+          </span>
+        </label>
       </div>
       {#if error}
         <div class="rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{error}</div>

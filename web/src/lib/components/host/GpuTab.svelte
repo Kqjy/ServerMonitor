@@ -79,6 +79,10 @@
       chartZoom = null;
       frozenWindow = null;
       loading = true;
+      usage = [];
+      memUsedPct = [];
+      temp = [];
+      power = [];
     }
     prevRange = current;
   });
@@ -109,6 +113,9 @@
   function handleReset() {
     chartZoom = null;
     frozenWindow = null;
+    const b = rangeBoundsMs(range);
+    fromMs = b.fromMs;
+    toMs = b.toMs;
   }
   void bytes;
 </script>

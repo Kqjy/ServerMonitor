@@ -30,6 +30,8 @@
   let timer: ReturnType<typeof setInterval> | null = null;
   let editing = $state(false);
   let pickerOpen = $state(false);
+  let upgradeBusy = $state(false);
+  let upgradeError = $state<string | null>(null);
 
   const tabs: { value: TabName; label: string }[] = [
     { value: 'overview', label: 'Overview' },
@@ -50,6 +52,20 @@
       error = null;
     } catch (e) {
       error = (e as Error).message;
+    }
+  }
+
+  async function requestUpgrade() {
+    if (!host || upgradeBusy) return;
+    upgradeBusy = true;
+    upgradeError = null;
+    try {
+      const updated = await api.requestHostUpgrade(host.id);
+      host = updated;
+    } catch (e) {
+      upgradeError = (e as Error).message;
+    } finally {
+      upgradeBusy = false;
     }
   }
 
@@ -130,6 +146,43 @@
           {host.os || '—'}{host.arch ? ` · ${host.arch}` : ''}{host.kernel ? ` · ${host.kernel}` : ''}
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
         </div>
+        {#if host.update_available}
+          <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <span class="text-sky-300">Update to v{host.latest_agent_version} available</span>
+            {#if host.supports_remote_upgrade}
+              {#if host.upgrade_pending}
+                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+                  <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+                  Pending next check-in
+                </span>
+              {:else}
+                <button
+                  type="button"
+                  onclick={requestUpgrade}
+                  disabled={upgradeBusy}
+                  class="px-2.5 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/40 text-sky-200 hover:bg-sky-500/25 disabled:opacity-50"
+                >
+                  {upgradeBusy ? 'Sending…' : 'Update now'}
+                </button>
+              {/if}
+              {#if host.auto_upgrade}
+                <span class="text-zinc-500">auto-update on</span>
+              {:else}
+                <span class="text-zinc-500">auto-update off</span>
+              {/if}
+            {:else}
+              <span
+                class="text-amber-400"
+                title="Agent versions older than 0.1.1 cannot self-upgrade. Re-run the install script on this host."
+              >
+                Manual upgrade required (agent &lt; v0.1.1)
+              </span>
+            {/if}
+            {#if upgradeError}
+              <span class="text-rose-300">{upgradeError}</span>
+            {/if}
+          </div>
+        {/if}
       </div>
       <div class="w-full sm:w-auto sm:ml-auto flex flex-wrap items-center gap-2 sm:gap-3 text-xs">
         {#if showRange}
@@ -189,7 +242,7 @@
     <div class="mt-6">
       {#if tabModel === 'overview'}<OverviewTab hostId={id} {range} />
       {:else if tabModel === 'memory'}<MemoryTab hostId={id} {range} />
-      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} />
+      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} enabledCollectors={host.enabled_collectors ?? []} />
       {:else if tabModel === 'network'}<NetworkTab hostId={id} {range} />
       {:else if tabModel === 'processes'}<ProcessesTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'containers'}<ContainersTab hostId={id} sampleIntervalS={host.sample_interval_s} />
