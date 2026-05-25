@@ -34,6 +34,7 @@ type Config struct {
 	TLSKeyFile           string
 	TrustProxyTLS        bool
 	InsecureAllowHTTP    bool
+	AgentSigningKeyFile  string
 }
 
 func (c *Config) ServesTLS() bool       { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
@@ -63,6 +64,7 @@ func Load() (*Config, error) {
 		TLSKeyFile:           getenv("TLS_KEY_FILE", ""),
 		TrustProxyTLS:        getenvBool("TRUST_PROXY_TLS", false),
 		InsecureAllowHTTP:    getenvBool("INSECURE_ALLOW_HTTP", false),
+		AgentSigningKeyFile:  getenv("AGENT_SIGNING_KEY_FILE", ""),
 	}
 
 	if c.DatabaseURL == "" {

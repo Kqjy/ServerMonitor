@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVER_URL="__SERVER_URL__"
+SERVER_URL='__SERVER_URL__'
 TOKEN="${SM_TOKEN:-}"
 INTERVAL="${SM_INTERVAL:-10}"
 INSECURE="${SM_INSECURE:-0}"
@@ -20,6 +20,36 @@ fi
 
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
+
+install_smartmontools() {
+    if command -v smartctl >/dev/null 2>&1; then
+        printf 'smartmontools already present: %s\n' "$(command -v smartctl)"
+        return 0
+    fi
+    printf 'installing smartmontools (required by SMART collector) ...\n'
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq smartmontools >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q smartmontools >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q smartmontools >/dev/null 2>&1 || true
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive --quiet install smartmontools >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache --quiet smartmontools >/dev/null 2>&1 || true
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --noconfirm --needed --quiet smartmontools >/dev/null 2>&1 || true
+    else
+        printf 'warning: no known package manager; install smartmontools manually for SMART support\n' >&2
+        return 0
+    fi
+    if command -v smartctl >/dev/null 2>&1; then
+        printf 'smartmontools installed: %s\n' "$(command -v smartctl)"
+    else
+        printf 'warning: smartmontools install attempt finished but smartctl is not on PATH; install manually for SMART support\n' >&2
+    fi
+}
 
 [ "$(id -u)" = "0" ] || err "run as root (use sudo)"
 need curl
@@ -67,6 +97,8 @@ header = "X-Agent-Token: $TOKEN"
 CURLCFG
 
 id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group --comment 'ServerMonitor agent' sm-agent
+
+[ "$ENABLE_SMART" = "1" ] && install_smartmontools
 
 EXTRA_GROUPS=()
 [ "$ENABLE_SMART" = "1" ]  && EXTRA_GROUPS+=(disk)

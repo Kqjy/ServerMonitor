@@ -17,6 +17,7 @@ import (
 
 	"servermonitor/internal/server/alerting"
 	"servermonitor/internal/server/storage"
+	"servermonitor/pkg/agentsig"
 	"servermonitor/pkg/metrics"
 	"servermonitor/pkg/version"
 )
@@ -264,9 +265,10 @@ type registerResponse struct {
 	HostID          int64  `json:"host_id"`
 	Token           string `json:"token"`
 	SampleIntervalS int    `json:"sample_interval_s"`
+	ServerPubkey    string `json:"server_pubkey,omitempty"`
 }
 
-func registerHostHandler(hosts *storage.Hosts) http.HandlerFunc {
+func registerHostHandler(hosts *storage.Hosts, signer *agentsig.Signer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req registerRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -295,7 +297,11 @@ func registerHostHandler(hosts *storage.Hosts) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusCreated, registerResponse{HostID: id, Token: token, SampleIntervalS: interval})
+		resp := registerResponse{HostID: id, Token: token, SampleIntervalS: interval}
+		if signer != nil {
+			resp.ServerPubkey = signer.PublicKeyHex()
+		}
+		writeJSON(w, http.StatusCreated, resp)
 	}
 }
 

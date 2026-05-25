@@ -27,7 +27,7 @@ The --admin-token flag is deliberately not supported here: argv is visible in
 By default the agent gets only CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE and no
 supplementary group memberships. Each --enable-* flag (or SM_ENABLE_<NAME>=1
 env var) opts into one extra collector's grant:
-  --enable-smart    adds CAP_SYS_RAWIO and 'disk' group membership (smartctl)
+  --enable-smart    adds CAP_SYS_RAWIO + 'disk' group, auto-installs smartmontools via apt/dnf/yum/apk/pacman/zypper
   --enable-docker   adds 'docker' group membership (containers collector)
   --enable-gpu      adds 'video' group membership (some nvidia-smi setups)
   --enable-network  adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
@@ -64,6 +64,36 @@ if [ "$ENABLE_ALL" = "1" ]; then
   ENABLE_NETWORK=1
 fi
 
+install_smartmontools() {
+  if command -v smartctl >/dev/null 2>&1; then
+    echo "smartmontools already present: $(command -v smartctl)"
+    return 0
+  fi
+  echo "installing smartmontools (required by SMART collector) ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq smartmontools >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q smartmontools >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q smartmontools >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive --quiet install smartmontools >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache --quiet smartmontools >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -S --noconfirm --needed --quiet smartmontools >/dev/null 2>&1 || true
+  else
+    echo "warning: no known package manager; install smartmontools manually for SMART support" >&2
+    return 0
+  fi
+  if command -v smartctl >/dev/null 2>&1; then
+    echo "smartmontools installed: $(command -v smartctl)"
+  else
+    echo "warning: smartmontools install attempt finished but smartctl is not on PATH; install manually for SMART support" >&2
+  fi
+}
+
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -z "$SERVER_URL" || -z "$BIN_PATH" ]] && usage
 
@@ -83,12 +113,19 @@ esac
 
 BIN_DIR="$(cd "$(dirname "$BIN_PATH")" && pwd)"
 BIN_DIR_PERMS="$(stat -c '%a' "$BIN_DIR")"
+BIN_DIR_OWNER="$(stat -c '%u' "$BIN_DIR")"
 if [[ "${BIN_DIR_PERMS: -1}" =~ [2367] ]]; then
   echo "refusing: binary source dir $BIN_DIR is world-writable (mode $BIN_DIR_PERMS)" >&2
   exit 1
 fi
+if [[ ${#BIN_DIR_PERMS} -ge 2 && "${BIN_DIR_PERMS: -2:1}" =~ [2367] && "$BIN_DIR_OWNER" != "0" ]]; then
+  echo "refusing: binary source dir $BIN_DIR is group-writable and not root-owned (mode $BIN_DIR_PERMS owner uid $BIN_DIR_OWNER)" >&2
+  exit 1
+fi
 
 id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group --comment 'ServerMonitor agent' sm-agent
+
+[ "$ENABLE_SMART" = "1" ] && install_smartmontools
 
 EXTRA_GROUPS=()
 [ "$ENABLE_SMART" = "1" ]  && EXTRA_GROUPS+=(disk)

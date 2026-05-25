@@ -15,6 +15,7 @@ import (
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
+	"servermonitor/pkg/agentsig"
 )
 
 type Router struct {
@@ -38,6 +39,7 @@ type Deps struct {
 	TrustedProxies []*net.IPNet
 	SecureCookies  bool
 	TrustProxyTLS  bool
+	AgentSigner    *agentsig.Signer
 }
 
 func New(d Deps) *Router {
@@ -57,7 +59,7 @@ func New(d Deps) *Router {
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.With(timeout).Get("/auth/status", authStatusHandler(d.Auth))
-		r.With(timeout).Get("/agent/binary", downloadAgentHandler(d.Hosts))
+		r.With(timeout).Get("/agent/binary", downloadAgentHandler(d.Hosts, d.AgentSigner))
 		r.Group(func(r chi.Router) {
 			r.Use(timeout)
 			r.Use(authRateLimiter(d.TrustedProxies))
@@ -71,7 +73,7 @@ func New(d Deps) *Router {
 			r.Use(timeout)
 			r.Use(ingestLimiter(d.IngestRate, d.IngestBurst))
 			r.Use(requireAgentToken(d.Hosts))
-			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.Logger))
+			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger))
 		})
 
 		r.Group(func(r chi.Router) {
@@ -84,14 +86,16 @@ func New(d Deps) *Router {
 				r.Use(timeout)
 				r.Get("/auth/me", meHandler())
 				r.Post("/auth/password", changePasswordHandler(d.Auth, d.SecureCookies))
-				r.Post("/admin/hosts", registerHostHandler(d.Hosts))
+				r.Post("/admin/hosts", registerHostHandler(d.Hosts, d.AgentSigner))
 				r.Patch("/admin/hosts/{id}", updateHostHandler(d.DB, d.Hosts))
 				r.Post("/admin/hosts/{id}/upgrade", requestHostUpgradeHandler(d.DB, d.Hosts))
 				r.Delete("/admin/hosts/{id}", deleteHostHandler(d.Hosts))
 				r.Get("/hosts", listHostsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}", getHostHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/processes", hostProcessesHandler(d.DB, d.Hosts))
+				r.Get("/hosts/{id}/processes/{pid}/series", hostProcessSeriesHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/containers", hostContainersHandler(d.DB, d.Hosts))
+				r.Get("/hosts/{id}/containers/{cid}/series", hostContainerSeriesHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/labels", hostLabelsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/alerts/active", hostActiveAlertsHandler(d.DB, d.Hosts))
 				r.Get("/series", seriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -73,12 +74,12 @@ func main() {
 	}
 
 	if cfg.InsecureSkip {
-		logger.Error("insecure_skip_verify=true: TLS certificate verification is DISABLED â€” never use in production",
+		logger.Warn("insecure_skip_verify=true: TLS certificate verification is DISABLED - never use in production",
 			"config", *configPath,
 			"server_url", cfg.ServerURL)
 	}
 	if strings.HasPrefix(strings.ToLower(cfg.ServerURL), "http://") {
-		logger.Error("server_url uses http://: agent token will be sent over plaintext â€” never use in production",
+		logger.Warn("server_url uses http://: agent token will be sent over plaintext - never use in production",
 			"config", *configPath,
 			"server_url", cfg.ServerURL)
 	}
@@ -96,6 +97,8 @@ func main() {
 	client := transport.New(cfg.ServerURL, cfg.Token, cfg.HTTPTimeout, cfg.InsecureSkip, logger, sp)
 	client.SetCurrentInterval(cfg.IntervalS)
 	r := runner.New(cfg, client, logger)
+
+	pk := &pubkeyHolder{v: cfg.ServerPubkey}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -137,6 +140,17 @@ func main() {
 				if !ok {
 					return
 				}
+				if upd.ServerPubkey != "" && pk.setIfEmpty(upd.ServerPubkey) {
+					if err := persistServerPubkey(*configPath, upd.ServerPubkey); err != nil {
+						logger.Warn("pinned server pubkey in memory but failed to persist to agent.toml; will retry after next restart",
+							"err", err,
+							"config", *configPath)
+					} else {
+						logger.Info("pinned server pubkey from ingest ack",
+							"pubkey", upd.ServerPubkey,
+							"config", *configPath)
+					}
+				}
 				latest := upd.LatestVersion
 				if latest == "" || !version.IsNewer(latest, runner.Version) {
 					continue
@@ -170,6 +184,7 @@ func main() {
 				err := upgrade.Run(ctx, upgrade.Options{
 					ServerURL:    cfg.ServerURL,
 					Token:        cfg.Token,
+					ServerPubkey: pk.get(),
 					InsecureSkip: cfg.InsecureSkip,
 					Logger:       logger,
 				})
@@ -255,19 +270,30 @@ func writeDeregisteredSentinel(path, serverURL string) {
 }
 
 func persistInterval(path string, intervalS int) error {
+	return persistConfigField(path, "interval_s", fmt.Sprintf("interval_s = %d", intervalS))
+}
+
+func persistServerPubkey(path, pubkey string) error {
+	return persistConfigField(path, "server_pubkey", fmt.Sprintf("server_pubkey = %q", pubkey))
+}
+
+var configFileMu sync.Mutex
+
+func persistConfigField(path, key, replacement string) error {
+	configFileMu.Lock()
+	defer configFileMu.Unlock()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	lines := strings.Split(string(data), "\n")
 	found := false
-	replacement := fmt.Sprintf("interval_s = %d", intervalS)
 	for i, l := range lines {
-		key, _, ok := strings.Cut(l, "=")
+		k, _, ok := strings.Cut(l, "=")
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(key) == "interval_s" {
+		if strings.TrimSpace(k) == key {
 			lines[i] = replacement
 			found = true
 			break
@@ -276,7 +302,28 @@ func persistInterval(path string, intervalS int) error {
 	if !found {
 		lines = append(lines, replacement)
 	}
-	return writeConfigAtomic(path, []byte(strings.Join(lines, "\n")))
+	return writeConfigAtomic(path, []byte(strings.Join(lines, "\n")), false)
+}
+
+type pubkeyHolder struct {
+	mu sync.Mutex
+	v  string
+}
+
+func (h *pubkeyHolder) get() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.v
+}
+
+func (h *pubkeyHolder) setIfEmpty(s string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.v != "" {
+		return false
+	}
+	h.v = s
+	return true
 }
 
 func defaultConfigPath() string {
@@ -342,19 +389,23 @@ func registerCmd(args []string) {
 		*hostname = h
 	}
 
-	token, hostID, err := callRegister(*server, adminToken, *hostname, *intervalS, *insecure)
+	token, hostID, pubkey, err := callRegister(*server, adminToken, *hostname, *intervalS, *insecure)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "register failed:", err)
 		os.Exit(1)
 	}
+	if pubkey == "" {
+		fmt.Fprintln(os.Stderr, "warning: server did not return server_pubkey; agent self-upgrade will be disabled until you upgrade and re-register against a signed server build")
+	}
 
 	stickyInsecure := *insecure && *persistInsecure
-	cfg := fmt.Sprintf(`server_url = %q
-token      = %q
-interval_s = %d
-spool_path = %q
+	cfg := fmt.Sprintf(`server_url    = %q
+token         = %q
+server_pubkey = %q
+interval_s    = %d
+spool_path    = %q
 insecure_skip_verify = %t
-`, *server, token, *intervalS, defaultSpoolPath(), stickyInsecure)
+`, *server, token, pubkey, *intervalS, defaultSpoolPath(), stickyInsecure)
 
 	cfgDir := filepath.Dir(*configPath)
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
@@ -365,7 +416,7 @@ insecure_skip_verify = %t
 		fmt.Fprintln(os.Stderr, "lock config dir ACL:", err)
 		os.Exit(1)
 	}
-	if err := writeConfigAtomic(*configPath, []byte(cfg)); err != nil {
+	if err := writeConfigAtomic(*configPath, []byte(cfg), true); err != nil {
 		fmt.Fprintln(os.Stderr, "write config:", err)
 		os.Exit(1)
 	}
@@ -377,7 +428,7 @@ insecure_skip_verify = %t
 	fmt.Printf("registered host %q (id=%d)\n", *hostname, hostID)
 	fmt.Printf("wrote config to %s\n", *configPath)
 	fmt.Println("\nnext steps:")
-	fmt.Println("  prefer scripts/install-agent-{linux,windows}.{sh,ps1} â€” they set ACLs, perms, and the hardened service identity.")
+	fmt.Println("  prefer scripts/install-agent-{linux,windows}.{sh,ps1} - they set ACLs, perms, and the hardened service identity.")
 	if runtime.GOOS == "windows" {
 		fmt.Println("  manual fallback (virtual service account, restricted privileges; no ACL hardening):")
 		fmt.Println("    sc.exe create sm-agent binPath= \"\\\"" + selfPath() + "\\\" --config \\\"" + *configPath + "\\\"\" start= auto obj= \"NT SERVICE\\sm-agent\"")
@@ -390,7 +441,7 @@ insecure_skip_verify = %t
 	}
 }
 
-func writeConfigAtomic(path string, data []byte) error {
+func writeConfigAtomic(path string, data []byte, lockACL bool) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "agent-*.toml.tmp")
 	if err != nil {
@@ -420,7 +471,7 @@ func writeConfigAtomic(path string, data []byte) error {
 		return err
 	}
 	cleanup = false
-	if runtime.GOOS == "windows" {
+	if lockACL && runtime.GOOS == "windows" {
 		if err := lockACLSystemAdminsOnly(path); err != nil {
 			return fmt.Errorf("rewrote %s but failed to relock ACL: %w", path, err)
 		}
@@ -436,7 +487,7 @@ func selfPath() string {
 	return p
 }
 
-func callRegister(server, adminToken, hostname string, intervalS int, insecure bool) (string, int64, error) {
+func callRegister(server, adminToken, hostname string, intervalS int, insecure bool) (string, int64, string, error) {
 	body, _ := json.Marshal(map[string]any{"hostname": hostname, "sample_interval_s": intervalS})
 	httpClient := &http.Client{
 		Timeout: 15 * time.Second,
@@ -447,28 +498,29 @@ func callRegister(server, adminToken, hostname string, intervalS int, insecure b
 	url := strings.TrimRight(server, "/") + "/api/v1/admin/hosts"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Admin-Token", adminToken)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", 0, fmt.Errorf("status %d: %s", resp.StatusCode, string(data))
+		return "", 0, "", fmt.Errorf("status %d: %s", resp.StatusCode, string(data))
 	}
 	var out struct {
-		HostID int64  `json:"host_id"`
-		Token  string `json:"token"`
+		HostID       int64  `json:"host_id"`
+		Token        string `json:"token"`
+		ServerPubkey string `json:"server_pubkey"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	if out.Token == "" {
-		return "", 0, errors.New("empty token")
+		return "", 0, "", errors.New("empty token")
 	}
-	return out.Token, out.HostID, nil
+	return out.Token, out.HostID, out.ServerPubkey, nil
 }

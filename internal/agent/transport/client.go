@@ -40,6 +40,7 @@ type ControlUpdate struct {
 	LatestVersion string
 	AutoUpgrade   *bool
 	UpgradeNow    bool
+	ServerPubkey  string
 }
 
 var ErrDeregistered = errors.New("host deregistered by server")
@@ -189,6 +190,7 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 			LatestAgentVersion string `json:"latest_agent_version"`
 			AutoUpgrade        *bool  `json:"auto_upgrade"`
 			UpgradeNow         bool   `json:"upgrade_now"`
+			ServerPubkey       string `json:"server_pubkey"`
 		}
 		if len(ackBytes) > 0 {
 			_ = json.Unmarshal(ackBytes, &ack)
@@ -207,11 +209,12 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 				}
 			}
 		}
-		if ack.LatestAgentVersion != "" || ack.UpgradeNow || ack.AutoUpgrade != nil {
+		if ack.LatestAgentVersion != "" || ack.UpgradeNow || ack.AutoUpgrade != nil || ack.ServerPubkey != "" {
 			upd := ControlUpdate{
 				LatestVersion: ack.LatestAgentVersion,
 				AutoUpgrade:   ack.AutoUpgrade,
 				UpgradeNow:    ack.UpgradeNow,
+				ServerPubkey:  ack.ServerPubkey,
 			}
 			select {
 			case c.controlCh <- upd:

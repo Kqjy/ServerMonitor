@@ -3,14 +3,56 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 
 	"servermonitor/internal/server/storage"
 )
+
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+const (
+	maxDetailSpan    = 31 * 24 * time.Hour
+	maxDetailBuckets = 10000
+)
+
+func resolveDetailWindow(r *http.Request, host storage.Host) (from, to time.Time, step int, err error) {
+	q := r.URL.Query()
+	now := time.Now()
+	from, err = parseTimeStrict(q.Get("from"), now.Add(-1*time.Hour))
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid from: %w", err)
+	}
+	to, err = parseTimeStrict(q.Get("to"), now)
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid to: %w", err)
+	}
+	if !to.After(from) {
+		return time.Time{}, time.Time{}, 0, errors.New("to must be after from")
+	}
+	span := to.Sub(from)
+	if span > maxDetailSpan {
+		return time.Time{}, time.Time{}, 0, errors.New("span exceeds 31d limit")
+	}
+	step, _ = strconv.Atoi(q.Get("step"))
+	if step <= 0 {
+		step = chooseStep(span, host.SampleIntervalS)
+	} else if host.SampleIntervalS > 0 && step < host.SampleIntervalS {
+		step = host.SampleIntervalS
+	}
+	spanSec := int(span.Seconds())
+	if step > 0 && spanSec/step > maxDetailBuckets {
+		step = (spanSec + maxDetailBuckets - 1) / maxDetailBuckets
+	}
+	return from, to, step, nil
+}
 
 type processSnapshot struct {
 	PID      int32     `json:"pid"`
@@ -221,6 +263,276 @@ func hostContainersHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFun
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+type processPoint struct {
+	Ts     time.Time `json:"ts"`
+	CPUPct float64   `json:"cpu_pct"`
+	MemRSS int64     `json:"mem_rss"`
+}
+
+type processSeriesResp struct {
+	HostID  int64          `json:"host_id"`
+	PID     int32          `json:"pid"`
+	Name    string         `json:"name,omitempty"`
+	Cmdline string         `json:"cmdline,omitempty"`
+	StepSec int            `json:"step_sec"`
+	Points  []processPoint `json:"points"`
+}
+
+type containerPoint struct {
+	Ts      time.Time `json:"ts"`
+	CPUPct  float64   `json:"cpu_pct"`
+	MemUsed int64     `json:"mem_used"`
+	RxRate  float64   `json:"rx_rate"`
+	TxRate  float64   `json:"tx_rate"`
+}
+
+type containerSeriesResp struct {
+	HostID  int64            `json:"host_id"`
+	CID     string           `json:"cid"`
+	Name    string           `json:"name,omitempty"`
+	Image   string           `json:"image,omitempty"`
+	StepSec int              `json:"step_sec"`
+	Points  []containerPoint `json:"points"`
+}
+
+func hostProcessSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		pid64, err := strconv.ParseInt(chi.URLParam(r, "pid"), 10, 32)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid pid")
+			return
+		}
+		pid := int32(pid64)
+		host, err := hosts.Get(r.Context(), hostID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		from, to, step, err := resolveDetailWindow(r, host)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		q := r.URL.Query()
+		anchor, err := parseTimeStrict(q.Get("anchor"), to)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid anchor: "+err.Error())
+			return
+		}
+		if anchor.Before(from) {
+			anchor = from
+		} else if anchor.After(to) {
+			anchor = to
+		}
+		gapSec := host.SampleIntervalS * 3
+		if gapSec < 60 {
+			gapSec = 60
+		}
+
+		nameFilter := q.Get("name")
+		latestArgs := []any{hostID, pid}
+		latestNameClause := ""
+		if nameFilter != "" {
+			latestNameClause = " AND name = $3"
+			latestArgs = append(latestArgs, nameFilter)
+		}
+		seriesArgs := []any{intervalString(gapSec), hostID, pid, from, to, anchor, intervalString(step)}
+		seriesNameClause := ""
+		if nameFilter != "" {
+			seriesNameClause = " AND name = $8"
+			seriesArgs = append(seriesArgs, nameFilter)
+		}
+
+		var name, cmdline string
+		latestSQL := `
+			SELECT COALESCE(name,''), COALESCE(cmdline,'')
+			FROM processes
+			WHERE host_id = $1 AND pid = $2` + latestNameClause + `
+			ORDER BY time DESC
+			LIMIT 1
+		`
+		if err := db.Pool.QueryRow(r.Context(), latestSQL, latestArgs...).Scan(&name, &cmdline); err != nil {
+			if isCtxErr(err) {
+				return
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+
+		seriesSQL := `
+			WITH lagged AS (
+			  SELECT time, cpu_pct, mem_rss,
+			         time - lag(time) OVER (ORDER BY time) AS dt
+			  FROM processes
+			  WHERE host_id = $2 AND pid = $3 AND time >= $4 AND time < $5` + seriesNameClause + `
+			),
+			gapped AS (
+			  SELECT time, cpu_pct, mem_rss,
+			         sum(CASE WHEN dt > $1::interval THEN 1 ELSE 0 END) OVER (ORDER BY time) AS run_id
+			  FROM lagged
+			),
+			target AS (
+			  SELECT run_id FROM gapped WHERE time <= $6 ORDER BY time DESC LIMIT 1
+			)
+			SELECT time_bucket($7::interval, time) AS b,
+			       COALESCE(avg(cpu_pct), 0)::float8 AS cpu,
+			       COALESCE(avg(mem_rss), 0)::bigint AS rss
+			FROM gapped
+			WHERE run_id = (SELECT run_id FROM target)
+			GROUP BY b
+			ORDER BY b ASC
+		`
+		rows, err := db.Pool.Query(r.Context(), seriesSQL, seriesArgs...)
+		if err != nil {
+			if isCtxErr(err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer rows.Close()
+		points := make([]processPoint, 0, 256)
+		for rows.Next() {
+			var p processPoint
+			if err := rows.Scan(&p.Ts, &p.CPUPct, &p.MemRSS); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			points = append(points, p)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, processSeriesResp{
+			HostID:  hostID,
+			PID:     pid,
+			Name:    name,
+			Cmdline: cmdline,
+			StepSec: step,
+			Points:  points,
+		})
+	}
+}
+
+func hostContainerSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		cid := chi.URLParam(r, "cid")
+		if cid == "" {
+			writeError(w, http.StatusBadRequest, "invalid cid")
+			return
+		}
+		host, err := hosts.Get(r.Context(), hostID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		from, to, step, err := resolveDetailWindow(r, host)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		var name, image string
+		if err := db.Pool.QueryRow(r.Context(), `
+			SELECT COALESCE(name,''), COALESCE(image,'')
+			FROM containers
+			WHERE host_id = $1 AND cid = $2
+			ORDER BY time DESC
+			LIMIT 1
+		`, hostID, cid).Scan(&name, &image); err != nil {
+			if isCtxErr(err) {
+				return
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+
+		rows, err := db.Pool.Query(r.Context(), `
+			WITH bucketed AS (
+			  SELECT time_bucket($1::interval, time) AS b,
+			         max(time) AS bmax,
+			         COALESCE(avg(cpu_pct), 0)::float8 AS cpu,
+			         COALESCE(avg(mem_used), 0)::bigint AS mem,
+			         last(rx_bytes, time) AS rx_last,
+			         last(tx_bytes, time) AS tx_last
+			  FROM containers
+			  WHERE host_id = $2 AND cid = $3 AND time >= $4 AND time < $5
+			  GROUP BY b
+			)
+			SELECT b, cpu, mem,
+			       CASE
+			         WHEN rx_last IS NULL OR lag(rx_last) OVER w IS NULL THEN 0
+			         WHEN rx_last < lag(rx_last) OVER w THEN 0
+			         ELSE (rx_last - lag(rx_last) OVER w)::float8
+			              / GREATEST(EXTRACT(EPOCH FROM (bmax - lag(bmax) OVER w)), 1)
+			       END AS rx_rate,
+			       CASE
+			         WHEN tx_last IS NULL OR lag(tx_last) OVER w IS NULL THEN 0
+			         WHEN tx_last < lag(tx_last) OVER w THEN 0
+			         ELSE (tx_last - lag(tx_last) OVER w)::float8
+			              / GREATEST(EXTRACT(EPOCH FROM (bmax - lag(bmax) OVER w)), 1)
+			       END AS tx_rate
+			FROM bucketed
+			WINDOW w AS (ORDER BY b)
+			ORDER BY b ASC
+		`, intervalString(step), hostID, cid, from, to)
+		if err != nil {
+			if isCtxErr(err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer rows.Close()
+		points := make([]containerPoint, 0, 256)
+		for rows.Next() {
+			var p containerPoint
+			if err := rows.Scan(&p.Ts, &p.CPUPct, &p.MemUsed, &p.RxRate, &p.TxRate); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			points = append(points, p)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, containerSeriesResp{
+			HostID:  hostID,
+			CID:     cid,
+			Name:    name,
+			Image:   image,
+			StepSec: step,
+			Points:  points,
+		})
 	}
 }
 

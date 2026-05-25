@@ -64,6 +64,7 @@ type IngestAck struct {
 	LatestAgentVersion string `json:"latest_agent_version,omitempty"`
 	AutoUpgrade        *bool  `json:"auto_upgrade,omitempty"`
 	UpgradeNow         bool   `json:"upgrade_now,omitempty"`
+	ServerPubkey       string `json:"server_pubkey,omitempty"`
 }
 
 type RegisterRequest struct {

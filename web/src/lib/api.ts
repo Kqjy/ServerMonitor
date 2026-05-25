@@ -81,6 +81,38 @@ export interface ContainerRow {
   time: string;
 }
 
+export interface ProcessSeriesPoint {
+  ts: string;
+  cpu_pct: number;
+  mem_rss: number;
+}
+
+export interface ProcessSeriesResp {
+  host_id: number;
+  pid: number;
+  name?: string;
+  cmdline?: string;
+  step_sec: number;
+  points: ProcessSeriesPoint[];
+}
+
+export interface ContainerSeriesPoint {
+  ts: string;
+  cpu_pct: number;
+  mem_used: number;
+  rx_rate: number;
+  tx_rate: number;
+}
+
+export interface ContainerSeriesResp {
+  host_id: number;
+  cid: string;
+  name?: string;
+  image?: string;
+  step_sec: number;
+  points: ContainerSeriesPoint[];
+}
+
 export interface AlertRule {
   id: number;
   name: string;
@@ -300,6 +332,36 @@ export const api = {
     if (opts.dir) q.set('dir', opts.dir);
     const qs = q.toString();
     return request<ContainerRow[]>(`/api/v1/hosts/${hostId}/containers${qs ? `?${qs}` : ''}`);
+  },
+  processSeries: (
+    hostId: number,
+    pid: number,
+    opts: { from?: string; to?: string; step?: number; name?: string; anchor?: string; signal?: AbortSignal } = {}
+  ) => {
+    const q = new URLSearchParams();
+    if (opts.from) q.set('from', opts.from);
+    if (opts.to) q.set('to', opts.to);
+    if (opts.step) q.set('step', String(opts.step));
+    if (opts.name) q.set('name', opts.name);
+    if (opts.anchor) q.set('anchor', opts.anchor);
+    return request<ProcessSeriesResp>(
+      `/api/v1/hosts/${hostId}/processes/${pid}/series?${q}`,
+      { signal: opts.signal }
+    );
+  },
+  containerSeries: (
+    hostId: number,
+    cid: string,
+    opts: { from?: string; to?: string; step?: number; signal?: AbortSignal } = {}
+  ) => {
+    const q = new URLSearchParams();
+    if (opts.from) q.set('from', opts.from);
+    if (opts.to) q.set('to', opts.to);
+    if (opts.step) q.set('step', String(opts.step));
+    return request<ContainerSeriesResp>(
+      `/api/v1/hosts/${hostId}/containers/${encodeURIComponent(cid)}/series?${q}`,
+      { signal: opts.signal }
+    );
   },
 
   alertRules: () => request<AlertRule[]>('/api/v1/alerts'),

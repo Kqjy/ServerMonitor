@@ -40,8 +40,11 @@ services:
       TRUST_PROXY_TLS: ${TRUST_PROXY_TLS:-}
       INSECURE_ALLOW_HTTP: ${INSECURE_ALLOW_HTTP:-}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      AGENT_SIGNING_KEY_FILE: ${AGENT_SIGNING_KEY_FILE:-/data/agent_signing.key}
     expose:
       - "8080"
+    volumes:
+      - appdata:/data
 
   backup:
     image: timescale/timescaledb:latest-pg16
@@ -70,3 +73,4 @@ services:
 volumes:
   pgdata:
   backups:
+  appdata:

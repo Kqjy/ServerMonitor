@@ -11,6 +11,7 @@ import (
 type Config struct {
 	ServerURL      string            `toml:"server_url"`
 	Token          string            `toml:"token"`
+	ServerPubkey   string            `toml:"server_pubkey"`
 	IntervalS      int               `toml:"interval_s"`
 	Enabled        []string          `toml:"enabled"`
 	Disabled       []string          `toml:"disabled"`

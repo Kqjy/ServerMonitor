@@ -3,7 +3,8 @@ param(
     [int]$IntervalS = 0,
     [switch]$Insecure,
     [switch]$PersistInsecure,
-    [switch]$AdminService
+    [switch]$AdminService,
+    [switch]$EnableSmart
 )
 
 $Token = $env:SM_TOKEN
@@ -12,6 +13,7 @@ if ($IntervalS -le 0) {
     if ($env:SM_INTERVAL) { $IntervalS = [int]$env:SM_INTERVAL } else { $IntervalS = 10 }
 }
 if ($env:SM_ADMIN_SERVICE -eq '1') { $AdminService = $true }
+if ($env:SM_ENABLE_SMART -eq '1')  { $EnableSmart  = $true }
 
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
@@ -33,6 +35,37 @@ if ($ServerUrl -notmatch '^https://') {
 
 $arch = if ([Environment]::Is64BitOperatingSystem) { 'amd64' } else { throw 'unsupported arch (32-bit Windows is not supported)' }
 $platform = "windows-$arch"
+
+function Install-Smartmontools {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'smartmontools\bin\smartctl.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'smartmontools\bin\smartctl.exe')
+    )
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            Write-Host "smartmontools already present: $p"
+            return
+        }
+    }
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Warning 'winget not available; install smartmontools manually for SMART support: https://www.smartmontools.org/wiki/Download'
+        return
+    }
+    Write-Host 'installing smartmontools via winget (required by SMART collector) ...'
+    & winget.exe install --id smartmontools.smartmontools --silent --accept-source-agreements --accept-package-agreements --scope machine | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("winget install smartmontools.smartmontools exited with {0}; install manually for SMART support" -f $LASTEXITCODE)
+        return
+    }
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            Write-Host "smartmontools installed: $p"
+            return
+        }
+    }
+    Write-Warning 'winget reported success but smartctl.exe was not found in the usual paths; install manually for SMART support'
+}
 
 function Get-VirtualServiceSid {
     param([Parameter(Mandatory=$true)][string]$Name)
@@ -87,14 +120,18 @@ function Lock-Acl {
 
 $installDir = Join-Path $env:ProgramFiles 'ServerMonitor'
 $configDir  = Join-Path $env:ProgramData 'ServerMonitor'
+$runtimeDir = Join-Path $configDir 'bin'
 if (-not (Test-Path $installDir)) { New-Item -ItemType Directory -Path $installDir | Out-Null }
 if (-not (Test-Path $configDir))  { New-Item -ItemType Directory -Path $configDir  | Out-Null }
+if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir | Out-Null }
 Lock-Acl -Path $installDir -ServiceAccess Read
 Lock-Acl -Path $configDir  -ServiceAccess Modify
+Lock-Acl -Path $runtimeDir -ServiceAccess Modify
 
-$exe = Join-Path $installDir 'sm-agent.exe'
-$cfgPath = Join-Path $configDir 'agent.toml'
-$spoolPath = Join-Path $configDir 'spool.db'
+$exe        = Join-Path $installDir 'sm-agent.exe'
+$runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
+$cfgPath    = Join-Path $configDir 'agent.toml'
+$spoolPath  = Join-Path $configDir 'spool.db'
 
 if ($Insecure) {
     [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
@@ -102,7 +139,9 @@ if ($Insecure) {
 
 Write-Host "downloading $ServerUrl agent for $platform ..."
 Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=$platform" -Headers @{ 'X-Agent-Token' = $Token } -OutFile $exe
-Lock-Acl -Path $exe -ServiceAccess Read
+Copy-Item -Force -Path $exe -Destination $runtimeExe
+Lock-Acl -Path $exe        -ServiceAccess Read
+Lock-Acl -Path $runtimeExe -ServiceAccess Modify
 
 $insecureLine = if ($Insecure -and $PersistInsecure) { 'true' } else { 'false' }
 $cfg = @"
@@ -138,7 +177,7 @@ if ($existing) {
     Start-Sleep -Seconds 1
 }
 
-$binPath = "`"$exe`" --config `"$cfgPath`""
+$binPath = "`"$runtimeExe`" --config `"$cfgPath`""
 & sc.exe create sm-agent binPath= $binPath start= auto obj= $svcAccount DisplayName= 'ServerMonitor Agent' | Out-Null
 & sc.exe description sm-agent 'Reports system metrics to ServerMonitor' | Out-Null
 & sc.exe failure sm-agent reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
@@ -167,6 +206,8 @@ if ($AdminService) {
 & sc.exe privs sm-agent $keepPrivs | Out-Null
 & sc.exe sidtype sm-agent unrestricted | Out-Null
 
+if ($EnableSmart) { Install-Smartmontools }
+
 Start-Service -Name 'sm-agent'
 
 Write-Host ''
@@ -176,4 +217,7 @@ Write-Host "logs:    Get-WinEvent -LogName Application -ProviderName 'sm-agent'"
 if (-not $AdminService) {
     Write-Host ''
     Write-Host 'note: SMART and full-process collectors require admin. Pass -AdminService or set $env:SM_ADMIN_SERVICE=1 to install as LocalSystem if you need them.'
+}
+if (-not $EnableSmart) {
+    Write-Host 'note: pass -EnableSmart (or set $env:SM_ENABLE_SMART=1) to auto-install smartmontools for the SMART collector.'
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -500,6 +501,26 @@ func parseTime(s string, def time.Time) time.Time {
 		return time.Unix(n, 0)
 	}
 	return def
+}
+
+func parseTimeStrict(s string, def time.Time) (time.Time, error) {
+	if s == "" {
+		return def, nil
+	}
+	if strings.HasPrefix(s, "-") {
+		d, err := time.ParseDuration(s[1:])
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid relative duration %q", s)
+		}
+		return time.Now().Add(-d), nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Unix(n, 0), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid time %q", s)
 }
 
 var stepBuckets = []int{1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600}

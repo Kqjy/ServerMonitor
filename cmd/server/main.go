@@ -26,6 +26,7 @@ import (
 	"servermonitor/internal/server/storage"
 	"servermonitor/internal/server/tasks"
 	"servermonitor/internal/server/web"
+	"servermonitor/pkg/agentsig"
 	"servermonitor/pkg/version"
 )
 
@@ -91,6 +92,29 @@ func main() {
 		logger.Info("retention policy", "target", a.Target, "kind", a.Kind, "value", a.Value)
 	}
 
+	var signer *agentsig.Signer
+	if cfg.AgentSigningKeyFile == "" {
+		signer, err = agentsig.NewSigner()
+		if err != nil {
+			logger.Error("agent signing key", "err", err)
+			os.Exit(1)
+		}
+		logger.Warn("AGENT_SIGNING_KEY_FILE not set; using ephemeral in-memory signing key — agents will need to re-register after every server restart for upgrades to verify",
+			"pubkey", signer.PublicKeyHex())
+	} else {
+		var created bool
+		signer, created, err = agentsig.LoadOrCreateSigner(cfg.AgentSigningKeyFile)
+		if err != nil {
+			logger.Error("agent signing key", "path", cfg.AgentSigningKeyFile, "err", err)
+			os.Exit(1)
+		}
+		if created {
+			logger.Info("generated agent signing key", "path", cfg.AgentSigningKeyFile, "pubkey", signer.PublicKeyHex())
+		} else {
+			logger.Info("loaded agent signing key", "path", cfg.AgentSigningKeyFile, "pubkey", signer.PublicKeyHex())
+		}
+	}
+
 	hosts := storage.NewHosts(db)
 	batcher := ingest.NewBatcher(db.Pool, cfg.BatcherMaxRows, cfg.BatcherMaxAge, logger)
 	batcher.Start(ctx)
@@ -146,6 +170,7 @@ func main() {
 		TrustedProxies: cfg.TrustedProxies,
 		SecureCookies:  cfg.SecureBrowserSide(),
 		TrustProxyTLS:  cfg.TrustProxyTLS,
+		AgentSigner:    signer,
 		Retention: api.RetentionConfig{
 			Raw:               cfg.RetentionRaw,
 			Aggregate5m:       cfg.RetentionAggregate5m,

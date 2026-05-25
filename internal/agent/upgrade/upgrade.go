@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"servermonitor/pkg/agentsig"
 )
 
 const downloadTimeout = 5 * time.Minute
@@ -20,11 +22,16 @@ const maxAgentBinaryBytes int64 = 256 << 20
 type Options struct {
 	ServerURL    string
 	Token        string
+	ServerPubkey string
 	InsecureSkip bool
 	Logger       *slog.Logger
 }
 
 func Run(ctx context.Context, opts Options) error {
+	if strings.TrimSpace(opts.ServerPubkey) == "" {
+		return agentsig.ErrUnknownPubkey
+	}
+
 	selfPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
@@ -64,6 +71,11 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("download status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	sigHeader := resp.Header.Get(agentsig.SignatureHeader)
+	if sigHeader == "" {
+		return fmt.Errorf("%w (server did not include %s header)", agentsig.ErrNoSignature, agentsig.SignatureHeader)
+	}
+
 	dir := filepath.Dir(selfPath)
 	newPath := selfPath + ".new"
 	_ = os.Remove(newPath)
@@ -72,7 +84,9 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("open temp: %w (install dir %q must be writable by the agent)", err, dir)
 	}
-	n, copyErr := io.Copy(tmp, io.LimitReader(resp.Body, maxAgentBinaryBytes+1))
+	digester := agentsig.NewDigest()
+	w := io.MultiWriter(tmp, digester)
+	n, copyErr := io.Copy(w, io.LimitReader(resp.Body, maxAgentBinaryBytes+1))
 	syncErr := tmp.Sync()
 	closeErr := tmp.Close()
 	if copyErr != nil {
@@ -94,6 +108,11 @@ func Run(ctx context.Context, opts Options) error {
 	if n < 1024 {
 		_ = os.Remove(newPath)
 		return fmt.Errorf("downloaded binary suspiciously small (%d bytes)", n)
+	}
+
+	if err := agentsig.Verify(opts.ServerPubkey, sigHeader, digester.Sum(nil)); err != nil {
+		_ = os.Remove(newPath)
+		return fmt.Errorf("verify signature: %w", err)
 	}
 
 	if err := swap(selfPath, newPath); err != nil {

@@ -1,14 +1,27 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import 'uplot';
   import { api, type ContainerRow } from '$lib/api';
   import { bytes, pct, timeAgo } from '$lib/format';
+  import ContainerDetail from './ContainerDetail.svelte';
 
   let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
 
   let rows = $state<ContainerRow[]>([]);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
+  let expandedCid = $state<string | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
+
+  function toggleExpand(cid: string) {
+    expandedCid = expandedCid === cid ? null : cid;
+  }
+
+  function onRowClick(cid: string) {
+    const sel = typeof window !== 'undefined' ? window.getSelection()?.toString() ?? '' : '';
+    if (sel.length > 0) return;
+    toggleExpand(cid);
+  }
 
   async function refresh() {
     const opts: { at?: string } = {};
@@ -27,15 +40,19 @@
     if (stepping) return;
     stepping = true;
     try {
-      const latest = rows[0]?.time;
-      const boundaryMs = atMs ?? (latest ? new Date(latest).getTime() : Date.now());
+      const boundaryMs = atMs ?? lastDataMs ?? Date.now();
       const fetched = await api.containers(hostId, {
         dir,
         at: new Date(boundaryMs).toISOString()
       });
       if (fetched.length > 0) {
         rows = fetched;
-        atMs = new Date(fetched[0].time).getTime();
+        let max = 0;
+        for (const r of fetched) {
+          const t = new Date(r.time).getTime();
+          if (t > max) max = t;
+        }
+        atMs = max > 0 ? max : null;
       } else if (dir === 'next') {
         atMs = null;
         await refresh();
@@ -82,7 +99,14 @@
     refresh();
   }
 
-  const lastDataMs = $derived(rows[0]?.time ? new Date(rows[0].time).getTime() : null);
+  const lastDataMs = $derived.by(() => {
+    let max = 0;
+    for (const r of rows) {
+      const t = new Date(r.time).getTime();
+      if (t > max) max = t;
+    }
+    return max > 0 ? max : null;
+  });
   const atLocal = $derived(
     atMs !== null
       ? toLocalInputValue(atMs)
@@ -168,12 +192,20 @@
         <tbody class="divide-y divide-zinc-800/70">
           {#each rows as c (c.cid)}
             {@const isUp = c.state.toLowerCase() === 'running'}
-            <tr class="hover:bg-zinc-900/60">
+            {@const open = expandedCid === c.cid}
+            <tr
+              class="hover:bg-zinc-900/60 cursor-pointer {open ? 'bg-zinc-900/60' : ''}"
+              onclick={() => onRowClick(c.cid)}>
               <td class="px-5 py-2 text-zinc-100 font-mono text-xs whitespace-nowrap">
-                <div>{c.name}</div>
-                <div class="text-[10px] text-zinc-500">{c.cid}</div>
+                <div class="inline-flex items-center gap-1.5">
+                  <svg viewBox="0 0 24 24" class="h-3 w-3 text-zinc-500 transition-transform {open ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                  <span>{c.name}</span>
+                </div>
+                <div class="text-[10px] text-zinc-500 pl-[18px]">{c.cid}</div>
               </td>
-              <td class="px-3 py-2 text-zinc-400 font-mono text-xs">{c.image}</td>
+              <td
+                class="px-3 py-2 text-zinc-400 font-mono text-xs cursor-text"
+                onclick={(e) => e.stopPropagation()}>{c.image}</td>
               <td class="px-3 py-2">
                 <span class="inline-flex items-center gap-1.5 text-xs">
                   <span class={`h-1.5 w-1.5 rounded-full ${isUp ? 'bg-emerald-400' : 'bg-zinc-600'}`}></span>
@@ -185,6 +217,13 @@
               <td class="px-3 py-2 text-right numeric text-zinc-300">{isUp ? `${bytes(c.rx_bytes ?? 0)} / ${bytes(c.tx_bytes ?? 0)}` : '—'}</td>
               <td class="px-5 py-2 text-right text-zinc-500 text-xs numeric">{timeAgo(c.time)}</td>
             </tr>
+            {#if open}
+              <tr class="bg-zinc-950/60">
+                <td colspan="7" class="p-0">
+                  <ContainerDetail {hostId} cid={c.cid} at={atMs ?? lastDataMs} />
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>

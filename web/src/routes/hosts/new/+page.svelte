@@ -107,6 +107,7 @@
   const pwshOneLiner = $derived.by(() => {
     const parts = [`$env:SM_INTERVAL="${interval}"`];
     if (adminService) parts.push('$env:SM_ADMIN_SERVICE="1"');
+    if (enableSmart)  parts.push('$env:SM_ENABLE_SMART="1"');
     return `${parts.join('; ')}; iex (iwr -useb ${baseUrl}/install.ps1).Content`;
   });
 
@@ -307,6 +308,10 @@ Lock-Path $cfg
                 <input type="checkbox" bind:checked={adminService} class="mt-0.5 accent-emerald-500" />
                 <span><span class="text-zinc-100">Admin service</span> <span class="text-zinc-500">— runs as <span class="font-mono">LocalSystem</span> (needed for SMART and full process visibility)</span></span>
               </label>
+              <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                <input type="checkbox" bind:checked={enableSmart} class="mt-0.5 accent-emerald-500" />
+                <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— auto-installs <span class="font-mono">smartmontools</span> via <span class="font-mono">winget</span> (also requires Admin service)</span></span>
+              </label>
             </div>
             <p class="text-xs text-zinc-500">Open PowerShell as Administrator on <span class="font-mono text-zinc-300">{platformLabel(active)}</span> and paste — the installer will prompt for the token shown above:</p>
             <div class="relative">
@@ -332,7 +337,7 @@ Lock-Path $cfg
                 </label>
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableSmart} class="mt-0.5 accent-emerald-500" />
-                  <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— joins <span class="font-mono">disk</span> group + grants <span class="font-mono">CAP_SYS_RAWIO</span></span></span>
+                  <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— joins <span class="font-mono">disk</span> group, grants <span class="font-mono">CAP_SYS_RAWIO</span>, auto-installs <span class="font-mono">smartmontools</span></span></span>
                 </label>
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableGpu} class="mt-0.5 accent-emerald-500" />

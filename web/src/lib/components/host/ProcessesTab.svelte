@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
+  import 'uplot';
   import { api, type ProcessRow } from '$lib/api';
   import { bytes, pct, timeAgo } from '$lib/format';
+  import ProcessDetail from './ProcessDetail.svelte';
 
   let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
 
@@ -12,7 +14,31 @@
   let limit = $state(50);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
+  let expandedPid = $state<number | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
+
+  function toggleExpand(pid: number) {
+    expandedPid = expandedPid === pid ? null : pid;
+  }
+
+  function onRowClick(pid: number) {
+    const sel = typeof window !== 'undefined' ? window.getSelection()?.toString() ?? '' : '';
+    if (sel.length > 0) return;
+    toggleExpand(pid);
+  }
+
+  function maxRowTime(items: ProcessRow[]): string | null {
+    let bestMs = 0;
+    let best: string | null = null;
+    for (const r of items) {
+      const t = new Date(r.time).getTime();
+      if (t > bestMs) {
+        bestMs = t;
+        best = r.time;
+      }
+    }
+    return best;
+  }
 
   async function refresh() {
     const opts: { limit: number; at?: string } = { limit };
@@ -20,11 +46,11 @@
     const fetched = await api.processes(hostId, opts);
     if (fetched.length > 0) {
       rows = fetched;
-      updatedAt = fetched[0].time;
+      updatedAt = maxRowTime(fetched);
     } else if (atMs === null && rows.length === 0) {
       const fallback = await api.processes(hostId, { limit, dir: 'prev' });
       rows = fallback;
-      updatedAt = fallback[0]?.time ?? null;
+      updatedAt = maxRowTime(fallback);
     } else if (atMs !== null) {
       rows = [];
       updatedAt = null;
@@ -43,8 +69,9 @@
       });
       if (fetched.length > 0) {
         rows = fetched;
-        updatedAt = fetched[0].time;
-        atMs = new Date(fetched[0].time).getTime();
+        const newest = maxRowTime(fetched);
+        updatedAt = newest;
+        atMs = newest ? new Date(newest).getTime() : null;
       } else if (dir === 'next') {
         atMs = null;
         await refresh();
@@ -57,11 +84,14 @@
     }
   }
 
+  let limitDirty = false;
   $effect(() => {
     void limit;
-    untrack(refresh);
+    if (limitDirty) untrack(refresh);
+    limitDirty = true;
   });
   onMount(() => {
+    refresh();
     timer = setInterval(() => {
       if (atMs !== null) return;
       refresh();
@@ -202,14 +232,31 @@
       </thead>
       <tbody class="divide-y divide-zinc-800/70">
         {#each sorted as p (p.pid)}
-          <tr class="hover:bg-zinc-900/60">
-            <td class="px-3 py-1.5 text-right text-zinc-500 numeric">{p.pid}</td>
+          {@const open = expandedPid === p.pid}
+          <tr
+            class="hover:bg-zinc-900/60 cursor-pointer {open ? 'bg-zinc-900/60' : ''}"
+            onclick={() => onRowClick(p.pid)}>
+            <td class="px-3 py-1.5 text-right text-zinc-500 numeric">
+              <span class="inline-flex items-center gap-1.5">
+                <svg viewBox="0 0 24 24" class="h-3 w-3 transition-transform {open ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                {p.pid}
+              </span>
+            </td>
             <td class="px-3 py-1.5 text-zinc-200 font-mono text-xs whitespace-nowrap">{p.name}</td>
             <td class="px-3 py-1.5 text-zinc-500 text-xs whitespace-nowrap">{p.user || ''}</td>
             <td class="px-3 py-1.5 text-right numeric {p.cpu_pct > 70 ? 'text-rose-300' : p.cpu_pct > 30 ? 'text-amber-300' : 'text-zinc-300'}">{pct(p.cpu_pct, 1)}</td>
             <td class="px-3 py-1.5 text-right numeric text-zinc-300">{bytes(p.mem_rss)}</td>
-            <td class="px-5 py-1.5 text-zinc-500 font-mono text-[11px] truncate max-w-md">{p.cmdline || ''}</td>
+            <td
+              class="px-5 py-1.5 text-zinc-500 font-mono text-[11px] truncate max-w-md cursor-text"
+              onclick={(e) => e.stopPropagation()}>{p.cmdline || ''}</td>
           </tr>
+          {#if open}
+            <tr class="bg-zinc-950/60">
+              <td colspan="6" class="p-0">
+                <ProcessDetail {hostId} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} />
+              </td>
+            </tr>
+          {/if}
         {/each}
       </tbody>
     </table>

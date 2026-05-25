@@ -16,10 +16,12 @@ COPY --from=web /internal/server/web/dist ./internal/server/web/dist
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 RUN go build -trimpath -ldflags="-s -w" -o /out/agent ./cmd/agent
+RUN mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=gobuild /out/server /usr/local/bin/server
 COPY --from=gobuild /out/agent  /usr/local/bin/agent
+COPY --from=gobuild --chown=65532:65532 /out/data /data
 USER nonroot
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --start-period=60s --retries=3 \

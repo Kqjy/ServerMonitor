@@ -13,6 +13,7 @@ import (
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
+	"servermonitor/pkg/agentsig"
 	"servermonitor/pkg/version"
 	"servermonitor/pkg/wire"
 )
@@ -22,7 +23,7 @@ const (
 	maxIngestDecompressed = 256 << 20
 )
 
-func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, logger *slog.Logger) http.HandlerFunc {
+func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer *agentsig.Signer, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := hostIDFromContext(r.Context())
 		if !ok {
@@ -61,7 +62,11 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, logger
 		}
 
 		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 {
-			writeJSON(w, http.StatusOK, wire.IngestAck{Accepted: 0, HostID: hostID})
+			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
+			if signer != nil {
+				emptyAck.ServerPubkey = signer.PublicKeyHex()
+			}
+			writeJSON(w, http.StatusOK, emptyAck)
 			return
 		}
 
@@ -136,6 +141,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, logger
 			Accepted:           len(batch.Points),
 			HostID:             hostID,
 			LatestAgentVersion: version.Version,
+		}
+		if signer != nil {
+			ack.ServerPubkey = signer.PublicKeyHex()
 		}
 		if host, hErr := hosts.Get(r.Context(), hostID); hErr == nil {
 			if host.SampleIntervalS > 0 {
