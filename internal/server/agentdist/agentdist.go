@@ -1,8 +1,11 @@
 package agentdist
 
 import (
+	"bytes"
 	"embed"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"strings"
 )
@@ -65,6 +68,28 @@ func Open(id string) (fs.File, Platform, error) {
 		return nil, Platform{}, err
 	}
 	return f, p, nil
+}
+
+func VerifyEmbeddedVersions(want string) error {
+	if want == "" {
+		return errors.New("want version is empty")
+	}
+	needle := []byte(want)
+	for _, p := range platforms {
+		f, err := binariesFS.Open("binaries/" + p.Filename)
+		if err != nil {
+			return fmt.Errorf("%s: open: %w", p.ID, err)
+		}
+		data, err := io.ReadAll(f)
+		_ = f.Close()
+		if err != nil {
+			return fmt.Errorf("%s: read: %w", p.ID, err)
+		}
+		if !bytes.Contains(data, needle) {
+			return fmt.Errorf("%s: embedded binary does not contain version %q (rebuild via: go run ./scripts/buildagents)", p.ID, want)
+		}
+	}
+	return nil
 }
 
 func PlatformFromUserAgent(ua string) string {

@@ -19,6 +19,8 @@ web/build/
 internal/server/web/dist/_app/
 internal/server/web/dist/favicon.svg
 
+internal/server/agentdist/binaries/sm-agent-*
+
 .DS_Store
 Thumbs.db
 .vscode/

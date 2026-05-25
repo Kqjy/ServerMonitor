@@ -14,6 +14,7 @@ RUN go mod download
 COPY . .
 COPY --from=web /internal/server/web/dist ./internal/server/web/dist
 ENV CGO_ENABLED=0
+RUN go run ./scripts/buildagents
 RUN go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 RUN go build -trimpath -ldflags="-s -w" -o /out/agent ./cmd/agent
 RUN mkdir -p /out/data

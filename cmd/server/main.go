@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"servermonitor/internal/server/agentdist"
 	"servermonitor/internal/server/alerting"
 	"servermonitor/internal/server/api"
 	"servermonitor/internal/server/archive"
@@ -55,6 +56,11 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	if err := agentdist.VerifyEmbeddedVersions(version.Version); err != nil {
+		logger.Error("embedded agent binaries are stale: refusing to start (would put agents into an upgrade loop)", "err", err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
