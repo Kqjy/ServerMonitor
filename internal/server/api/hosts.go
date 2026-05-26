@@ -22,25 +22,31 @@ import (
 	"servermonitor/pkg/version"
 )
 
+type collectorStatusDTO struct {
+	State   string `json:"state"`
+	Message string `json:"message,omitempty"`
+}
+
 type hostDTO struct {
-	ID                    int64             `json:"id"`
-	Hostname              string            `json:"hostname"`
-	OS                    string            `json:"os,omitempty"`
-	Arch                  string            `json:"arch,omitempty"`
-	Kernel                string            `json:"kernel,omitempty"`
-	AgentVersion          string            `json:"agent_version,omitempty"`
-	LatestAgentVersion    string            `json:"latest_agent_version,omitempty"`
-	UpdateAvailable       bool              `json:"update_available,omitempty"`
-	AutoUpgrade           bool              `json:"auto_upgrade"`
-	SupportsRemoteUpgrade bool              `json:"supports_remote_upgrade"`
-	UpgradePending        bool              `json:"upgrade_pending,omitempty"`
-	SampleIntervalS       int               `json:"sample_interval_s"`
-	EnabledCollectors     []string          `json:"enabled_collectors,omitempty"`
-	Tags                  map[string]string `json:"tags,omitempty"`
-	LastSeenISO           string            `json:"last_seen,omitempty"`
-	CreatedAtISO          string            `json:"created_at"`
-	FiringAlerts          int               `json:"firing_alerts,omitempty"`
-	FiringSeverity        string            `json:"firing_severity,omitempty"`
+	ID                    int64                         `json:"id"`
+	Hostname              string                        `json:"hostname"`
+	OS                    string                        `json:"os,omitempty"`
+	Arch                  string                        `json:"arch,omitempty"`
+	Kernel                string                        `json:"kernel,omitempty"`
+	AgentVersion          string                        `json:"agent_version,omitempty"`
+	LatestAgentVersion    string                        `json:"latest_agent_version,omitempty"`
+	UpdateAvailable       bool                          `json:"update_available,omitempty"`
+	AutoUpgrade           bool                          `json:"auto_upgrade"`
+	SupportsRemoteUpgrade bool                          `json:"supports_remote_upgrade"`
+	UpgradePending        bool                          `json:"upgrade_pending,omitempty"`
+	SampleIntervalS       int                           `json:"sample_interval_s"`
+	EnabledCollectors     []string                      `json:"enabled_collectors,omitempty"`
+	CollectorStatus       map[string]collectorStatusDTO `json:"collector_status,omitempty"`
+	Tags                  map[string]string             `json:"tags,omitempty"`
+	LastSeenISO           string                        `json:"last_seen,omitempty"`
+	CreatedAtISO          string                        `json:"created_at"`
+	FiringAlerts          int                           `json:"firing_alerts,omitempty"`
+	FiringSeverity        string                        `json:"firing_severity,omitempty"`
 }
 
 const minRemoteUpgradeVersion = "0.1.1"
@@ -69,6 +75,12 @@ func toDTO(h storage.Host) hostDTO {
 		EnabledCollectors:     h.EnabledCollectors,
 		Tags:                  h.Tags,
 		CreatedAtISO:          h.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+	}
+	if len(h.CollectorStatus) > 0 {
+		d.CollectorStatus = make(map[string]collectorStatusDTO, len(h.CollectorStatus))
+		for k, v := range h.CollectorStatus {
+			d.CollectorStatus[k] = collectorStatusDTO{State: v.State, Message: v.Message}
+		}
 	}
 	if h.LastSeen != nil {
 		d.LastSeenISO = h.LastSeen.UTC().Format("2006-01-02T15:04:05Z")

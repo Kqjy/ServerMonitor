@@ -38,14 +38,29 @@ type Container struct {
 	TxBytes  int64     `json:"tx_bytes,omitempty"`
 }
 
+type Port struct {
+	Time    time.Time `json:"t"`
+	Proto   string    `json:"proto"`
+	Addr    string    `json:"addr"`
+	Port    uint16    `json:"port"`
+	PID     int32     `json:"pid,omitempty"`
+	Process string    `json:"process,omitempty"`
+}
+
+type CollectorStatus struct {
+	State   string `json:"state"`
+	Message string `json:"message,omitempty"`
+}
+
 type HostInfo struct {
-	Hostname     string            `json:"hostname"`
-	OS           string            `json:"os"`
-	Arch         string            `json:"arch"`
-	Kernel       string            `json:"kernel,omitempty"`
-	AgentVersion string            `json:"agent_version"`
-	Collectors   []string          `json:"collectors,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
+	Hostname        string                     `json:"hostname"`
+	OS              string                     `json:"os"`
+	Arch            string                     `json:"arch"`
+	Kernel          string                     `json:"kernel,omitempty"`
+	AgentVersion    string                     `json:"agent_version"`
+	Collectors      []string                   `json:"collectors,omitempty"`
+	CollectorStatus map[string]CollectorStatus `json:"collector_status,omitempty"`
+	Tags            map[string]string          `json:"tags,omitempty"`
 }
 
 type Batch struct {
@@ -53,6 +68,7 @@ type Batch struct {
 	Points     []Point     `json:"points"`
 	Processes  []Process   `json:"processes,omitempty"`
 	Containers []Container `json:"containers,omitempty"`
+	Ports      []Port      `json:"ports,omitempty"`
 	Sent       time.Time   `json:"sent"`
 }
 

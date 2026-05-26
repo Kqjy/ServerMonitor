@@ -31,6 +31,14 @@ var smartctlCandidates = map[string][]string{
 	},
 }
 
+const (
+	smartStateUnknown  = "unknown"
+	smartStateOK       = "ok"
+	smartStateBinary   = "binary_missing"
+	smartStateScanFail = "scan_failed"
+	smartStateNoDevs   = "no_devices"
+)
+
 type smartCollector struct {
 	mu         sync.Mutex
 	probed     bool
@@ -38,12 +46,29 @@ type smartCollector struct {
 	devices    []string
 	devicesAt  time.Time
 	devicesTTL time.Duration
+	state      string
+	stateMsg   string
 }
 
 func init() { Register(&smartCollector{}) }
 
 func (c *smartCollector) Name() string        { return "smart" }
 func (c *smartCollector) Platforms() []string { return []string{"linux", "darwin", "windows"} }
+
+func (c *smartCollector) Status() wire.CollectorStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state := c.state
+	if state == "" {
+		state = smartStateUnknown
+	}
+	return wire.CollectorStatus{State: state, Message: c.stateMsg}
+}
+
+func (c *smartCollector) setStateLocked(state, msg string) {
+	c.state = state
+	c.stateMsg = msg
+}
 
 func (c *smartCollector) ensure(ctx context.Context) bool {
 	c.mu.Lock()
@@ -56,13 +81,15 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 		c.smartctl = resolveTrustedBin(smartctlCandidates[runtime.GOOS])
 	}
 	if c.smartctl == "" {
+		c.setStateLocked(smartStateBinary, "smartctl binary not found; install smartmontools")
 		return false
 	}
 	if time.Since(c.devicesAt) < c.devicesTTL && c.devices != nil {
-		return true
+		return len(c.devices) > 0
 	}
 	out, err := run(ctx, c.smartctl, "--scan", "--json=c")
 	if err != nil {
+		c.setStateLocked(smartStateScanFail, "smartctl --scan failed: "+err.Error())
 		return false
 	}
 	var scan struct {
@@ -71,6 +98,7 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 		} `json:"devices"`
 	}
 	if err := json.Unmarshal(out, &scan); err != nil {
+		c.setStateLocked(smartStateScanFail, "smartctl --scan returned unparseable output")
 		return false
 	}
 	c.devices = c.devices[:0]
@@ -78,7 +106,12 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 		c.devices = append(c.devices, d.Name)
 	}
 	c.devicesAt = time.Now()
-	return len(c.devices) > 0
+	if len(c.devices) == 0 {
+		c.setStateLocked(smartStateNoDevs, "smartctl scanned successfully but reports no SMART-capable devices")
+		return false
+	}
+	c.setStateLocked(smartStateOK, "")
+	return true
 }
 
 func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {

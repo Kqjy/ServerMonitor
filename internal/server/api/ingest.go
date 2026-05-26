@@ -61,7 +61,7 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			return
 		}
 
-		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 {
+		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 {
 			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
 			if signer != nil {
 				emptyAck.ServerPubkey = signer.PublicKeyHex()
@@ -106,8 +106,19 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 				return
 			}
 		}
+		for i := range batch.Ports {
+			t := batch.Ports[i].Time
+			if t.IsZero() {
+				batch.Ports[i].Time = now
+				continue
+			}
+			if t.Before(minT) || t.After(maxT) {
+				writeError(w, http.StatusBadRequest, "timestamp out of range")
+				return
+			}
+		}
 
-		points, procs, conts := ingest.ConvertBatch(hostID, &batch)
+		points, procs, conts, ports := ingest.ConvertBatch(hostID, &batch)
 		if err := b.Reserve(len(points)); err != nil {
 			if errors.Is(err, ingest.ErrBackpressure) {
 				w.Header().Set("Retry-After", "2")
@@ -117,22 +128,30 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			writeError(w, http.StatusInternalServerError, "reserve failed")
 			return
 		}
-		if err := ingest.InsertSnapshots(r.Context(), b.Pool(), procs, conts); err != nil {
+		if err := ingest.InsertSnapshots(r.Context(), b.Pool(), procs, conts, ports); err != nil {
 			b.ReleaseReserved(len(points))
-			logger.Warn("insert snapshots", "err", err, "host", hostID, "procs", len(procs), "conts", len(conts))
+			logger.Warn("insert snapshots", "err", err, "host", hostID, "procs", len(procs), "conts", len(conts), "ports", len(ports))
 			w.Header().Set("Retry-After", "2")
 			writeError(w, http.StatusBadGateway, "snapshot insert failed")
 			return
 		}
 		b.CommitReserved(points)
 
+		var collStatus map[string]storage.CollectorStatus
+		if len(batch.Host.CollectorStatus) > 0 {
+			collStatus = make(map[string]storage.CollectorStatus, len(batch.Host.CollectorStatus))
+			for k, v := range batch.Host.CollectorStatus {
+				collStatus[k] = storage.CollectorStatus{State: v.State, Message: v.Message}
+			}
+		}
 		_ = hosts.Touch(r.Context(), hostID, storage.HostInfoUpdate{
-			OS:           batch.Host.OS,
-			Arch:         batch.Host.Arch,
-			Kernel:       batch.Host.Kernel,
-			AgentVersion: batch.Host.AgentVersion,
-			Collectors:   batch.Host.Collectors,
-			Tags:         batch.Host.Tags,
+			OS:              batch.Host.OS,
+			Arch:            batch.Host.Arch,
+			Kernel:          batch.Host.Kernel,
+			AgentVersion:    batch.Host.AgentVersion,
+			Collectors:      batch.Host.Collectors,
+			CollectorStatus: collStatus,
+			Tags:            batch.Host.Tags,
 		})
 
 		hub.Broadcast(hostID, batch.Points)

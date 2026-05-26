@@ -1,39 +1,21 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import 'uplot';
-  import { api, type ContainerRow } from '$lib/api';
-  import { bytes, pct, timeAgo } from '$lib/format';
-  import ContainerDetail from './ContainerDetail.svelte';
+  import { api, type PortRow } from '$lib/api';
+  import { timeAgo } from '$lib/format';
 
   let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
 
-  let rows = $state<ContainerRow[]>([]);
+  let rows = $state<PortRow[]>([]);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
-  let expandedCid = $state<string | null>(null);
+  let filter = $state('');
+  let scope = $state<'all' | 'public' | 'local'>('all');
   let timer: ReturnType<typeof setInterval> | null = null;
-
-  function toggleExpand(cid: string) {
-    expandedCid = expandedCid === cid ? null : cid;
-  }
-
-  function onRowClick(cid: string) {
-    const sel = typeof window !== 'undefined' ? window.getSelection()?.toString() ?? '' : '';
-    if (sel.length > 0) return;
-    toggleExpand(cid);
-  }
 
   async function refresh() {
     const opts: { at?: string } = {};
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
-    const fetched = await api.containers(hostId, opts);
-    if (fetched.length > 0) {
-      rows = fetched;
-    } else if (atMs === null && rows.length === 0) {
-      rows = await api.containers(hostId, { dir: 'prev' });
-    } else if (atMs !== null) {
-      rows = [];
-    }
+    rows = await api.ports(hostId, opts);
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -41,7 +23,7 @@
     stepping = true;
     try {
       const boundaryMs = atMs ?? lastDataMs ?? Date.now();
-      const fetched = await api.containers(hostId, {
+      const fetched = await api.ports(hostId, {
         dir,
         at: new Date(boundaryMs).toISOString()
       });
@@ -99,6 +81,22 @@
     refresh();
   }
 
+  function isLoopback(addr: string): boolean {
+    return addr === '127.0.0.1' || addr === '::1' || addr.startsWith('127.');
+  }
+  function isWildcard(addr: string): boolean {
+    return addr === '0.0.0.0' || addr === '::' || addr === '' || addr === '*';
+  }
+  function reachLabel(addr: string): { text: string; tone: 'public' | 'local' | 'specific' } {
+    if (isLoopback(addr)) return { text: 'loopback', tone: 'local' };
+    if (isWildcard(addr)) return { text: 'all interfaces', tone: 'public' };
+    return { text: addr, tone: 'specific' };
+  }
+  function displayAddr(addr: string): string {
+    if (isWildcard(addr)) return '*';
+    return addr;
+  }
+
   const lastDataMs = $derived.by(() => {
     let max = 0;
     for (const r of rows) {
@@ -115,14 +113,41 @@
         : ''
   );
   const isLive = $derived(atMs === null);
-  const running = $derived(rows.filter((r) => r.state.toLowerCase() === 'running'));
-  const stopped = $derived(rows.filter((r) => r.state.toLowerCase() !== 'running'));
+
+  const filtered = $derived.by(() => {
+    const f = filter.trim().toLowerCase();
+    return rows.filter((r) => {
+      const loop = isLoopback(r.addr);
+      if (scope === 'public' && loop) return false;
+      if (scope === 'local' && !loop) return false;
+      if (!f) return true;
+      if (String(r.port).includes(f)) return true;
+      if (r.proto.toLowerCase().includes(f)) return true;
+      if (r.process && r.process.toLowerCase().includes(f)) return true;
+      if (r.addr.toLowerCase().includes(f)) return true;
+      return false;
+    });
+  });
+
+  const counts = $derived.by(() => {
+    let pub = 0;
+    let loc = 0;
+    let tcp = 0;
+    let udp = 0;
+    for (const r of rows) {
+      if (isLoopback(r.addr)) loc++;
+      else pub++;
+      if (r.proto.startsWith('tcp')) tcp++;
+      else if (r.proto.startsWith('udp')) udp++;
+    }
+    return { pub, loc, tcp, udp };
+  });
 </script>
 
 <div class="rounded-xl border border-zinc-800 bg-zinc-900/40">
   <header class="px-4 sm:px-5 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
-    <div class="text-xs uppercase tracking-wider text-zinc-500">Containers</div>
-    <div class="flex items-center gap-3 text-xs text-zinc-500">
+    <div class="text-xs uppercase tracking-wider text-zinc-500">Listening ports</div>
+    <div class="flex flex-wrap items-center gap-3 text-xs text-zinc-500">
       <div class="flex items-center gap-1">
         <button
           type="button"
@@ -157,22 +182,43 @@
           Now
         </button>
       </div>
-      <span class="numeric text-zinc-400">{running.length} running · {stopped.length} stopped</span>
+      <span class="numeric text-zinc-400">
+        {counts.pub} public · {counts.loc} loopback · {counts.tcp} tcp · {counts.udp} udp
+      </span>
     </div>
   </header>
+
+  <div class="px-4 sm:px-5 py-2 border-b border-zinc-800 flex flex-wrap items-center gap-2">
+    <input
+      type="text"
+      placeholder="Filter port, process, or address…"
+      bind:value={filter}
+      class="flex-1 min-w-[12rem] bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs"
+    />
+    <div class="flex items-center gap-1 text-xs">
+      {#each [{v:'all',l:'All'},{v:'public',l:'Public'},{v:'local',l:'Loopback'}] as opt (opt.v)}
+        <button
+          type="button"
+          onclick={() => (scope = opt.v as typeof scope)}
+          class="px-2 py-1 rounded-md transition-colors {scope === opt.v ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">
+          {opt.l}
+        </button>
+      {/each}
+    </div>
+  </div>
 
   {#if rows.length === 0}
     <div class="p-12 text-center">
       <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
         <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
-          <path d="M3 8h18l-2 11H5L3 8Z" /><path d="M8 8V5h8v3" />
+          <rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
         </svg>
       </div>
-      <h2 class="text-base font-medium text-zinc-100">No containers detected</h2>
+      <h2 class="text-base font-medium text-zinc-100">No listening ports</h2>
       <p class="mt-1 text-sm text-zinc-500 max-w-md mx-auto">
         {isLive
-          ? "The agent didn't find a reachable Docker daemon. If one is running, ensure the agent has access to the docker socket."
-          : 'No container data within 5 minutes of the selected moment.'}
+          ? 'The agent did not report any bound sockets on this host.'
+          : 'No port data within 2 minutes of the selected moment.'}
       </p>
     </div>
   {:else}
@@ -180,51 +226,42 @@
       <table class="w-full text-sm">
         <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
           <tr>
-            <th class="text-left font-medium px-5 py-2.5">Name</th>
-            <th class="text-left font-medium px-3 py-2.5">Image</th>
-            <th class="text-left font-medium px-3 py-2.5">State</th>
-            <th class="text-right font-medium px-3 py-2.5">CPU</th>
-            <th class="text-right font-medium px-3 py-2.5">Memory</th>
-            <th class="text-right font-medium px-3 py-2.5">Net I/O</th>
+            <th class="text-right font-medium px-5 py-2.5 w-20">Port</th>
+            <th class="text-left font-medium px-3 py-2.5 w-20">Proto</th>
+            <th class="text-left font-medium px-3 py-2.5">Bind</th>
+            <th class="text-left font-medium px-3 py-2.5">Process</th>
+            <th class="text-right font-medium px-3 py-2.5">PID</th>
             <th class="text-right font-medium px-5 py-2.5">Updated</th>
           </tr>
         </thead>
         <tbody class="divide-y divide-zinc-800/70">
-          {#each rows as c (c.cid)}
-            {@const isUp = c.state.toLowerCase() === 'running'}
-            {@const open = expandedCid === c.cid}
-            <tr
-              class="hover:bg-zinc-900/60 cursor-pointer {open ? 'bg-zinc-900/60' : ''}"
-              onclick={() => onRowClick(c.cid)}>
-              <td class="px-5 py-2 text-zinc-100 font-mono text-xs whitespace-nowrap">
-                <div class="inline-flex items-center gap-1.5">
-                  <svg viewBox="0 0 24 24" class="h-3 w-3 text-zinc-500 transition-transform {open ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
-                  <span>{c.name}</span>
+          {#each filtered as p (p.proto + '|' + p.addr + '|' + p.port)}
+            {@const reach = reachLabel(p.addr)}
+            <tr class="hover:bg-zinc-900/60">
+              <td class="px-5 py-2 text-right numeric font-mono text-zinc-100">{p.port}</td>
+              <td class="px-3 py-2 text-zinc-400 text-xs font-mono uppercase">{p.proto}</td>
+              <td class="px-3 py-2 text-xs">
+                <div class="flex items-center gap-2">
+                  <span class="font-mono text-zinc-400">{displayAddr(p.addr)}</span>
+                  {#if reach.tone === 'public'}
+                    <span class="text-[10px] uppercase tracking-wider text-amber-400">all interfaces</span>
+                  {:else if reach.tone === 'local'}
+                    <span class="text-[10px] uppercase tracking-wider text-zinc-500">loopback</span>
+                  {/if}
                 </div>
-                <div class="text-[10px] text-zinc-500 pl-[18px]">{c.cid}</div>
               </td>
-              <td
-                class="px-3 py-2 text-zinc-400 font-mono text-xs cursor-text"
-                onclick={(e) => e.stopPropagation()}>{c.image}</td>
-              <td class="px-3 py-2">
-                <span class="inline-flex items-center gap-1.5 text-xs">
-                  <span class={`h-1.5 w-1.5 rounded-full ${isUp ? 'bg-emerald-400' : 'bg-zinc-600'}`}></span>
-                  <span class={isUp ? 'text-emerald-300' : 'text-zinc-500'}>{c.state}</span>
-                </span>
-              </td>
-              <td class="px-3 py-2 text-right numeric text-zinc-300">{isUp ? pct(c.cpu_pct, 1) : '—'}</td>
-              <td class="px-3 py-2 text-right numeric text-zinc-300">{isUp ? `${bytes(c.mem_used)}${c.mem_limit ? ` / ${bytes(c.mem_limit)}` : ''}` : '—'}</td>
-              <td class="px-3 py-2 text-right numeric text-zinc-300">{isUp ? `${bytes(c.rx_bytes ?? 0)} / ${bytes(c.tx_bytes ?? 0)}` : '—'}</td>
-              <td class="px-5 py-2 text-right text-zinc-500 text-xs numeric">{timeAgo(c.time)}</td>
+              <td class="px-3 py-2 text-zinc-300 text-xs truncate max-w-xs">{p.process || '—'}</td>
+              <td class="px-3 py-2 text-right numeric text-zinc-500 text-xs">{p.pid && p.pid > 0 ? p.pid : '—'}</td>
+              <td class="px-5 py-2 text-right text-zinc-500 text-xs numeric">{timeAgo(p.time)}</td>
             </tr>
-            {#if open}
-              <tr class="bg-zinc-950/60">
-                <td colspan="7" class="p-0">
-                  <ContainerDetail {hostId} cid={c.cid} at={atMs ?? lastDataMs} pinned={atMs !== null} />
-                </td>
-              </tr>
-            {/if}
           {/each}
+          {#if filtered.length === 0}
+            <tr>
+              <td colspan="6" class="px-5 py-8 text-center text-xs text-zinc-500">
+                No ports match the current filter.
+              </td>
+            </tr>
+          {/if}
         </tbody>
       </table>
     </div>

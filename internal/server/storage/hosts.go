@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -18,6 +19,11 @@ var (
 	ErrHostnameTaken  = errors.New("hostname already in use")
 )
 
+type CollectorStatus struct {
+	State   string `json:"state"`
+	Message string `json:"message,omitempty"`
+}
+
 type Host struct {
 	ID                 int64
 	Hostname           string
@@ -27,6 +33,7 @@ type Host struct {
 	AgentVersion       string
 	SampleIntervalS    int
 	EnabledCollectors  []string
+	CollectorStatus    map[string]CollectorStatus
 	Tags               map[string]string
 	LastSeen           *time.Time
 	CreatedAt          time.Time
@@ -206,7 +213,8 @@ func (h *Hosts) refresh(ctx context.Context) error {
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, hostname, agent_token_hash, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(kernel,''), COALESCE(agent_version,''),
-		       sample_interval_s, enabled_collectors, tags, last_seen, created_at, deleted_at,
+		       sample_interval_s, enabled_collectors, tags, collector_status,
+		       last_seen, created_at, deleted_at,
 		       auto_upgrade, upgrade_requested_at
 		FROM hosts
 	`)
@@ -219,14 +227,15 @@ func (h *Hosts) refresh(ctx context.Context) error {
 	byID := make(map[int64]Host)
 	for rows.Next() {
 		var (
-			host Host
-			hash []byte
-			tags []byte
+			host       Host
+			hash       []byte
+			tags       []byte
+			collStatus []byte
 		)
 		if err := rows.Scan(
 			&host.ID, &host.Hostname, &hash, &host.OS, &host.Arch,
 			&host.Kernel, &host.AgentVersion,
-			&host.SampleIntervalS, &host.EnabledCollectors, &tags,
+			&host.SampleIntervalS, &host.EnabledCollectors, &tags, &collStatus,
 			&host.LastSeen, &host.CreatedAt, &host.DeletedAt,
 			&host.AutoUpgrade, &host.UpgradeRequestedAt,
 		); err != nil {
@@ -234,6 +243,9 @@ func (h *Hosts) refresh(ctx context.Context) error {
 		}
 		if len(tags) > 0 {
 			_ = json.Unmarshal(tags, &host.Tags)
+		}
+		if len(collStatus) > 0 {
+			_ = json.Unmarshal(collStatus, &host.CollectorStatus)
 		}
 		var key [32]byte
 		copy(key[:], hash)
@@ -307,6 +319,14 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) error 
 		}
 		tags = b
 	}
+	collStatus := []byte("{}")
+	if len(info.CollectorStatus) > 0 {
+		b, err := json.Marshal(info.CollectorStatus)
+		if err != nil {
+			return err
+		}
+		collStatus = b
+	}
 	_, err := h.db.Pool.Exec(ctx, `
 		UPDATE hosts SET
 		  os = COALESCE(NULLIF($2,''), os),
@@ -315,20 +335,34 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) error 
 		  agent_version = COALESCE(NULLIF($5,''), agent_version),
 		  enabled_collectors = CASE WHEN cardinality($6::text[]) > 0 THEN $6 ELSE enabled_collectors END,
 		  tags = CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE tags END,
+		  collector_status = CASE WHEN $8::jsonb <> '{}'::jsonb THEN $8::jsonb ELSE collector_status END,
 		  last_seen = now()
 		WHERE id = $1 AND deleted_at IS NULL
-	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags)
-	if err == nil && len(info.Tags) > 0 {
+	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus)
+	if err != nil {
+		return err
+	}
+	h.mu.RLock()
+	cached, cacheOK := h.byID[id]
+	cacheValid := time.Since(h.cachedAt) < h.cacheTTL
+	h.mu.RUnlock()
+	if !cacheValid || !cacheOK {
+		return nil
+	}
+	tagsChanged := len(info.Tags) > 0 && !maps.Equal(info.Tags, cached.Tags)
+	statusChanged := len(info.CollectorStatus) > 0 && !maps.Equal(info.CollectorStatus, cached.CollectorStatus)
+	if tagsChanged || statusChanged {
 		h.invalidate()
 	}
-	return err
+	return nil
 }
 
 type HostInfoUpdate struct {
-	OS           string
-	Arch         string
-	Kernel       string
-	AgentVersion string
-	Collectors   []string
-	Tags         map[string]string
+	OS              string
+	Arch            string
+	Kernel          string
+	AgentVersion    string
+	Collectors      []string
+	CollectorStatus map[string]CollectorStatus
+	Tags            map[string]string
 }

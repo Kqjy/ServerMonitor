@@ -15,13 +15,14 @@
   import NetworkTab from '$lib/components/host/NetworkTab.svelte';
   import ProcessesTab from '$lib/components/host/ProcessesTab.svelte';
   import ContainersTab from '$lib/components/host/ContainersTab.svelte';
+  import PortsTab from '$lib/components/host/PortsTab.svelte';
   import SensorsTab from '$lib/components/host/SensorsTab.svelte';
   import GpuTab from '$lib/components/host/GpuTab.svelte';
 
   const id = $derived(Number($page.params.id));
   const tab = $derived(($page.url.searchParams.get('tab') ?? 'overview') as TabName);
-  type TabName = 'overview' | 'memory' | 'disk' | 'network' | 'processes' | 'containers' | 'sensors' | 'gpu';
-  const showRange = $derived(tab !== 'processes' && tab !== 'containers');
+  type TabName = 'overview' | 'memory' | 'disk' | 'network' | 'processes' | 'containers' | 'ports' | 'sensors' | 'gpu';
+  const showRange = $derived(tab !== 'processes' && tab !== 'containers' && tab !== 'ports');
 
   let host = $state<Host | null>(null);
   let activeAlerts = $state<ActiveAlert[]>([]);
@@ -40,6 +41,7 @@
     { value: 'network', label: 'Network' },
     { value: 'processes', label: 'Processes' },
     { value: 'containers', label: 'Containers' },
+    { value: 'ports', label: 'Ports' },
     { value: 'sensors', label: 'Sensors' },
     { value: 'gpu', label: 'GPU' }
   ];
@@ -242,10 +244,11 @@
     <div class="mt-6">
       {#if tabModel === 'overview'}<OverviewTab hostId={id} {range} />
       {:else if tabModel === 'memory'}<MemoryTab hostId={id} {range} />
-      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} enabledCollectors={host.enabled_collectors ?? []} />
+      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} enabledCollectors={host.enabled_collectors ?? []} collectorStatus={host.collector_status ?? {}} />
       {:else if tabModel === 'network'}<NetworkTab hostId={id} {range} />
       {:else if tabModel === 'processes'}<ProcessesTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'containers'}<ContainersTab hostId={id} sampleIntervalS={host.sample_interval_s} />
+      {:else if tabModel === 'ports'}<PortsTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} />
       {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} />
       {/if}

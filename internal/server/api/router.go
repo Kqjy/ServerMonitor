@@ -96,6 +96,7 @@ func New(d Deps) *Router {
 				r.Get("/hosts/{id}/processes/{pid}/series", hostProcessSeriesHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/containers", hostContainersHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/containers/{cid}/series", hostContainerSeriesHandler(d.DB, d.Hosts))
+				r.Get("/hosts/{id}/ports", hostPortsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/labels", hostLabelsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/alerts/active", hostActiveAlertsHandler(d.DB, d.Hosts))
 				r.Get("/series", seriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))

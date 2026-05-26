@@ -79,6 +79,15 @@ type containerSnapshot struct {
 	Time     time.Time `json:"time"`
 }
 
+type portSnapshot struct {
+	Proto   string    `json:"proto"`
+	Addr    string    `json:"addr"`
+	Port    int32     `json:"port"`
+	PID     int32     `json:"pid,omitempty"`
+	Process string    `json:"process,omitempty"`
+	Time    time.Time `json:"time"`
+}
+
 func hostProcessesHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -180,6 +189,15 @@ func resolveSnapshotAt(ctx context.Context, db *storage.DB, table string, hostID
 			query = `SELECT max(time) FROM containers WHERE host_id = $1 AND time < $2::timestamptz - INTERVAL '1 millisecond'`
 		case "next":
 			query = `SELECT min(time) FROM containers WHERE host_id = $1 AND time > $2::timestamptz + INTERVAL '1 millisecond'`
+		default:
+			return nil, errors.New("invalid dir")
+		}
+	case "ports":
+		switch dir {
+		case "prev":
+			query = `SELECT max(time) FROM ports WHERE host_id = $1 AND time < $2::timestamptz - INTERVAL '1 millisecond'`
+		case "next":
+			query = `SELECT min(time) FROM ports WHERE host_id = $1 AND time > $2::timestamptz + INTERVAL '1 millisecond'`
 		default:
 			return nil, errors.New("invalid dir")
 		}
@@ -533,6 +551,83 @@ func hostContainerSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.Handl
 			StepSec: step,
 			Points:  points,
 		})
+	}
+}
+
+func hostPortsHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if _, err := hosts.Get(r.Context(), hostID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		at := time.Now()
+		if atParam := r.URL.Query().Get("at"); atParam != "" {
+			parsed, err := time.Parse(time.RFC3339, atParam)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid at timestamp")
+				return
+			}
+			at = parsed
+		}
+		switch r.URL.Query().Get("dir") {
+		case "":
+		case "prev", "next":
+			resolved, err := resolveSnapshotAt(r.Context(), db, "ports", hostID, at, r.URL.Query().Get("dir"))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if resolved == nil {
+				writeJSON(w, http.StatusOK, []portSnapshot{})
+				return
+			}
+			at = *resolved
+		default:
+			writeError(w, http.StatusBadRequest, "invalid dir")
+			return
+		}
+		rows, err := db.Pool.Query(r.Context(), `
+			WITH latest AS (
+			  SELECT DISTINCT ON (proto, addr, port)
+			         time, proto, addr, port,
+			         COALESCE(pid, 0) AS pid,
+			         COALESCE(process, '') AS process
+			  FROM ports
+			  WHERE host_id = $1 AND time <= $2 AND time > $2 - INTERVAL '2 minutes'
+			  ORDER BY proto, addr, port, time DESC
+			)
+			SELECT time, proto, addr, port, pid, process
+			FROM latest
+			ORDER BY port ASC, proto ASC, addr ASC
+		`, hostID, at)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer rows.Close()
+		out := make([]portSnapshot, 0, 64)
+		for rows.Next() {
+			var p portSnapshot
+			if err := rows.Scan(&p.Time, &p.Proto, &p.Addr, &p.Port, &p.PID, &p.Process); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			out = append(out, p)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 

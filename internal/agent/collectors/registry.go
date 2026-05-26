@@ -41,6 +41,14 @@ type ContainerCollector interface {
 	CollectContainers(ctx context.Context) ([]wire.Container, error)
 }
 
+type PortCollector interface {
+	CollectPorts(ctx context.Context) ([]wire.Port, error)
+}
+
+type StatusReporter interface {
+	Status() wire.CollectorStatus
+}
+
 var (
 	regMu      sync.Mutex
 	registered []Collector

@@ -226,8 +226,8 @@ func InsertProcesses(ctx context.Context, pool *pgxpool.Pool, rows []ProcessRow)
 	return err
 }
 
-func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow, conts []ContainerRow) error {
-	if len(procs) == 0 && len(conts) == 0 {
+func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow, conts []ContainerRow, ports []PortRow) error {
+	if len(procs) == 0 && len(conts) == 0 && len(ports) == 0 {
 		return nil
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
@@ -255,7 +255,27 @@ func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow
 			return err
 		}
 	}
+	if len(ports) > 0 {
+		src := pgx.CopyFromSlice(len(ports), func(i int) ([]any, error) {
+			r := ports[i]
+			return []any{r.Time, r.HostID, r.Proto, r.Addr, r.Port, r.PID, r.Process}, nil
+		})
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"ports"},
+			[]string{"time", "host_id", "proto", "addr", "port", "pid", "process"}, src); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
+}
+
+type PortRow struct {
+	Time    time.Time
+	HostID  int64
+	Proto   string
+	Addr    string
+	Port    int32
+	PID     *int32
+	Process *string
 }
 
 type ContainerRow struct {
@@ -285,7 +305,7 @@ func InsertContainers(ctx context.Context, pool *pgxpool.Pool, rows []ContainerR
 	return err
 }
 
-func ConvertBatch(hostID int64, batch *wire.Batch) ([]Row, []ProcessRow, []ContainerRow) {
+func ConvertBatch(hostID int64, batch *wire.Batch) ([]Row, []ProcessRow, []ContainerRow, []PortRow) {
 	points := make([]Row, 0, len(batch.Points))
 	now := time.Now()
 	for _, p := range batch.Points {
@@ -326,5 +346,28 @@ func ConvertBatch(hostID int64, batch *wire.Batch) ([]Row, []ProcessRow, []Conta
 			MemLimit: c.MemLimit, RxBytes: c.RxBytes, TxBytes: c.TxBytes,
 		})
 	}
-	return points, procs, conts
+	ports := make([]PortRow, 0, len(batch.Ports))
+	for _, p := range batch.Ports {
+		t := p.Time
+		if t.IsZero() {
+			t = now
+		}
+		row := PortRow{
+			Time:   t,
+			HostID: hostID,
+			Proto:  p.Proto,
+			Addr:   p.Addr,
+			Port:   int32(p.Port),
+		}
+		if p.PID > 0 {
+			pid := p.PID
+			row.PID = &pid
+		}
+		if p.Process != "" {
+			name := p.Process
+			row.Process = &name
+		}
+		ports = append(ports, row)
+	}
+	return points, procs, conts, ports
 }

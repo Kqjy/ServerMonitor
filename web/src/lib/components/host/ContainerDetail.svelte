@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import { api, type ContainerSeriesPoint } from '$lib/api';
-  import MultiChart from '$lib/components/MultiChart.svelte';
+  import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import { bytes } from '$lib/format';
 
-  let { hostId, cid, at = null }: { hostId: number; cid: string; at?: number | null } = $props();
+  let { hostId, cid, at = null, pinned = false }: { hostId: number; cid: string; at?: number | null; pinned?: boolean } = $props();
 
   type Win = '15m' | '1h' | '6h' | '24h';
   const windows: { key: Win; ms: number; label: string }[] = [
@@ -19,25 +19,38 @@
   let points = $state<ContainerSeriesPoint[]>([]);
   let fromMs = $state(Date.now() - 60 * 60 * 1000);
   let toMs = $state(Date.now());
+  let chartZoom = $state<ChartZoom>(null);
+  let windowFromMs = Date.now() - 60 * 60 * 1000;
+  let windowToMs = Date.now();
   let ac: AbortController | null = null;
   let lastAnchor = 0;
   let lastWin: Win | null = null;
+  let lastAt: number | null = null;
+  let lastPinned = false;
   const minDeltaMs = 1_000;
 
   async function load() {
     const span = windows.find((w) => w.key === win)!.ms;
     const anchor = at ?? Date.now();
-    if (win === lastWin && Math.abs(anchor - lastAnchor) < minDeltaMs) return;
-    const windowChanged = win !== lastWin;
+    const winChanged = win !== lastWin;
+    const pinChanged = pinned !== lastPinned;
+    const pinValueChanged = pinned && at !== lastAt;
+    const resetZoom = winChanged || pinChanged || pinValueChanged;
+    if (!resetZoom && Math.abs(anchor - lastAnchor) < minDeltaMs) return;
     lastAnchor = anchor;
     lastWin = win;
+    lastAt = at;
+    lastPinned = pinned;
     ac?.abort();
     ac = new AbortController();
     loading = true;
     const to = new Date(anchor);
     const from = new Date(anchor - span);
-    if (windowChanged) {
+    windowFromMs = from.getTime();
+    windowToMs = to.getTime();
+    if (resetZoom) {
       points = [];
+      chartZoom = null;
       toMs = to.getTime();
       fromMs = from.getTime();
     }
@@ -48,8 +61,10 @@
         signal: ac.signal
       });
       points = resp.points;
-      toMs = to.getTime();
-      fromMs = from.getTime();
+      if (chartZoom === null) {
+        toMs = to.getTime();
+        fromMs = from.getTime();
+      }
     } catch (e) {
       if ((e as Error).name !== 'AbortError') throw e;
     } finally {
@@ -60,6 +75,7 @@
   $effect(() => {
     void win;
     void at;
+    void pinned;
     untrack(load);
   });
 
@@ -93,6 +109,18 @@
       points: points.map((p) => ({ ts: p.ts, v: p.tx_rate }))
     }
   ]);
+
+  const isZoomed = $derived(chartZoom !== null);
+  function handleZoom(f: number, t: number) {
+    chartZoom = { fromMs: f, toMs: t };
+    fromMs = f;
+    toMs = t;
+  }
+  function handleReset() {
+    chartZoom = null;
+    fromMs = windowFromMs;
+    toMs = windowToMs;
+  }
 </script>
 
 <div class="px-5 py-4 bg-zinc-950/60">
@@ -122,6 +150,12 @@
         fill
         {fromMs}
         {toMs}
+        yMinSpan={1}
+        yClampMin={0}
+        yMaxDigits={2}
+        zoomed={isZoomed}
+        onZoom={handleZoom}
+        onResetZoom={handleReset}
         loading={loading && points.length === 0}
         emptyText="No samples in window" />
     </div>
@@ -134,6 +168,10 @@
         format={(v) => bytes(v)}
         {fromMs}
         {toMs}
+        yClampMin={0}
+        zoomed={isZoomed}
+        onZoom={handleZoom}
+        onResetZoom={handleReset}
         loading={loading && points.length === 0}
         emptyText="No samples in window" />
     </div>
@@ -145,6 +183,10 @@
         format={(v) => `${bytes(v)}/s`}
         {fromMs}
         {toMs}
+        yClampMin={0}
+        zoomed={isZoomed}
+        onZoom={handleZoom}
+        onResetZoom={handleReset}
         loading={loading && points.length === 0}
         emptyText="No samples in window" />
     </div>

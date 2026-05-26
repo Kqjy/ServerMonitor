@@ -1,3 +1,8 @@
+export interface CollectorStatus {
+  state: string;
+  message?: string;
+}
+
 export interface Host {
   id: number;
   hostname: string;
@@ -12,6 +17,7 @@ export interface Host {
   upgrade_pending?: boolean;
   sample_interval_s: number;
   enabled_collectors?: string[];
+  collector_status?: Record<string, CollectorStatus>;
   tags?: Record<string, string>;
   last_seen?: string;
   created_at: string;
@@ -78,6 +84,15 @@ export interface ContainerRow {
   mem_limit?: number;
   rx_bytes?: number;
   tx_bytes?: number;
+  time: string;
+}
+
+export interface PortRow {
+  proto: string;
+  addr: string;
+  port: number;
+  pid?: number;
+  process?: string;
   time: string;
 }
 
@@ -332,6 +347,13 @@ export const api = {
     if (opts.dir) q.set('dir', opts.dir);
     const qs = q.toString();
     return request<ContainerRow[]>(`/api/v1/hosts/${hostId}/containers${qs ? `?${qs}` : ''}`);
+  },
+  ports: (hostId: number, opts: { at?: string; dir?: 'prev' | 'next' } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.at) q.set('at', opts.at);
+    if (opts.dir) q.set('dir', opts.dir);
+    const qs = q.toString();
+    return request<PortRow[]>(`/api/v1/hosts/${hostId}/ports${qs ? `?${qs}` : ''}`);
   },
   processSeries: (
     hostId: number,

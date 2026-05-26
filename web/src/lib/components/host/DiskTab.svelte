@@ -1,13 +1,24 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
-  import { api, type SeriesEntry } from '$lib/api';
+  import { api, type SeriesEntry, type CollectorStatus } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
   import { bytes, pct, dur } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
 
-  let { hostId, range, enabledCollectors = [] }: { hostId: number; range: Range; enabledCollectors?: string[] } = $props();
+  let {
+    hostId,
+    range,
+    enabledCollectors = [],
+    collectorStatus = {}
+  }: {
+    hostId: number;
+    range: Range;
+    enabledCollectors?: string[];
+    collectorStatus?: Record<string, CollectorStatus>;
+  } = $props();
 
   const smartEnabled = $derived(enabledCollectors.includes('smart'));
+  const smartStatus = $derived(collectorStatus.smart);
 
   type SmartRow = {
     device: string;
@@ -262,18 +273,42 @@
   {/if}
 
   {#if smart.length === 0 && smartEnabled && !loading}
-    <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
-      <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
-      <div class="px-5 py-4 text-sm text-amber-100/90 space-y-2">
-        <p>The <span class="font-mono text-amber-200">smart</span> collector is enabled, but no devices have reported SMART data.</p>
-        <p class="text-amber-100/70 text-xs">Common causes:</p>
-        <ul class="list-disc list-inside text-xs text-amber-100/70 space-y-0.5 pl-1">
-          <li><span class="font-mono">smartctl</span> (smartmontools) isn't installed on the host</li>
-          <li>the agent isn't running with admin/root privileges</li>
-          <li>the underlying devices don't expose SMART (some virtual disks, USB enclosures)</li>
-        </ul>
-      </div>
-    </section>
+    {#if smartStatus?.state === 'no_devices'}
+      <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+        <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">SMART health</header>
+        <div class="px-5 py-4 text-sm text-zinc-300 space-y-1">
+          <p>No SMART-capable devices on this host.</p>
+          <p class="text-zinc-500 text-xs">The agent ran <span class="font-mono text-zinc-400">smartctl --scan</span> successfully, but the system reported zero devices. This is normal for VPS instances, VMs, and storage behind hypervisors or USB enclosures that don't expose SMART.</p>
+        </div>
+      </section>
+    {:else if smartStatus?.state === 'binary_missing'}
+      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
+        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
+        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
+          <p><span class="font-mono text-amber-200">smartctl</span> is not installed on this host.</p>
+          <p class="text-amber-100/70 text-xs">Install <span class="font-mono">smartmontools</span> (Linux: <span class="font-mono">apt install smartmontools</span> or equivalent; Windows: smartmontools.org) and restart the agent.</p>
+        </div>
+      </section>
+    {:else if smartStatus?.state === 'scan_failed'}
+      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
+        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
+        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
+          <p><span class="font-mono text-amber-200">smartctl --scan</span> failed on this host.</p>
+          <p class="text-amber-100/70 text-xs">The most common cause is the agent not running with admin/root privileges. Re-install or run the service as a privileged user.</p>
+          {#if smartStatus.message}
+            <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
+          {/if}
+        </div>
+      </section>
+    {:else}
+      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
+        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
+        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-2">
+          <p>The <span class="font-mono text-amber-200">smart</span> collector is enabled, but no devices have reported SMART data yet.</p>
+          <p class="text-amber-100/70 text-xs">If this persists for more than a minute, check that <span class="font-mono">smartctl</span> is installed and the agent has admin/root privileges.</p>
+        </div>
+      </section>
+    {/if}
   {/if}
 
   {#if smart.length > 0}
