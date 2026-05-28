@@ -7,6 +7,7 @@
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
   import Sparkline from '$lib/components/Sparkline.svelte';
+  import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
   let { hostId, range }: { hostId: number; range: Range } = $props();
 
@@ -38,28 +39,25 @@
   let timer: ReturnType<typeof setInterval> | null = null;
   let unsub: (() => void) | null = null;
   let prevRange: Range | null = null;
-  let frozenWindow: { fromMs: number; toMs: number } | null = null;
 
   async function refresh() {
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    let pageBounds: { fromMs: number; toMs: number };
     let from: string;
     let to: string | undefined;
-    if (frozenWindow !== null) {
-      pageBounds = frozenWindow;
-      from = new Date(frozenWindow.fromMs).toISOString();
-      to = new Date(frozenWindow.toMs).toISOString();
+    if (chartZoom !== null) {
+      from = new Date(chartZoom.fromMs).toISOString();
+      to = new Date(chartZoom.toMs).toISOString();
+      fromMs = chartZoom.fromMs;
+      toMs = chartZoom.toMs;
     } else {
-      pageBounds = rangeBoundsMs(range);
+      const b = rangeBoundsMs(range);
       from = rangeToFrom(range);
       to = rangeToTo(range);
-    }
-    if (chartZoom === null) {
-      fromMs = pageBounds.fromMs;
-      toMs = pageBounds.toMs;
+      fromMs = b.fromMs;
+      toMs = b.toMs;
     }
     try {
       const [c, cu, cs, ci, ck, cores, lc1, lc5, lc15, mp, mu, mt, lo1, lo5, lo15, up, iw, st, fq] = await Promise.all([
@@ -84,10 +82,6 @@
         api.series({ host: hostId, metric: 'cpu_freq_mhz', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      if (chartZoom === null) {
-        fromMs = pageBounds.fromMs;
-        toMs = pageBounds.toMs;
-      }
       cpu = c.points;
       cpuUser = cu.points;
       cpuSystem = cs.points;
@@ -123,7 +117,6 @@
     const current = range;
     if (prevRange !== null && !rangeEquals(current, prevRange)) {
       chartZoom = null;
-      frozenWindow = null;
       loading = true;
       cpu = [];
       cpuUser = [];
@@ -224,20 +217,17 @@
     selectedCore = selectedCore === core ? null : core;
   }
   function handleZoom(f: number, t: number) {
-    if (frozenWindow === null) {
-      const b = rangeBoundsMs(range);
-      frozenWindow = { fromMs: b.fromMs, toMs: b.toMs };
-    }
+    chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    chartZoom = { fromMs: f, toMs: t };
+    refresh();
   }
   function handleReset() {
     chartZoom = null;
-    frozenWindow = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    refresh();
   }
 </script>
 
@@ -259,7 +249,10 @@
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
       <div class="text-xs uppercase tracking-wider text-zinc-500">CPU total</div>
-      <div class="text-xs text-zinc-500 numeric">{pct(cpuNow, 2)}</div>
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-zinc-500 numeric">{pct(cpuNow, 2)}</div>
+        <DownloadCsv host={hostId} metric="cpu_total_pct" {range} />
+      </div>
     </header>
     <div class="px-3 py-3">
       <MultiChart
@@ -281,7 +274,10 @@
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
       <div class="text-xs uppercase tracking-wider text-zinc-500">CPU per core</div>
-      <div class="text-xs text-zinc-500 numeric">{coreCount} core{coreCount === 1 ? '' : 's'}</div>
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-zinc-500 numeric">{coreCount} core{coreCount === 1 ? '' : 's'}</div>
+        <DownloadCsv host={hostId} metric="cpu_core_pct" splitBy="core" {range} />
+      </div>
     </header>
     <div class="p-3">
       {#if !hasCoreData}
@@ -397,7 +393,10 @@
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
       <div class="text-xs uppercase tracking-wider text-zinc-500">Memory utilization</div>
-      <div class="text-xs text-zinc-500 numeric">{pct(memPct.at(-1)?.v ?? 0, 2)}</div>
+      <div class="flex items-center gap-3">
+        <div class="text-xs text-zinc-500 numeric">{pct(memPct.at(-1)?.v ?? 0, 2)}</div>
+        <DownloadCsv host={hostId} metric="mem_used_pct" {range} />
+      </div>
     </header>
     <div class="px-3 py-3">
       <MultiChart

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
@@ -53,7 +54,7 @@ func New(d Deps) *Router {
 
 	timeout := middleware.Timeout(30 * time.Second)
 
-	r.Get("/healthz", healthHandler)
+	r.Get("/healthz", healthHandler(d.DB, d.Logger))
 	r.With(timeout).Get("/install.sh", installScriptHandler("sh", d.TrustedProxies, d.TrustProxyTLS))
 	r.With(timeout).Get("/install.ps1", installScriptHandler("ps1", d.TrustedProxies, d.TrustProxyTLS))
 
@@ -101,6 +102,7 @@ func New(d Deps) *Router {
 				r.Get("/hosts/{id}/alerts/active", hostActiveAlertsHandler(d.DB, d.Hosts))
 				r.Get("/series", seriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))
 				r.Get("/series/multi", multiSeriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))
+				r.Get("/series/batch", seriesBatchHandler(d.DB, d.Hosts, d.Retention))
 				r.Get("/metrics", listMetricsHandler())
 				r.Get("/stats", statsHandler(d.Batcher))
 				r.Get("/retention", retentionHandler(d.Retention))
@@ -128,9 +130,23 @@ func New(d Deps) *Router {
 	return &Router{r}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+func healthHandler(db *storage.DB, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Pool.Ping(ctx); err != nil {
+			logger.Warn("healthz db ping failed", "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status": "degraded",
+				"checks": map[string]string{"db": "error"},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok",
+			"checks": map[string]string{"db": "ok"},
+		})
+	}
 }
 
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {

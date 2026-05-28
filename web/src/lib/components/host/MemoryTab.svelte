@@ -5,6 +5,7 @@
   import { bytes, pct } from '$lib/format';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
+  import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
   let { hostId, range }: { hostId: number; range: Range } = $props();
 
@@ -26,28 +27,25 @@
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
-  let frozenWindow: { fromMs: number; toMs: number } | null = null;
 
   async function refresh() {
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    let pageBounds: { fromMs: number; toMs: number };
     let from: string;
     let to: string | undefined;
-    if (frozenWindow !== null) {
-      pageBounds = frozenWindow;
-      from = new Date(frozenWindow.fromMs).toISOString();
-      to = new Date(frozenWindow.toMs).toISOString();
+    if (chartZoom !== null) {
+      from = new Date(chartZoom.fromMs).toISOString();
+      to = new Date(chartZoom.toMs).toISOString();
+      fromMs = chartZoom.fromMs;
+      toMs = chartZoom.toMs;
     } else {
-      pageBounds = rangeBoundsMs(range);
+      const b = rangeBoundsMs(range);
       from = rangeToFrom(range);
       to = rangeToTo(range);
-    }
-    if (chartZoom === null) {
-      fromMs = pageBounds.fromMs;
-      toMs = pageBounds.toMs;
+      fromMs = b.fromMs;
+      toMs = b.toMs;
     }
     try {
       const [u, c, b2, f, su, t, av, st] = await Promise.all([
@@ -61,10 +59,6 @@
         api.series({ host: hostId, metric: 'swap_total', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      if (chartZoom === null) {
-        fromMs = pageBounds.fromMs;
-        toMs = pageBounds.toMs;
-      }
       used = u.points;
       cached = c.points;
       buffers = b2.points;
@@ -87,7 +81,6 @@
     const current = range;
     if (prevRange !== null && !rangeEquals(current, prevRange)) {
       chartZoom = null;
-      frozenWindow = null;
       loading = true;
       used = [];
       cached = [];
@@ -113,20 +106,17 @@
   const usedTone = $derived(total ? (usedNow / total > 0.9 ? 'bad' : usedNow / total > 0.75 ? 'warn' : 'good') : 'neutral') as 'good' | 'warn' | 'bad' | 'neutral';
   const isZoomed = $derived(chartZoom !== null);
   function handleZoom(f: number, t: number) {
-    if (frozenWindow === null) {
-      const b = rangeBoundsMs(range);
-      frozenWindow = { fromMs: b.fromMs, toMs: b.toMs };
-    }
+    chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    chartZoom = { fromMs: f, toMs: t };
+    refresh();
   }
   function handleReset() {
     chartZoom = null;
-    frozenWindow = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    refresh();
   }
 </script>
 
@@ -139,7 +129,10 @@
   </div>
 
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-    <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Memory breakdown</header>
+    <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+      <div class="text-xs uppercase tracking-wider text-zinc-500">Memory breakdown</div>
+      <DownloadCsv host={hostId} metric="mem_used" {range} title="Download memory used (bytes) as CSV" />
+    </header>
     <div class="px-3 py-3">
       <MultiChart
         series={[
@@ -161,7 +154,10 @@
 
   {#if swapTotal > 0}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Swap used</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Swap used</div>
+        <DownloadCsv host={hostId} metric="swap_used" {range} />
+      </header>
       <div class="px-3 py-3">
         <MultiChart
           series={[{ label: 'Swap', color: 'oklch(0.83 0.18 85)', points: swapUsed }]}

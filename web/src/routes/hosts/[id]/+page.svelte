@@ -4,7 +4,7 @@
   import { api, type Host, type ActiveAlert } from '$lib/api';
   import { statusFor, timeAgo, severityClass, severityRank } from '$lib/format';
   import { subscribeAlerts } from '$lib/sse';
-  import { ranges, isPreset, rangeLabel, type Range } from '$lib/time';
+  import { ranges, isPreset, rangeLabel, loadRange, saveRange, writeRangeToUrl, rangeEquals, type Range } from '$lib/time';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import Tabs from '$lib/components/Tabs.svelte';
   import EditHostDialog from '$lib/components/EditHostDialog.svelte';
@@ -27,7 +27,7 @@
   let host = $state<Host | null>(null);
   let activeAlerts = $state<ActiveAlert[]>([]);
   let error = $state<string | null>(null);
-  let range = $state<Range>('1h');
+  let range = $state<Range>(loadRange($page.url.searchParams));
   let timer: ReturnType<typeof setInterval> | null = null;
   let editing = $state(false);
   let pickerOpen = $state(false);
@@ -73,6 +73,16 @@
 
   $effect(() => {
     if (id) refresh();
+  });
+
+  let prevRange: Range | null = null;
+  $effect(() => {
+    const r = range;
+    if (prevRange === null || !rangeEquals(prevRange, r)) {
+      saveRange(r);
+      writeRangeToUrl(r);
+      prevRange = r;
+    }
   });
 
   function setTab(t: TabName) {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,6 +229,10 @@ func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, r
 			}
 		}
 
+		if strings.EqualFold(q.Get("format"), "csv") {
+			writeSeriesCSV(w, host.Hostname, metricName, metricID.Meta().Unit, out)
+			return
+		}
 		writeJSON(w, http.StatusOK, seriesResp{
 			HostID:  hostID,
 			Metric:  metricName,
@@ -447,6 +452,10 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 			series = append(series, *grouped[k])
 		}
 
+		if strings.EqualFold(q.Get("format"), "csv") {
+			writeMultiSeriesCSV(w, host.Hostname, metricName, metricID.Meta().Unit, splitBy, series)
+			return
+		}
 		writeJSON(w, http.StatusOK, multiSeriesResp{
 			HostID:  hostID,
 			Metric:  metricName,
@@ -454,6 +463,164 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 			StepSec: step,
 			SplitBy: splitBy,
 			Series:  series,
+		})
+	}
+}
+
+type batchSeriesEntry struct {
+	Points []seriesPoint `json:"points"`
+}
+
+type batchSeriesResp struct {
+	Metric  string                      `json:"metric"`
+	Unit    string                      `json:"unit"`
+	StepSec int                         `json:"step_sec"`
+	Hosts   map[string]batchSeriesEntry `json:"hosts"`
+}
+
+const batchSeriesMaxHosts = 200
+
+func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		hostsParam := q.Get("hosts")
+		metricName := q.Get("metric")
+		if hostsParam == "" || metricName == "" {
+			writeError(w, http.StatusBadRequest, "hosts and metric are required")
+			return
+		}
+		metricID, ok := metrics.ByName(metricName)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown metric")
+			return
+		}
+
+		parts := strings.Split(hostsParam, ",")
+		requested := make([]int64, 0, len(parts))
+		seen := map[int64]struct{}{}
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(p, 10, 64)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid host id: "+p)
+				return
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			requested = append(requested, id)
+		}
+		if len(requested) == 0 {
+			writeError(w, http.StatusBadRequest, "no host ids provided")
+			return
+		}
+		if len(requested) > batchSeriesMaxHosts {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("too many host ids (max %d)", batchSeriesMaxHosts))
+			return
+		}
+
+		hostIDs := make([]int64, 0, len(requested))
+		maxInterval := 0
+		for _, id := range requested {
+			h, err := hosts.Get(r.Context(), id)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					continue
+				}
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			hostIDs = append(hostIDs, id)
+			if h.SampleIntervalS > maxInterval {
+				maxInterval = h.SampleIntervalS
+			}
+		}
+		if len(hostIDs) == 0 {
+			writeError(w, http.StatusNotFound, "no matching hosts")
+			return
+		}
+		if maxInterval <= 0 {
+			maxInterval = 10
+		}
+
+		labelSel := q.Get("labels")
+		labelArg := []byte("{}")
+		if labelSel != "" {
+			var labelMap map[string]string
+			if err := json.Unmarshal([]byte(labelSel), &labelMap); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid labels json")
+				return
+			}
+			labelArg = []byte(labelSel)
+		}
+
+		now := time.Now()
+		from := parseTime(q.Get("from"), now.Add(-1*time.Hour))
+		to := parseTime(q.Get("to"), now)
+		if !to.After(from) {
+			writeError(w, http.StatusBadRequest, "to must be after from")
+			return
+		}
+		rawCutoff := now.Add(-ret.RawCutoff)
+		if from.Before(rawCutoff) {
+			writeError(w, http.StatusBadRequest, "from is older than raw retention; use /series for archived data")
+			return
+		}
+
+		step, _ := strconv.Atoi(q.Get("step"))
+		if step <= 0 {
+			step = chooseStep(to.Sub(from), maxInterval)
+		} else if step < maxInterval {
+			step = maxInterval
+		}
+
+		result := make(map[string]batchSeriesEntry, len(hostIDs))
+		for _, id := range hostIDs {
+			result[strconv.FormatInt(id, 10)] = batchSeriesEntry{Points: []seriesPoint{}}
+		}
+
+		rows, err := db.Pool.Query(r.Context(), `
+			SELECT host_id, time_bucket($1::interval, time) AS bucket, avg(value)
+			FROM metric_points
+			WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
+			  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+			GROUP BY host_id, bucket
+			ORDER BY host_id, bucket ASC
+		`, intervalString(step), hostIDs, int16(metricID), from, to, labelArg)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				hostID int64
+				t      time.Time
+				v      float64
+			)
+			if err := rows.Scan(&hostID, &t, &v); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			key := strconv.FormatInt(hostID, 10)
+			entry := result[key]
+			entry.Points = append(entry.Points, seriesPoint{Ts: t, V: v})
+			result[key] = entry
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, batchSeriesResp{
+			Metric:  metricName,
+			Unit:    metricID.Meta().Unit,
+			StepSec: step,
+			Hosts:   result,
 		})
 	}
 }
@@ -573,4 +740,75 @@ func statsHandler(b interface {
 			"dropped": d,
 		})
 	}
+}
+
+func csvFilename(hostname, metric string) string {
+	safe := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('_')
+			}
+		}
+		out := b.String()
+		if out == "" {
+			return "data"
+		}
+		return out
+	}
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	return safe(hostname) + "_" + safe(metric) + "_" + stamp + ".csv"
+}
+
+func setCSVHeaders(w http.ResponseWriter, hostname, metric string) *csv.Writer {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, csvFilename(hostname, metric)))
+	w.WriteHeader(http.StatusOK)
+	return csv.NewWriter(w)
+}
+
+func formatFloat(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+func writeSeriesCSV(w http.ResponseWriter, hostname, metric, unit string, points []seriesPoint) {
+	cw := setCSVHeaders(w, hostname, metric)
+	header := "value"
+	if unit != "" {
+		header = "value_" + unit
+	}
+	_ = cw.Write([]string{"ts", header})
+	for _, p := range points {
+		_ = cw.Write([]string{p.Ts.UTC().Format(time.RFC3339Nano), formatFloat(p.V)})
+	}
+	cw.Flush()
+}
+
+func writeMultiSeriesCSV(w http.ResponseWriter, hostname, metric, unit, splitBy string, series []seriesEntry) {
+	cw := setCSVHeaders(w, hostname, metric)
+	valueHeader := "value"
+	if unit != "" {
+		valueHeader = "value_" + unit
+	}
+	labelCol := splitBy
+	if labelCol == "" {
+		labelCol = "labels"
+	}
+	_ = cw.Write([]string{"ts", labelCol, valueHeader})
+	for _, s := range series {
+		var labelVal string
+		if splitBy != "" {
+			labelVal = s.Labels[splitBy]
+		} else if len(s.Labels) > 0 {
+			b, _ := json.Marshal(s.Labels)
+			labelVal = string(b)
+		}
+		for _, p := range s.Points {
+			_ = cw.Write([]string{p.Ts.UTC().Format(time.RFC3339Nano), labelVal, formatFloat(p.V)})
+		}
+	}
+	cw.Flush()
 }

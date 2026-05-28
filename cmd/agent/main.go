@@ -31,9 +31,21 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "register" {
-		registerCmd(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "register":
+			registerCmd(os.Args[2:])
+			return
+		case "healthz":
+			if err := healthzCmd(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "healthz:", err)
+				if errors.Is(err, errHealthMissing) {
+					os.Exit(2)
+				}
+				os.Exit(1)
+			}
+			return
+		}
 	}
 
 	var (
@@ -96,6 +108,10 @@ func main() {
 
 	client := transport.New(cfg.ServerURL, cfg.Token, cfg.HTTPTimeout, cfg.InsecureSkip, logger, sp)
 	client.SetCurrentInterval(cfg.IntervalS)
+	if cfg.HealthPath == "" {
+		cfg.HealthPath = defaultHealthPath()
+	}
+	client.SetHealthPath(cfg.HealthPath)
 	r := runner.New(cfg, client, logger)
 
 	pk := &pubkeyHolder{v: cfg.ServerPubkey}
@@ -344,6 +360,96 @@ func defaultSpoolPath() string {
 		return `C:\ProgramData\ServerMonitor\spool.db`
 	}
 	return "/var/lib/servermonitor/spool.db"
+}
+
+func defaultHealthPath() string {
+	if runtime.GOOS == "windows" {
+		if pd := os.Getenv("ProgramData"); pd != "" {
+			return filepath.Join(pd, "ServerMonitor", "health.json")
+		}
+		return `C:\ProgramData\ServerMonitor\health.json`
+	}
+	return "/var/lib/servermonitor/health.json"
+}
+
+var errHealthMissing = errors.New("no health record yet (agent has not completed a successful push)")
+
+func healthzCmd(args []string) error {
+	fs := flag.NewFlagSet("healthz", flag.ContinueOnError)
+	configPath := fs.String("config", defaultConfigPath(), "path to agent.toml")
+	maxAge := fs.Duration("max-age", 0, "maximum age of the last successful push (default: 3×interval_s, minimum 60s)")
+	pathOverride := fs.String("path", "", "path to health.json (overrides config + default)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *maxAge < 0 {
+		return fmt.Errorf("--max-age must be >= 0 (got %s)", *maxAge)
+	}
+
+	var configExplicit, maxAgeExplicit bool
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "config":
+			configExplicit = true
+		case "max-age":
+			maxAgeExplicit = true
+		}
+	})
+
+	healthPath := *pathOverride
+	intervalS := 0
+	if healthPath == "" {
+		cfg, err := config.Load(*configPath)
+		if err == nil {
+			healthPath = cfg.HealthPath
+			intervalS = cfg.IntervalS
+		} else if configExplicit || !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: failed to load config %s: %v\n", *configPath, err)
+		}
+	}
+	if healthPath == "" {
+		healthPath = defaultHealthPath()
+	}
+
+	data, err := os.ReadFile(healthPath)
+	if err != nil {
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return fmt.Errorf("%w: %s (%v)", errHealthMissing, healthPath, err)
+		}
+		return fmt.Errorf("read %s: %w", healthPath, err)
+	}
+	var rec struct {
+		LastPushAt time.Time `json:"last_push_at"`
+		IntervalS  int       `json:"interval_s"`
+	}
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return fmt.Errorf("%w: %s parse failed: %v", errHealthMissing, healthPath, err)
+	}
+	if rec.LastPushAt.IsZero() {
+		return fmt.Errorf("%w: %s missing last_push_at", errHealthMissing, healthPath)
+	}
+
+	threshold := *maxAge
+	if !maxAgeExplicit {
+		eff := rec.IntervalS
+		if eff <= 0 {
+			eff = intervalS
+		}
+		if eff <= 0 {
+			eff = 10
+		}
+		threshold = time.Duration(eff*3) * time.Second
+		if threshold < 60*time.Second {
+			threshold = 60 * time.Second
+		}
+	}
+
+	age := time.Since(rec.LastPushAt)
+	if age > threshold {
+		return fmt.Errorf("last push %s ago, exceeds max-age %s", age.Truncate(time.Second), threshold)
+	}
+	fmt.Printf("ok: last push %s ago (max-age %s)\n", age.Truncate(time.Second), threshold)
+	return nil
 }
 
 func registerCmd(args []string) {

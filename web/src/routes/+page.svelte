@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { api, type Host, type SeriesPoint } from '$lib/api';
   import { statusFor, timeAgo, pct, severityClass } from '$lib/format';
-  import { subscribeHost, subscribeAlerts, appendLive, rangeWindowMs } from '$lib/sse';
+  import { subscribeHosts, subscribeAlerts, appendLive, rangeWindowMs } from '$lib/sse';
   import Sparkline from '$lib/components/Sparkline.svelte';
   import StatusDot from '$lib/components/StatusDot.svelte';
 
@@ -12,16 +12,15 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
-  let unsubs: Array<() => void> = [];
+  let pointsUnsub: (() => void) | null = null;
   let alertUnsub: (() => void) | null = null;
   let pendingRefresh: ReturnType<typeof setTimeout> | null = null;
 
   async function refreshHosts() {
     try {
       const list = await api.hosts();
-      const changed = list.length !== hosts.length;
       hosts = list;
-      if (changed) resubscribe();
+      if (!pointsUnsub) subscribe();
     } catch {}
   }
 
@@ -30,22 +29,24 @@
       const list = await api.hosts();
       hosts = list;
       error = null;
-      await Promise.all(
-        list.map(async (h) => {
-          try {
-            const r = await api.series({
-              host: h.id,
-              metric: 'cpu_total_pct',
-              from: '-15m',
-              step: 30
-            });
-            sparks[h.id] = r.points;
-            const last = r.points[r.points.length - 1];
+      if (list.length > 0) {
+        try {
+          const r = await api.seriesBatch({
+            hosts: list.map((h) => h.id),
+            metric: 'cpu_total_pct',
+            from: '-15m',
+            step: 30
+          });
+          for (const h of list) {
+            const entry = r.hosts[String(h.id)];
+            if (!entry) continue;
+            sparks[h.id] = entry.points;
+            const last = entry.points[entry.points.length - 1];
             if (last) lastValues[h.id] = last.v;
-          } catch {}
-        })
-      );
-      resubscribe();
+          }
+        } catch {}
+      }
+      subscribe();
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -53,18 +54,16 @@
     }
   }
 
-  function resubscribe() {
-    unsubs.forEach((u) => u());
-    unsubs = hosts.map((h) =>
-      subscribeHost(h.id, ['cpu_total_pct'], (points) => {
-        const win = rangeWindowMs('15m');
-        for (const p of points) {
-          if (p.metric !== 'cpu_total_pct') continue;
-          sparks[h.id] = appendLive(sparks[h.id] ?? [], { ts: p.ts, v: p.v }, win);
-          lastValues[h.id] = p.v;
-        }
-      })
-    );
+  function subscribe() {
+    pointsUnsub?.();
+    pointsUnsub = subscribeHosts(['cpu_total_pct'], (hostId, points) => {
+      const win = rangeWindowMs('15m');
+      for (const p of points) {
+        if (p.metric !== 'cpu_total_pct') continue;
+        sparks[hostId] = appendLive(sparks[hostId] ?? [], { ts: p.ts, v: p.v }, win);
+        lastValues[hostId] = p.v;
+      }
+    });
   }
 
   onMount(() => {
@@ -82,7 +81,7 @@
   onDestroy(() => {
     if (timer) clearInterval(timer);
     if (pendingRefresh) clearTimeout(pendingRefresh);
-    unsubs.forEach((u) => u());
+    pointsUnsub?.();
     alertUnsub?.();
   });
 </script>

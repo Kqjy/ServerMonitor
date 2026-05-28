@@ -20,6 +20,7 @@ type Config struct {
 	BatchMaxPoints int               `toml:"batch_max_points"`
 	SpoolPath      string            `toml:"spool_path"`
 	SpoolMaxBytes  int64             `toml:"spool_max_bytes"`
+	HealthPath     string            `toml:"health_path"`
 	HTTPTimeout    time.Duration     `toml:"http_timeout"`
 	InsecureSkip   bool              `toml:"insecure_skip_verify"`
 	AutoUpgrade    *bool             `toml:"auto_upgrade"`

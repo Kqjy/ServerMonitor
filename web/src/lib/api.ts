@@ -62,6 +62,13 @@ export interface MultiSeriesResp {
   series: SeriesEntry[];
 }
 
+export interface BatchSeriesResp {
+  metric: string;
+  unit: string;
+  step_sec: number;
+  hosts: Record<string, { points: SeriesPoint[] }>;
+}
+
 export interface ProcessRow {
   pid: number;
   name: string;
@@ -312,6 +319,22 @@ export const api = {
     if (params.step) q.set('step', String(params.step));
     if (params.labels) q.set('labels', JSON.stringify(params.labels));
     return request<SeriesResp>(`/api/v1/series?${q}`, { signal: params.signal });
+  },
+  seriesBatch: (params: {
+    hosts: number[];
+    metric: string;
+    from?: string;
+    to?: string;
+    step?: number;
+    signal?: AbortSignal;
+  }) => {
+    const q = new URLSearchParams();
+    q.set('hosts', params.hosts.join(','));
+    q.set('metric', params.metric);
+    if (params.from) q.set('from', params.from);
+    if (params.to) q.set('to', params.to);
+    if (params.step) q.set('step', String(params.step));
+    return request<BatchSeriesResp>(`/api/v1/series/batch?${q}`, { signal: params.signal });
   },
   seriesMulti: (params: {
     host: number;

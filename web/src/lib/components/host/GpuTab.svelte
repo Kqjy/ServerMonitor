@@ -4,6 +4,7 @@
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
   import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
+  import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
   let { hostId, range }: { hostId: number; range: Range } = $props();
 
@@ -19,7 +20,6 @@
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
-  let frozenWindow: { fromMs: number; toMs: number } | null = null;
 
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
@@ -33,21 +33,19 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    let pageBounds: { fromMs: number; toMs: number };
     let from: string;
     let to: string | undefined;
-    if (frozenWindow !== null) {
-      pageBounds = frozenWindow;
-      from = new Date(frozenWindow.fromMs).toISOString();
-      to = new Date(frozenWindow.toMs).toISOString();
+    if (chartZoom !== null) {
+      from = new Date(chartZoom.fromMs).toISOString();
+      to = new Date(chartZoom.toMs).toISOString();
+      fromMs = chartZoom.fromMs;
+      toMs = chartZoom.toMs;
     } else {
-      pageBounds = rangeBoundsMs(range);
+      const b = rangeBoundsMs(range);
       from = rangeToFrom(range);
       to = rangeToTo(range);
-    }
-    if (chartZoom === null) {
-      fromMs = pageBounds.fromMs;
-      toMs = pageBounds.toMs;
+      fromMs = b.fromMs;
+      toMs = b.toMs;
     }
     try {
       const [u, mp, t, p] = await Promise.all([
@@ -57,10 +55,6 @@
         api.seriesMulti({ host: hostId, metric: 'gpu_power_w', from, to, splitBy: 'gpu', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      if (chartZoom === null) {
-        fromMs = pageBounds.fromMs;
-        toMs = pageBounds.toMs;
-      }
       usage = u.series;
       memUsedPct = mp.series;
       temp = t.series;
@@ -77,7 +71,6 @@
     const current = range;
     if (prevRange !== null && !rangeEquals(current, prevRange)) {
       chartZoom = null;
-      frozenWindow = null;
       loading = true;
       usage = [];
       memUsedPct = [];
@@ -102,20 +95,17 @@
   const hasData = $derived(usage.length + memUsedPct.length + temp.length + power.length > 0);
   const isZoomed = $derived(chartZoom !== null);
   function handleZoom(f: number, t: number) {
-    if (frozenWindow === null) {
-      const b = rangeBoundsMs(range);
-      frozenWindow = { fromMs: b.fromMs, toMs: b.toMs };
-    }
+    chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    chartZoom = { fromMs: f, toMs: t };
+    refresh();
   }
   function handleReset() {
     chartZoom = null;
-    frozenWindow = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    refresh();
   }
   void bytes;
 </script>
@@ -137,19 +127,31 @@
 {:else}
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">GPU utilization</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">GPU utilization</div>
+        <DownloadCsv host={hostId} metric="gpu_usage_pct" splitBy="gpu" {range} />
+      </header>
       <div class="px-3 py-3"><MultiChart series={toSeries(usage)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">VRAM utilization</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">VRAM utilization</div>
+        <DownloadCsv host={hostId} metric="gpu_mem_used_pct" splitBy="gpu" {range} />
+      </header>
       <div class="px-3 py-3"><MultiChart series={toSeries(memUsedPct)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Temperature</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Temperature</div>
+        <DownloadCsv host={hostId} metric="gpu_temp_c" splitBy="gpu" {range} />
+      </header>
       <div class="px-3 py-3"><MultiChart series={toSeries(temp)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Power draw</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Power draw</div>
+        <DownloadCsv host={hostId} metric="gpu_power_w" splitBy="gpu" {range} />
+      </header>
       <div class="px-3 py-3"><MultiChart series={toSeries(power)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="W" format={(v) => `${v.toFixed(0)} W`} /></div>
     </section>
   </div>

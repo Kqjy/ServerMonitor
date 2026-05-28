@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -41,6 +42,16 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("resolve self: %w", err)
 	}
 
+	installDir := filepath.Dir(selfPath)
+	if err := verifyDirSafe(installDir); err != nil {
+		return err
+	}
+
+	if opts.InsecureSkip {
+		opts.Logger.Warn("agent upgrade: TLS certificate verification disabled",
+			"hint", "set insecure_skip = false in agent.toml once the server has a trusted cert")
+	}
+
 	platform := runtime.GOOS + "-" + runtime.GOARCH
 
 	dlCtx, cancel := context.WithTimeout(ctx, downloadTimeout)
@@ -76,13 +87,12 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("%w (server did not include %s header)", agentsig.ErrNoSignature, agentsig.SignatureHeader)
 	}
 
-	dir := filepath.Dir(selfPath)
 	newPath := selfPath + ".new"
 	_ = os.Remove(newPath)
 
 	tmp, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
-		return fmt.Errorf("open temp: %w (install dir %q must be writable by the agent)", err, dir)
+		return fmt.Errorf("open temp: %w (install dir %q must be writable by the agent)", err, installDir)
 	}
 	digester := agentsig.NewDigest()
 	w := io.MultiWriter(tmp, digester)
@@ -110,9 +120,22 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("downloaded binary suspiciously small (%d bytes)", n)
 	}
 
-	if err := agentsig.Verify(opts.ServerPubkey, sigHeader, digester.Sum(nil)); err != nil {
+	wantDigest := digester.Sum(nil)
+	if err := agentsig.Verify(opts.ServerPubkey, sigHeader, wantDigest); err != nil {
 		_ = os.Remove(newPath)
 		return fmt.Errorf("verify signature: %w", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(newPath, 0o500); err != nil {
+			_ = os.Remove(newPath)
+			return fmt.Errorf("chmod staged binary: %w", err)
+		}
+	}
+
+	if err := verifyStagedBinary(newPath, wantDigest); err != nil {
+		_ = os.Remove(newPath)
+		return err
 	}
 
 	if err := swap(selfPath, newPath); err != nil {
@@ -124,6 +147,43 @@ func Run(ctx context.Context, opts Options) error {
 		"path", selfPath,
 		"bytes", n,
 		"hint", "exiting non-zero so the service manager restarts with the new binary")
+	return nil
+}
+
+func verifyDirSafe(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat install dir %q: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("install dir %q is not a directory", dir)
+	}
+	mode := fi.Mode().Perm()
+	if mode&0o002 != 0 {
+		return fmt.Errorf("refusing upgrade: install dir %q is world-writable (mode %#o)", dir, mode)
+	}
+	if mode&0o020 != 0 && !dirGroupOwnedByRunningUID(fi) {
+		return fmt.Errorf("refusing upgrade: install dir %q is group-writable (mode %#o) and the group is not the agent's effective uid; tighten with chmod g-w or chown so the group is trusted", dir, mode)
+	}
+	return nil
+}
+
+func verifyStagedBinary(path string, want []byte) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reopen staged binary: %w", err)
+	}
+	defer f.Close()
+	got, _, err := agentsig.DigestReader(f)
+	if err != nil {
+		return fmt.Errorf("rehash staged binary: %w", err)
+	}
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("staged binary at %q changed between write and verify (possible tamper)", path)
+	}
 	return nil
 }
 

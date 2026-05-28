@@ -66,3 +66,67 @@ export function rangeEquals(a: Range, b: Range): boolean {
   return false;
 }
 
+const RANGE_STORAGE_KEY = 'sm_range';
+
+export function loadRange(searchParams?: URLSearchParams): Range {
+  if (searchParams) {
+    const r = searchParams.get('range');
+    if (r && (ranges as string[]).includes(r)) return r as RangePreset;
+    const fromS = searchParams.get('from');
+    const toS = searchParams.get('to');
+    if (fromS && toS) {
+      const fromMs = Date.parse(fromS);
+      const toMs = Date.parse(toS);
+      if (!isNaN(fromMs) && !isNaN(toMs) && toMs > fromMs) {
+        return { fromMs, toMs };
+      }
+    }
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const stored = localStorage.getItem(RANGE_STORAGE_KEY);
+      if (stored && (ranges as string[]).includes(stored)) return stored as RangePreset;
+    } catch {}
+  }
+  return '1h';
+}
+
+export function saveRange(r: Range): void {
+  if (typeof localStorage === 'undefined') return;
+  if (!isPreset(r)) return;
+  try {
+    localStorage.setItem(RANGE_STORAGE_KEY, r);
+  } catch {}
+}
+
+export function writeRangeToUrl(r: Range): void {
+  if (typeof window === 'undefined') return;
+  const u = new URL(window.location.href);
+  u.searchParams.delete('range');
+  u.searchParams.delete('from');
+  u.searchParams.delete('to');
+  if (isPreset(r)) {
+    u.searchParams.set('range', r);
+  } else {
+    u.searchParams.set('from', new Date(r.fromMs).toISOString());
+    u.searchParams.set('to', new Date(r.toMs).toISOString());
+  }
+  history.replaceState(history.state, '', u.toString());
+}
+
+export function loadPresetWin<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  if (typeof localStorage === 'undefined') return fallback;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored && (allowed as readonly string[]).includes(stored)) return stored as T;
+  } catch {}
+  return fallback;
+}
+
+export function savePresetWin(key: string, value: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+

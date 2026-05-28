@@ -5,6 +5,7 @@
   import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
+  import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
   let { hostId, range }: { hostId: number; range: Range } = $props();
 
@@ -27,7 +28,6 @@
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
-  let frozenWindow: { fromMs: number; toMs: number } | null = null;
 
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
@@ -41,21 +41,19 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    let pageBounds: { fromMs: number; toMs: number };
     let from: string;
     let to: string | undefined;
-    if (frozenWindow !== null) {
-      pageBounds = frozenWindow;
-      from = new Date(frozenWindow.fromMs).toISOString();
-      to = new Date(frozenWindow.toMs).toISOString();
+    if (chartZoom !== null) {
+      from = new Date(chartZoom.fromMs).toISOString();
+      to = new Date(chartZoom.toMs).toISOString();
+      fromMs = chartZoom.fromMs;
+      toMs = chartZoom.toMs;
     } else {
-      pageBounds = rangeBoundsMs(range);
+      const b = rangeBoundsMs(range);
       from = rangeToFrom(range);
       to = rangeToTo(range);
-    }
-    if (chartZoom === null) {
-      fromMs = pageBounds.fromMs;
-      toMs = pageBounds.toMs;
+      fromMs = b.fromMs;
+      toMs = b.toMs;
     }
     try {
       const [r, t, rp, tp, re, te, rd, td, e, l, w] = await Promise.all([
@@ -72,10 +70,6 @@
         api.series({ host: hostId, metric: 'conn_timewait', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      if (chartZoom === null) {
-        fromMs = pageBounds.fromMs;
-        toMs = pageBounds.toMs;
-      }
       rx = r.series;
       tx = t.series;
       rxPkts = rp.series;
@@ -99,7 +93,6 @@
     const current = range;
     if (prevRange !== null && !rangeEquals(current, prevRange)) {
       chartZoom = null;
-      frozenWindow = null;
       loading = true;
       rx = [];
       tx = [];
@@ -127,20 +120,17 @@
 
   const isZoomed = $derived(chartZoom !== null);
   function handleZoom(f: number, t: number) {
-    if (frozenWindow === null) {
-      const b = rangeBoundsMs(range);
-      frozenWindow = { fromMs: b.fromMs, toMs: b.toMs };
-    }
+    chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    chartZoom = { fromMs: f, toMs: t };
+    refresh();
   }
   function handleReset() {
     chartZoom = null;
-    frozenWindow = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    refresh();
   }
 
   function lastSum(entries: SeriesEntry[]): number {
@@ -187,14 +177,20 @@
   </div>
 
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-    <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Receive</header>
+    <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+      <div class="text-xs uppercase tracking-wider text-zinc-500">Receive</div>
+      <DownloadCsv host={hostId} metric="net_rx_bytes" splitBy="iface" {range} />
+    </header>
     <div class="px-3 py-3">
       <MultiChart series={toSeries(rx)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
   </section>
 
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-    <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Transmit</header>
+    <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+      <div class="text-xs uppercase tracking-wider text-zinc-500">Transmit</div>
+      <DownloadCsv host={hostId} metric="net_tx_bytes" splitBy="iface" {range} />
+    </header>
     <div class="px-3 py-3">
       <MultiChart series={toSeries(tx)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
@@ -202,13 +198,19 @@
 
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Receive packets</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Receive packets</div>
+        <DownloadCsv host={hostId} metric="net_rx_packets" splitBy="iface" {range} />
+      </header>
       <div class="px-3 py-3">
         <MultiChart series={toSeries(rxPkts)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
       </div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Transmit packets</header>
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Transmit packets</div>
+        <DownloadCsv host={hostId} metric="net_tx_packets" splitBy="iface" {range} />
+      </header>
       <div class="px-3 py-3">
         <MultiChart series={toSeries(txPkts)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
       </div>

@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -34,6 +36,12 @@ type Client struct {
 	appliedIntervalS int
 
 	controlCh chan ControlUpdate
+
+	healthMu   sync.Mutex
+	healthPath string
+
+	healthFailMu  sync.Mutex
+	healthFailing bool
 }
 
 type ControlUpdate struct {
@@ -68,6 +76,86 @@ func (c *Client) ControlUpdates() <-chan ControlUpdate {
 	return c.controlCh
 }
 
+func (c *Client) SetHealthPath(p string) {
+	c.healthMu.Lock()
+	c.healthPath = p
+	c.healthMu.Unlock()
+}
+
+func (c *Client) writeHealth() {
+	c.healthMu.Lock()
+	path := c.healthPath
+	c.healthMu.Unlock()
+	if path == "" {
+		return
+	}
+	c.appliedMu.Lock()
+	interval := c.appliedIntervalS
+	c.appliedMu.Unlock()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.logHealthFailure("mkdir", err, "path", path)
+		return
+	}
+	data, err := json.Marshal(map[string]any{
+		"last_push_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"interval_s":   interval,
+	})
+	if err != nil {
+		c.logHealthFailure("marshal", err, "path", path)
+		return
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		c.logHealthFailure("create temp", err, "dir", dir)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, werr := tmp.Write(data); werr != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		c.logHealthFailure("write", werr, "path", tmpName)
+		return
+	}
+	if serr := tmp.Sync(); serr != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		c.logHealthFailure("sync", serr, "path", tmpName)
+		return
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		_ = os.Remove(tmpName)
+		c.logHealthFailure("close", cerr, "path", tmpName)
+		return
+	}
+	_ = os.Chmod(tmpName, 0o644)
+	if rerr := os.Rename(tmpName, path); rerr != nil {
+		_ = os.Remove(tmpName)
+		c.logHealthFailure("rename", rerr, "from", tmpName, "to", path)
+		return
+	}
+	c.healthFailMu.Lock()
+	c.healthFailing = false
+	c.healthFailMu.Unlock()
+}
+
+func (c *Client) logHealthFailure(stage string, err error, kv ...any) {
+	c.healthFailMu.Lock()
+	first := !c.healthFailing
+	c.healthFailing = true
+	c.healthFailMu.Unlock()
+	args := append([]any{"stage", stage, "err", err}, kv...)
+	if first {
+		if c.logger != nil {
+			c.logger.Warn("health file write failed; subsequent failures will log at debug until success", args...)
+		}
+		return
+	}
+	if c.logger != nil {
+		c.logger.Debug("health file write failed", args...)
+	}
+}
+
 func (c *Client) IntervalUpdates() <-chan int {
 	return c.intervalCh
 }
@@ -91,7 +179,7 @@ func (c *Client) Send(ctx context.Context, batch *wire.Batch) error {
 	if err != nil {
 		return err
 	}
-	if err := c.postBytes(ctx, body); err != nil {
+	if err := c.postBytes(ctx, body, true); err != nil {
 		if !isRetryable(err) {
 			c.logger.Warn("ingest rejected (permanent), dropping batch", "err", err, "points", len(batch.Points))
 			return err
@@ -132,7 +220,7 @@ func (c *Client) drainLoop(ctx context.Context) {
 			wait = 30 * time.Second
 			continue
 		}
-		if err := c.postBytes(ctx, body); err != nil {
+		if err := c.postBytes(ctx, body, false); err != nil {
 			if errors.Is(err, ErrDeregistered) {
 				return
 			}
@@ -163,7 +251,7 @@ func nextBackoff(d time.Duration) time.Duration {
 	return d
 }
 
-func (c *Client) postBytes(ctx context.Context, body []byte) error {
+func (c *Client) postBytes(ctx context.Context, body []byte, live bool) error {
 	select {
 	case <-c.deregisteredCh:
 		return ErrDeregistered
@@ -228,6 +316,9 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 				default:
 				}
 			}
+		}
+		if live {
+			c.writeHealth()
 		}
 		return nil
 	}

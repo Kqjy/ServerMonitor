@@ -3,6 +3,7 @@
   import { api, type ProcessSeriesPoint } from '$lib/api';
   import MultiChart from '$lib/components/MultiChart.svelte';
   import { bytes } from '$lib/format';
+  import { loadPresetWin, savePresetWin } from '$lib/time';
 
   let { hostId, pid, name = '', at = null }: { hostId: number; pid: number; name?: string; at?: number | null } = $props();
 
@@ -14,7 +15,15 @@
     { key: '24h', ms: 24 * 60 * 60 * 1000, label: '24h' }
   ];
 
-  let win = $state<Win>('1h');
+  const WIN_STORAGE_KEY = 'sm_process_win';
+  const allowedWins: readonly Win[] = ['15m', '1h', '6h', '24h'];
+  let win = $state<Win>(loadPresetWin(WIN_STORAGE_KEY, allowedWins, '1h'));
+  let prevWin: Win | null = null;
+  $effect(() => {
+    const v = win;
+    if (prevWin !== null && prevWin !== v) savePresetWin(WIN_STORAGE_KEY, v);
+    prevWin = v;
+  });
   let loading = $state(false);
   let points = $state<ProcessSeriesPoint[]>([]);
   let fromMs = $state(Date.now() - 60 * 60 * 1000);

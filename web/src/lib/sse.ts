@@ -102,6 +102,38 @@ export function subscribeHost(
   );
 }
 
+type HostsHandler = (hostId: number, points: LivePoint[]) => void;
+
+export function subscribeHosts(
+  metricNames: string[],
+  onPoints: HostsHandler
+): () => void {
+  const q = new URLSearchParams();
+  q.set('host_id', '0');
+  if (metricNames.length) q.set('metrics', metricNames.join(','));
+  const url = `/api/v1/stream?${q.toString()}`;
+  const wanted = new Set(metricNames);
+
+  return openStream(
+    url,
+    'points',
+    (evt: MessageEvent) => {
+      try {
+        const env = JSON.parse(evt.data) as Envelope;
+        const out: LivePoint[] = [];
+        for (const p of env.points) {
+          const name = metricNameCache!.get(p.m) ?? '';
+          if (!name) continue;
+          if (wanted.size && !wanted.has(name)) continue;
+          out.push({ metric: name, labels: p.l, ts: p.t, v: p.v });
+        }
+        if (out.length) onPoints(env.host_id, out);
+      } catch {}
+    },
+    ensureMetricCache
+  );
+}
+
 export function pointsToSeries(points: LivePoint[], metric: string, labels?: Record<string, string>): SeriesPoint[] {
   return points
     .filter((p) => {
