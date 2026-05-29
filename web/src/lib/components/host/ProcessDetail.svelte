@@ -64,7 +64,7 @@
       toMs = to.getTime();
       fromMs = from.getTime();
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') throw e;
+      if ((e as Error).name !== 'AbortError') points = [];
     } finally {
       loading = false;
     }

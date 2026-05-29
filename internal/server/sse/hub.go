@@ -22,6 +22,11 @@ const (
 	subAlerts
 )
 
+const (
+	pointsChanBuffer = 1024
+	alertChanBuffer  = 64
+)
+
 type subMsg struct {
 	event string
 	data  []byte
@@ -126,11 +131,15 @@ func (h *Hub) HandleSSE(w http.ResponseWriter, r *http.Request) {
 		kind = subAlerts
 	}
 
+	bufSize := alertChanBuffer
+	if kind == subPoints {
+		bufSize = pointsChanBuffer
+	}
 	s := &sub{
 		hostID:  hostID,
 		kind:    kind,
 		metrics: metricSet,
-		ch:      make(chan subMsg, 64),
+		ch:      make(chan subMsg, bufSize),
 	}
 	h.mu.Lock()
 	h.subs[s] = struct{}{}

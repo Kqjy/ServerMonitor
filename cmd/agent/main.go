@@ -413,7 +413,7 @@ func healthzCmd(args []string) error {
 
 	data, err := os.ReadFile(healthPath)
 	if err != nil {
-		if os.IsNotExist(err) || os.IsPermission(err) {
+		if os.IsNotExist(err) {
 			return fmt.Errorf("%w: %s (%v)", errHealthMissing, healthPath, err)
 		}
 		return fmt.Errorf("read %s: %w", healthPath, err)

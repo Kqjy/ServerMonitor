@@ -92,11 +92,8 @@ export function loadRange(searchParams?: URLSearchParams): Range {
 }
 
 export function saveRange(r: Range): void {
-  if (typeof localStorage === 'undefined') return;
   if (!isPreset(r)) return;
-  try {
-    localStorage.setItem(RANGE_STORAGE_KEY, r);
-  } catch {}
+  savePresetWin(RANGE_STORAGE_KEY, r);
 }
 
 export function writeRangeToUrl(r: Range): void {

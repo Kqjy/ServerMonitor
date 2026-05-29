@@ -261,7 +261,7 @@ func healthzCmd() error {
 	}
 	url := fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port))
 	client := &http.Client{
-		Timeout: 3 * time.Second,
+		Timeout: 4 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},

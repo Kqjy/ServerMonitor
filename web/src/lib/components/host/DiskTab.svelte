@@ -60,15 +60,10 @@
     inflight = ac;
     let from: string;
     let to: string | undefined;
-    if (chartZoom !== null) {
-      from = new Date(chartZoom.fromMs).toISOString();
-      to = new Date(chartZoom.toMs).toISOString();
-      fromMs = chartZoom.fromMs;
-      toMs = chartZoom.toMs;
-    } else {
-      const b = rangeBoundsMs(range);
-      from = rangeToFrom(range);
-      to = rangeToTo(range);
+    const b = rangeBoundsMs(range);
+    from = rangeToFrom(range);
+    to = rangeToTo(range);
+    if (chartZoom === null) {
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -184,14 +179,12 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    refresh();
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
-    refresh();
   }
 </script>
 

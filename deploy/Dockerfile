@@ -25,6 +25,6 @@ COPY --from=gobuild /out/agent  /usr/local/bin/agent
 COPY --from=gobuild --chown=65532:65532 /out/data /data
 USER nonroot
 EXPOSE 8080
-HEALTHCHECK --interval=15s --timeout=3s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=15s --timeout=6s --start-period=60s --retries=3 \
   CMD ["/usr/local/bin/server", "healthz"]
 ENTRYPOINT ["/usr/local/bin/server"]

@@ -524,7 +524,7 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 		}
 
 		hostIDs := make([]int64, 0, len(requested))
-		maxInterval := 0
+		minInterval := 0
 		for _, id := range requested {
 			h, err := hosts.Get(r.Context(), id)
 			if err != nil {
@@ -535,16 +535,16 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 				return
 			}
 			hostIDs = append(hostIDs, id)
-			if h.SampleIntervalS > maxInterval {
-				maxInterval = h.SampleIntervalS
+			if h.SampleIntervalS > 0 && (minInterval == 0 || h.SampleIntervalS < minInterval) {
+				minInterval = h.SampleIntervalS
 			}
 		}
 		if len(hostIDs) == 0 {
 			writeError(w, http.StatusNotFound, "no matching hosts")
 			return
 		}
-		if maxInterval <= 0 {
-			maxInterval = 10
+		if minInterval <= 0 {
+			minInterval = 10
 		}
 
 		labelSel := q.Get("labels")
@@ -565,17 +565,17 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 			writeError(w, http.StatusBadRequest, "to must be after from")
 			return
 		}
-		rawCutoff := now.Add(-ret.RawCutoff)
-		if from.Before(rawCutoff) {
-			writeError(w, http.StatusBadRequest, "from is older than raw retention; use /series for archived data")
-			return
+		if ret.RawCutoff > 0 {
+			if rawCutoff := now.Add(-ret.RawCutoff); from.Before(rawCutoff) {
+				from = rawCutoff
+			}
 		}
 
 		step, _ := strconv.Atoi(q.Get("step"))
 		if step <= 0 {
-			step = chooseStep(to.Sub(from), maxInterval)
-		} else if step < maxInterval {
-			step = maxInterval
+			step = chooseStep(to.Sub(from), minInterval)
+		} else if step < minInterval {
+			step = minInterval
 		}
 
 		result := make(map[string]batchSeriesEntry, len(hostIDs))
@@ -583,37 +583,39 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 			result[strconv.FormatInt(id, 10)] = batchSeriesEntry{Points: []seriesPoint{}}
 		}
 
-		rows, err := db.Pool.Query(r.Context(), `
-			SELECT host_id, time_bucket($1::interval, time) AS bucket, avg(value)
-			FROM metric_points
-			WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
-			  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
-			GROUP BY host_id, bucket
-			ORDER BY host_id, bucket ASC
-		`, intervalString(step), hostIDs, int16(metricID), from, to, labelArg)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var (
-				hostID int64
-				t      time.Time
-				v      float64
-			)
-			if err := rows.Scan(&hostID, &t, &v); err != nil {
+		if to.After(from) {
+			rows, err := db.Pool.Query(r.Context(), `
+				SELECT host_id, time_bucket($1::interval, time) AS bucket, avg(value)
+				FROM metric_points
+				WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
+				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+				GROUP BY host_id, bucket
+				ORDER BY host_id, bucket ASC
+			`, intervalString(step), hostIDs, int16(metricID), from, to, labelArg)
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			key := strconv.FormatInt(hostID, 10)
-			entry := result[key]
-			entry.Points = append(entry.Points, seriesPoint{Ts: t, V: v})
-			result[key] = entry
-		}
-		if err := rows.Err(); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			defer rows.Close()
+			for rows.Next() {
+				var (
+					hostID int64
+					t      time.Time
+					v      float64
+				)
+				if err := rows.Scan(&hostID, &t, &v); err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				key := strconv.FormatInt(hostID, 10)
+				entry := result[key]
+				entry.Points = append(entry.Points, seriesPoint{Ts: t, V: v})
+				result[key] = entry
+			}
+			if err := rows.Err(); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 
 		writeJSON(w, http.StatusOK, batchSeriesResp{
@@ -774,6 +776,17 @@ func formatFloat(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
 func writeSeriesCSV(w http.ResponseWriter, hostname, metric, unit string, points []seriesPoint) {
 	cw := setCSVHeaders(w, hostname, metric)
 	header := "value"
@@ -797,7 +810,7 @@ func writeMultiSeriesCSV(w http.ResponseWriter, hostname, metric, unit, splitBy 
 	if labelCol == "" {
 		labelCol = "labels"
 	}
-	_ = cw.Write([]string{"ts", labelCol, valueHeader})
+	_ = cw.Write([]string{"ts", csvSafe(labelCol), valueHeader})
 	for _, s := range series {
 		var labelVal string
 		if splitBy != "" {
@@ -807,7 +820,7 @@ func writeMultiSeriesCSV(w http.ResponseWriter, hostname, metric, unit, splitBy 
 			labelVal = string(b)
 		}
 		for _, p := range s.Points {
-			_ = cw.Write([]string{p.Ts.UTC().Format(time.RFC3339Nano), labelVal, formatFloat(p.V)})
+			_ = cw.Write([]string{p.Ts.UTC().Format(time.RFC3339Nano), csvSafe(labelVal), formatFloat(p.V)})
 		}
 	}
 	cw.Flush()

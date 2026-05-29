@@ -50,7 +50,7 @@
       });
       points = resp.points;
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') throw e;
+      if ((e as Error).name !== 'AbortError') points = [];
     } finally {
       loading = false;
     }
@@ -78,11 +78,7 @@
       toMs = to.getTime();
       fromMs = from.getTime();
     }
-    if (chartZoom !== null) {
-      await fetchSpan(new Date(chartZoom.fromMs), new Date(chartZoom.toMs));
-    } else {
-      await fetchSpan(from, to);
-    }
+    await fetchSpan(from, to);
   }
 
   $effect(() => {
@@ -128,13 +124,11 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
-    fetchSpan(new Date(f), new Date(t));
   }
   function handleReset() {
     chartZoom = null;
     fromMs = windowFromMs;
     toMs = windowToMs;
-    fetchSpan(new Date(windowFromMs), new Date(windowToMs));
   }
 </script>
 

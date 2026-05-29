@@ -320,21 +320,38 @@ export const api = {
     if (params.labels) q.set('labels', JSON.stringify(params.labels));
     return request<SeriesResp>(`/api/v1/series?${q}`, { signal: params.signal });
   },
-  seriesBatch: (params: {
+  seriesBatch: async (params: {
     hosts: number[];
     metric: string;
     from?: string;
     to?: string;
     step?: number;
     signal?: AbortSignal;
-  }) => {
-    const q = new URLSearchParams();
-    q.set('hosts', params.hosts.join(','));
-    q.set('metric', params.metric);
-    if (params.from) q.set('from', params.from);
-    if (params.to) q.set('to', params.to);
-    if (params.step) q.set('step', String(params.step));
-    return request<BatchSeriesResp>(`/api/v1/series/batch?${q}`, { signal: params.signal });
+  }): Promise<BatchSeriesResp> => {
+    const CHUNK = 200;
+    const fetchChunk = (ids: number[]) => {
+      const q = new URLSearchParams();
+      q.set('hosts', ids.join(','));
+      q.set('metric', params.metric);
+      if (params.from) q.set('from', params.from);
+      if (params.to) q.set('to', params.to);
+      if (params.step) q.set('step', String(params.step));
+      return request<BatchSeriesResp>(`/api/v1/series/batch?${q}`, { signal: params.signal });
+    };
+    if (params.hosts.length <= CHUNK) return fetchChunk(params.hosts);
+    const chunks: number[][] = [];
+    for (let i = 0; i < params.hosts.length; i += CHUNK) {
+      chunks.push(params.hosts.slice(i, i + CHUNK));
+    }
+    const settled = await Promise.allSettled(chunks.map(fetchChunk));
+    const merged: BatchSeriesResp = { metric: params.metric, unit: '', step_sec: 0, hosts: {} };
+    for (const s of settled) {
+      if (s.status !== 'fulfilled') continue;
+      merged.unit = s.value.unit;
+      merged.step_sec = Math.max(merged.step_sec, s.value.step_sec);
+      Object.assign(merged.hosts, s.value.hosts);
+    }
+    return merged;
   },
   seriesMulti: (params: {
     host: number;

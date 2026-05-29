@@ -161,14 +161,28 @@ func verifyDirSafe(dir string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("install dir %q is not a directory", dir)
 	}
-	mode := fi.Mode().Perm()
-	if mode&0o002 != 0 {
-		return fmt.Errorf("refusing upgrade: install dir %q is world-writable (mode %#o)", dir, mode)
+	cur := dir
+	for {
+		fi, err := os.Stat(cur)
+		if err != nil {
+			return fmt.Errorf("stat %q: %w", cur, err)
+		}
+		mode := fi.Mode()
+		perm := mode.Perm()
+		if mode&os.ModeSticky == 0 {
+			if perm&0o002 != 0 {
+				return fmt.Errorf("refusing upgrade: %q is world-writable (mode %#o); a writable directory on the install path lets an untrusted user replace the agent binary", cur, perm)
+			}
+			if perm&0o020 != 0 && !dirGroupOwnedByRunningUID(fi) {
+				return fmt.Errorf("refusing upgrade: %q is group-writable (mode %#o) and the group is not the agent's effective uid; tighten with chmod g-w or chown so the group is trusted", cur, perm)
+			}
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return nil
+		}
+		cur = parent
 	}
-	if mode&0o020 != 0 && !dirGroupOwnedByRunningUID(fi) {
-		return fmt.Errorf("refusing upgrade: install dir %q is group-writable (mode %#o) and the group is not the agent's effective uid; tighten with chmod g-w or chown so the group is trusted", dir, mode)
-	}
-	return nil
 }
 
 func verifyStagedBinary(path string, want []byte) error {
