@@ -253,7 +253,7 @@
           {#if open}
             <tr class="bg-zinc-950/60">
               <td colspan="6" class="p-0">
-                <ProcessDetail {hostId} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} />
+                <ProcessDetail {hostId} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} live={isLive} />
               </td>
             </tr>
           {/if}

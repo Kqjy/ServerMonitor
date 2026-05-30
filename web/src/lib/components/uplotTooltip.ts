@@ -55,18 +55,24 @@ export function tooltipPlugin(opts: {
           lastIdx = -1;
           return;
         }
+        const xs = u.data[0] as number[];
+        const ts = xs[idx];
+        if (ts == null) {
+          setHidden(true);
+          lastIdx = -1;
+          return;
+        }
+        if (pointerBeyondData(u, xs, idx, left, ts)) {
+          setHidden(true);
+          lastIdx = -1;
+          return;
+        }
         if (idx === lastIdx && tip.style.display === 'block') {
           positionTip(tip, u.over, left, top);
           return;
         }
         lastIdx = idx;
 
-        const xs = u.data[0];
-        const ts = xs[idx];
-        if (ts == null) {
-          setHidden(true);
-          return;
-        }
         const date = new Date(ts * 1000);
         const timeStr = formatTimestamp(date);
 
@@ -122,6 +128,22 @@ export function tooltipPlugin(opts: {
     el.style.left = `${x}px`;
     el.style.top = `${y}px`;
   }
+}
+
+function pointerBeyondData(u: uPlot, xs: number[], idx: number, left: number, ts: number): boolean {
+  const n = xs.length;
+  const atLeft = idx === 0;
+  const atRight = idx === n - 1;
+  if (!atLeft && !atRight) return false;
+  const ptLeft = u.valToPos(ts, 'x');
+  const beyond = atLeft && atRight ? true : atLeft ? left < ptLeft : left > ptLeft;
+  if (!beyond) return false;
+  let halfStepPx = 16;
+  if (n >= 2) {
+    const adj = atLeft ? xs[1] : xs[n - 2];
+    halfStepPx = Math.abs(u.valToPos(adj, 'x') - ptLeft) / 2;
+  }
+  return Math.abs(left - ptLeft) > halfStepPx;
 }
 
 function formatTimestamp(d: Date): string {

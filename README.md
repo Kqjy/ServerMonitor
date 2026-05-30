@@ -71,6 +71,12 @@ sudo ./scripts/install-agent-linux.sh \
 
 Both scripts wrap `sm-agent register` (which calls `POST /api/v1/admin/hosts`), then enable the service (`systemd` on Linux, `sc.exe` on Windows). Within ~10 seconds the host appears in the dashboard with a live CPU sparkline.
 
+**Docker (containerized agent)**
+
+For hosts that run everything in containers, deploy the agent as a container instead of installing it on the host — register the host, drop its token into an env file, and `docker compose up`. Full steps in **[deploy/AGENT-DOCKER.md](deploy/AGENT-DOCKER.md)**. The container reads its identity from `SM_SERVER_URL` / `SM_TOKEN` / `SM_SERVER_PUBKEY`, so no on-disk `agent.toml` is required.
+
+A host that only runs *Glances* in a container is not itself containerized — the host install above is simpler and still reports that host's containers via the Docker socket.
+
 ---
 
 ## What the agent collects

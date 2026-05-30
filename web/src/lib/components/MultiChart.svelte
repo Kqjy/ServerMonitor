@@ -25,6 +25,7 @@
     emptyText = 'No data in this range',
     zoomed = false,
     loading = false,
+    masking = false,
     yMinSpan,
     yClampMin,
     yMaxDigits,
@@ -41,6 +42,7 @@
     emptyText?: string;
     zoomed?: boolean;
     loading?: boolean;
+    masking?: boolean;
     yMinSpan?: number;
     yClampMin?: number;
     yMaxDigits?: number;
@@ -199,8 +201,9 @@
   }
 
   const empty = $derived(!hasData(series));
-  const showLoading = $derived(loading);
-  const showEmpty = $derived(!loading && empty);
+  const showLoading = $derived(loading || masking);
+  const showEmpty = $derived(!loading && !masking && empty);
+  const maskStale = $derived(masking && !empty);
 
   $effect(() => {
     const targetFromS = currentFromS();
@@ -224,6 +227,8 @@
         suppressBroadcast = true;
         plot.setScale('x', { min: targetFromS, max: targetToS });
         queueMicrotask(() => { suppressBroadcast = false; });
+      } else if (!dataRefilled) {
+        plot.redraw();
       }
     } else if (hasData(series)) {
       build(alignData(series));
@@ -250,7 +255,7 @@
 <div class="relative">
   <div bind:this={host} class="w-full" style="height: {height}px"></div>
   {#if showLoading}
-    <div class="absolute inset-0 px-3 pointer-events-none" aria-busy="true" aria-label="Loading chart">
+    <div class="absolute inset-0 px-3 pointer-events-none" class:bg-zinc-950={maskStale} class:rounded-md={maskStale} aria-busy="true" aria-label="Loading chart">
       <div class="h-full w-full rounded-md shimmer opacity-40"></div>
       <div class="absolute inset-0 flex items-center justify-center">
         <div class="flex items-center gap-2 px-3 py-1.5 rounded-md border border-zinc-800 bg-zinc-950/80 text-[11px] uppercase tracking-wider text-zinc-400">

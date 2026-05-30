@@ -39,6 +39,13 @@ type procCPUSample struct {
 	cputime    float64
 }
 
+type procMeta struct {
+	createTime int64
+	name       string
+	user       string
+	cmdline    string
+}
+
 type processCollector struct {
 	mu              sync.Mutex
 	last            procCountSnapshot
@@ -46,6 +53,7 @@ type processCollector struct {
 	countRefreshing bool
 	prevCPU         map[int32]procCPUSample
 	prevCPUAt       time.Time
+	metaCache       map[int32]procMeta
 	lastTopNSkipped int
 }
 
@@ -95,15 +103,22 @@ func (c *processCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	c.mu.Lock()
 	skipped := c.lastTopNSkipped
 	c.mu.Unlock()
-	return []wire.Point{
+	pts := []wire.Point{
 		point(now, metrics.ProcCount, nil, float64(cached.pids)),
-		point(now, metrics.ProcRunning, nil, float64(cached.running)),
-		point(now, metrics.ProcSleep, nil, float64(cached.sleep)),
-		point(now, metrics.ProcZombie, nil, float64(cached.zombie)),
-		point(now, metrics.ProcStop, nil, float64(cached.stopped)),
+	}
+	if procStatesSupported {
+		pts = append(pts,
+			point(now, metrics.ProcRunning, nil, float64(cached.running)),
+			point(now, metrics.ProcSleep, nil, float64(cached.sleep)),
+			point(now, metrics.ProcZombie, nil, float64(cached.zombie)),
+			point(now, metrics.ProcStop, nil, float64(cached.stopped)),
+		)
+	}
+	pts = append(pts,
 		point(now, metrics.ProcThreads, nil, float64(cached.threads)),
 		point(now, metrics.ProcScanSkipped, nil, float64(skipped)),
-	}, nil
+	)
+	return pts, nil
 }
 
 func (c *processCollector) CollectProcesses(ctx context.Context, topN int) ([]wire.Process, error) {
@@ -149,11 +164,19 @@ func (c *processCollector) scanTopProcesses(ctx context.Context, topN int) ([]wi
 	c.mu.Lock()
 	prevCPU := c.prevCPU
 	prevAt := c.prevCPUAt
+	prevMeta := c.metaCache
 	c.mu.Unlock()
 
 	elapsed := now.Sub(prevAt).Seconds()
 	havePrev := !prevAt.IsZero() && elapsed > 0
 	nextCPU := make(map[int32]procCPUSample, len(procs))
+
+	threadByPID, _ := threadCountsByPID(ctx)
+
+	var nextMeta map[int32]procMeta
+	if procMetaCacheEnabled {
+		nextMeta = make(map[int32]procMeta, len(procs))
+	}
 
 	type row struct {
 		pid     int32
@@ -194,16 +217,32 @@ func (c *processCollector) scanTopProcesses(ctx context.Context, topN int) ([]wi
 			skipped++
 			continue
 		}
-		name, _ := p.NameWithContext(ctx)
-		user, _ := p.UsernameWithContext(ctx)
-		cmd, _ := p.CmdlineWithContext(ctx)
+
+		meta, ok := lookupProcMeta(prevMeta, p.Pid, ct)
+		if !ok {
+			name, _ := p.NameWithContext(ctx)
+			user, _ := p.UsernameWithContext(ctx)
+			cmd, _ := p.CmdlineWithContext(ctx)
+			meta = procMeta{createTime: ct, name: name, user: user, cmdline: trunc(cmd, 512)}
+		}
+		if nextMeta != nil {
+			nextMeta[p.Pid] = meta
+		}
+
 		stat, _ := p.StatusWithContext(ctx)
-		nt, _ := p.NumThreadsWithContext(ctx)
+
+		var nt int32
+		if threadByPID != nil {
+			nt = threadByPID[p.Pid]
+		} else {
+			nt, _ = p.NumThreadsWithContext(ctx)
+		}
+
 		rows = append(rows, row{
 			pid:     p.Pid,
-			name:    name,
-			user:    user,
-			cmdline: trunc(cmd, 512),
+			name:    meta.name,
+			user:    meta.user,
+			cmdline: meta.cmdline,
 			cpu:     float32(cpuPct),
 			rss:     int64(mem.RSS),
 			status:  strings.Join(stat, ","),
@@ -214,6 +253,9 @@ func (c *processCollector) scanTopProcesses(ctx context.Context, topN int) ([]wi
 	c.mu.Lock()
 	c.prevCPU = nextCPU
 	c.prevCPUAt = now
+	if nextMeta != nil {
+		c.metaCache = nextMeta
+	}
 	c.lastTopNSkipped = skipped
 	c.mu.Unlock()
 
@@ -241,6 +283,17 @@ func (c *processCollector) scanTopProcesses(ctx context.Context, topN int) ([]wi
 		}
 	}
 	return out, nil
+}
+
+func lookupProcMeta(cache map[int32]procMeta, pid int32, createTime int64) (procMeta, bool) {
+	if !procMetaCacheEnabled || cache == nil || createTime == 0 {
+		return procMeta{}, false
+	}
+	m, ok := cache[pid]
+	if !ok || m.createTime != createTime {
+		return procMeta{}, false
+	}
+	return m, true
 }
 
 func trunc(s string, n int) string {

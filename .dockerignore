@@ -1,0 +1,9 @@
+.git
+.gitignore
+bin/
+*.exe
+web/node_modules
+web/.svelte-kit
+web/build
+deploy/.env
+deploy/.env.agent

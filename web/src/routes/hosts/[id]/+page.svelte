@@ -252,15 +252,15 @@
     <Tabs {tabs} bind:value={tabModel} />
 
     <div class="mt-6">
-      {#if tabModel === 'overview'}<OverviewTab hostId={id} {range} />
-      {:else if tabModel === 'memory'}<MemoryTab hostId={id} {range} />
-      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} enabledCollectors={host.enabled_collectors ?? []} collectorStatus={host.collector_status ?? {}} />
-      {:else if tabModel === 'network'}<NetworkTab hostId={id} {range} />
+      {#if tabModel === 'overview'}<OverviewTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
+      {:else if tabModel === 'memory'}<MemoryTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
+      {:else if tabModel === 'disk'}<DiskTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} enabledCollectors={host.enabled_collectors ?? []} collectorStatus={host.collector_status ?? {}} />
+      {:else if tabModel === 'network'}<NetworkTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'processes'}<ProcessesTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'containers'}<ContainersTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'ports'}<PortsTab hostId={id} sampleIntervalS={host.sample_interval_s} />
-      {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} />
-      {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} />
+      {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
+      {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {/if}
     </div>
 

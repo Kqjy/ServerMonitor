@@ -1,8 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -28,10 +31,6 @@ type Config struct {
 }
 
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
 	c := &Config{
 		IntervalS:      10,
 		ProcessTopN:    50,
@@ -40,19 +39,54 @@ func Load(path string) (*Config, error) {
 		SpoolMaxBytes:  256 * 1024 * 1024,
 		HTTPTimeout:    20 * time.Second,
 	}
-	if err := toml.Unmarshal(data, c); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if err := toml.Unmarshal(data, c); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("read config: %w", err)
 	}
+
+	applyEnvOverrides(c)
+
 	if c.ServerURL == "" {
-		return nil, fmt.Errorf("server_url is required")
+		return nil, fmt.Errorf("server_url is required (set it in %s or via SM_SERVER_URL)", path)
 	}
 	if c.Token == "" {
-		return nil, fmt.Errorf("token is required")
+		return nil, fmt.Errorf("token is required (set it in %s or via SM_TOKEN)", path)
 	}
 	if c.IntervalS <= 0 {
 		c.IntervalS = 10
 	}
 	return c, nil
+}
+
+func applyEnvOverrides(c *Config) {
+	if v := os.Getenv("SM_SERVER_URL"); v != "" {
+		c.ServerURL = v
+	}
+	if v := os.Getenv("SM_TOKEN"); v != "" {
+		c.Token = v
+	}
+	if v := os.Getenv("SM_SERVER_PUBKEY"); v != "" {
+		c.ServerPubkey = v
+	}
+	if v := os.Getenv("SM_SPOOL_PATH"); v != "" {
+		c.SpoolPath = v
+	}
+	if v := os.Getenv("SM_INTERVAL_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.IntervalS = n
+		}
+	}
+	if v := os.Getenv("SM_AUTO_UPGRADE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.AutoUpgrade = &b
+		}
+	}
 }
 
 func (c *Config) Interval() time.Duration {

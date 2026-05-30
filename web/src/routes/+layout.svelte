@@ -68,7 +68,7 @@
 
     <footer class="border-t border-zinc-800 py-4 text-xs text-zinc-500 text-center">
       <div class="max-w-7xl mx-auto px-4 sm:px-6">
-        ServerMonitor — Unified Server Monitoring{#if auth.serverVersion}<span class="text-zinc-600"> · </span><span class="numeric">v{auth.serverVersion}</span>{/if}
+        ServerMonitor — Unified Server Monitoring {#if auth.serverVersion}| <span class="numeric">v{auth.serverVersion}</span>{/if}
       </div>
     </footer>
   </div>

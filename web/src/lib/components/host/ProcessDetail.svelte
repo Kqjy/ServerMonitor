@@ -5,7 +5,7 @@
   import { bytes } from '$lib/format';
   import { loadPresetWin, savePresetWin } from '$lib/time';
 
-  let { hostId, pid, name = '', at = null }: { hostId: number; pid: number; name?: string; at?: number | null } = $props();
+  let { hostId, pid, name = '', at = null, live = true }: { hostId: number; pid: number; name?: string; at?: number | null; live?: boolean } = $props();
 
   type Win = '15m' | '1h' | '6h' | '24h';
   const windows: { key: Win; ms: number; label: string }[] = [
@@ -33,12 +33,18 @@
   let lastWin: Win | null = null;
   let lastName = '';
   const minDeltaMs = 1_000;
+  let chartZoom = $state<{ fromMs: number; toMs: number } | null>(null);
+  const isZoomed = $derived(chartZoom !== null);
 
   async function load() {
     const span = windows.find((w) => w.key === win)!.ms;
     const anchor = at ?? Date.now();
     if (win === lastWin && name === lastName && Math.abs(anchor - lastAnchor) < minDeltaMs) return;
     const windowChanged = win !== lastWin || name !== lastName;
+    if (chartZoom !== null) {
+      if (live && !windowChanged) return;
+      chartZoom = null;
+    }
     lastAnchor = anchor;
     lastWin = win;
     lastName = name;
@@ -68,6 +74,19 @@
     } finally {
       loading = false;
     }
+  }
+
+  function handleZoom(f: number, t: number) {
+    chartZoom = { fromMs: f, toMs: t };
+    fromMs = f;
+    toMs = t;
+  }
+  function handleReset() {
+    chartZoom = null;
+    const span = windows.find((w) => w.key === win)!.ms;
+    const anchor = lastAnchor || Date.now();
+    toMs = anchor;
+    fromMs = anchor - span;
   }
 
   $effect(() => {
@@ -124,6 +143,9 @@
         fill
         {fromMs}
         {toMs}
+        zoomed={isZoomed}
+        onZoom={handleZoom}
+        onResetZoom={handleReset}
         loading={loading && points.length === 0}
         emptyText="No samples in window" />
     </div>
@@ -136,6 +158,9 @@
         format={(v) => bytes(v)}
         {fromMs}
         {toMs}
+        zoomed={isZoomed}
+        onZoom={handleZoom}
+        onResetZoom={handleReset}
         loading={loading && points.length === 0}
         emptyText="No samples in window" />
     </div>

@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
-  let { hostId, range }: { hostId: number; range: Range } = $props();
+  let { hostId, range, sampleIntervalS = 10 }: { hostId: number; range: Range; sampleIntervalS?: number } = $props();
 
   let usage = $state<SeriesEntry[]>([]);
   let memUsedPct = $state<SeriesEntry[]>([]);
@@ -15,7 +15,10 @@
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
   let loading = $state(true);
+  let masking = $state(false);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -33,12 +36,16 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
+    const zoomed = chartZoom;
     let from: string;
     let to: string | undefined;
-    const b = rangeBoundsMs(range);
-    from = rangeToFrom(range);
-    to = rangeToTo(range);
-    if (chartZoom === null) {
+    if (zoomed) {
+      from = new Date(zoomed.fromMs).toISOString();
+      to = new Date(zoomed.toMs).toISOString();
+    } else {
+      const b = rangeBoundsMs(range);
+      from = rangeToFrom(range);
+      to = rangeToTo(range);
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -50,15 +57,19 @@
         api.seriesMulti({ host: hostId, metric: 'gpu_power_w', from, to, splitBy: 'gpu', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
+      loadedStep = u.step_sec;
+      zoomFetched = zoomed !== null;
       usage = u.series;
       memUsedPct = mp.series;
       temp = t.series;
       power = p.series;
       loading = false;
+      masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
       loading = false;
+      masking = false;
     }
   }
 
@@ -80,7 +91,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(refresh, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
@@ -93,12 +104,14 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) { masking = true; refresh(); }
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    if (zoomFetched) { masking = true; refresh(); }
   }
   void bytes;
 </script>
@@ -124,28 +137,28 @@
         <div class="text-xs uppercase tracking-wider text-zinc-500">GPU utilization</div>
         <DownloadCsv host={hostId} metric="gpu_usage_pct" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(usage)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(usage)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
         <div class="text-xs uppercase tracking-wider text-zinc-500">VRAM utilization</div>
         <DownloadCsv host={hostId} metric="gpu_mem_used_pct" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(memUsedPct)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(memUsedPct)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="%" /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
         <div class="text-xs uppercase tracking-wider text-zinc-500">Temperature</div>
         <DownloadCsv host={hostId} metric="gpu_temp_c" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(temp)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(temp)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
         <div class="text-xs uppercase tracking-wider text-zinc-500">Power draw</div>
         <DownloadCsv host={hostId} metric="gpu_power_w" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(power)} {fromMs} {toMs} zoomed={isZoomed} onZoom={handleZoom} onResetZoom={handleReset} unit="W" format={(v) => `${v.toFixed(0)} W`} /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(power)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="W" format={(v) => `${v.toFixed(0)} W`} /></div>
     </section>
   </div>
 {/if}

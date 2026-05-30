@@ -1,0 +1,37 @@
+services:
+  sm-agent:
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.1.6}
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+      - SYS_PTRACE
+    security_opt:
+      - no-new-privileges:true
+    command: ["--config", "/var/lib/servermonitor/agent.toml"]
+    environment:
+      SM_SERVER_URL: ${SM_SERVER_URL:?set SM_SERVER_URL in .env.agent}
+      SM_TOKEN: ${SM_TOKEN:?set SM_TOKEN in .env.agent}
+      SM_SERVER_PUBKEY: ${SM_SERVER_PUBKEY:-}
+      SM_INTERVAL_S: ${SM_INTERVAL_S:-}
+      SM_SPOOL_PATH: /var/lib/servermonitor/spool.db
+      SM_HOST_FS_ROOT: /host
+      SM_AUTO_UPGRADE: "false"
+    tmpfs:
+      - /tmp
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+      - sm-agent-state:/var/lib/servermonitor
+
+volumes:
+  sm-agent-state:

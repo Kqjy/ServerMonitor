@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry, type CollectorStatus } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes, pct, dur } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
@@ -9,11 +9,13 @@
   let {
     hostId,
     range,
+    sampleIntervalS = 10,
     enabledCollectors = [],
     collectorStatus = {}
   }: {
     hostId: number;
     range: Range;
+    sampleIntervalS?: number;
     enabledCollectors?: string[];
     collectorStatus?: Record<string, CollectorStatus>;
   } = $props();
@@ -40,7 +42,10 @@
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
   let loading = $state(true);
+  let masking = $state(false);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -58,12 +63,16 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
+    const zoomed = chartZoom;
     let from: string;
     let to: string | undefined;
-    const b = rangeBoundsMs(range);
-    from = rangeToFrom(range);
-    to = rangeToTo(range);
-    if (chartZoom === null) {
+    if (zoomed) {
+      from = new Date(zoomed.fromMs).toISOString();
+      to = new Date(zoomed.toMs).toISOString();
+    } else {
+      const b = rangeBoundsMs(range);
+      from = rangeToFrom(range);
+      to = rangeToTo(range);
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -83,6 +92,8 @@
         api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
+      loadedStep = r.step_sec;
+      zoomFetched = zoomed !== null;
       read = r.series;
       write = wr.series;
       readOps = rOps.series;
@@ -141,10 +152,12 @@
       smartTemps = sTemp.series;
 
       loading = false;
+      masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
       loading = false;
+      masking = false;
     }
   }
 
@@ -167,7 +180,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(refresh, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
@@ -179,12 +192,14 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) { masking = true; refresh(); }
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    if (zoomFetched) { masking = true; refresh(); }
   }
 </script>
 
@@ -195,7 +210,7 @@
       <DownloadCsv host={hostId} metric="disk_read_bytes" splitBy="device" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(read)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(read)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
   </section>
 
@@ -205,7 +220,7 @@
       <DownloadCsv host={hostId} metric="disk_write_bytes" splitBy="device" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(write)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(write)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
   </section>
 
@@ -216,7 +231,7 @@
         <DownloadCsv host={hostId} metric="disk_read_ops" splitBy="device" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(readOps)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(readOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
       </div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -225,7 +240,7 @@
         <DownloadCsv host={hostId} metric="disk_write_ops" splitBy="device" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(writeOps)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(writeOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
       </div>
     </section>
   </div>
@@ -352,7 +367,7 @@
           <DownloadCsv host={hostId} metric="smart_temp_c" splitBy="device" {range} />
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(smartTemps)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} />
+          <MultiChart series={toSeries(smartTemps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} />
         </div>
       </section>
     {/if}

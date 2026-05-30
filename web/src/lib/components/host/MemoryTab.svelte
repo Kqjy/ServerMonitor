@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesPoint } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes, pct } from '$lib/format';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
-  let { hostId, range }: { hostId: number; range: Range } = $props();
+  let { hostId, range, sampleIntervalS = 10 }: { hostId: number; range: Range; sampleIntervalS?: number } = $props();
 
   let used = $state<SeriesPoint[]>([]);
   let cached = $state<SeriesPoint[]>([]);
@@ -22,7 +22,10 @@
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
   let loading = $state(true);
+  let masking = $state(false);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -33,12 +36,16 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
+    const zoomed = chartZoom;
     let from: string;
     let to: string | undefined;
-    const b = rangeBoundsMs(range);
-    from = rangeToFrom(range);
-    to = rangeToTo(range);
-    if (chartZoom === null) {
+    if (zoomed) {
+      from = new Date(zoomed.fromMs).toISOString();
+      to = new Date(zoomed.toMs).toISOString();
+    } else {
+      const b = rangeBoundsMs(range);
+      from = rangeToFrom(range);
+      to = rangeToTo(range);
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -54,6 +61,8 @@
         api.series({ host: hostId, metric: 'swap_total', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
+      loadedStep = u.step_sec;
+      zoomFetched = zoomed !== null;
       used = u.points;
       cached = c.points;
       buffers = b2.points;
@@ -65,10 +74,12 @@
       swapTotal = st.points.at(-1)?.v ?? 0;
       swapUsedNow = su.points.at(-1)?.v ?? 0;
       loading = false;
+      masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
       loading = false;
+      masking = false;
     }
   }
 
@@ -91,7 +102,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(refresh, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
@@ -104,12 +115,14 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) { masking = true; refresh(); }
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    if (zoomFetched) { masking = true; refresh(); }
   }
 </script>
 
@@ -136,7 +149,7 @@
         ]}
         {fromMs}
         {toMs}
-        zoomed={isZoomed}
+        zoomed={isZoomed} {masking}
         {loading}
         onZoom={handleZoom}
         onResetZoom={handleReset}
@@ -156,7 +169,7 @@
           series={[{ label: 'Swap', color: 'oklch(0.83 0.18 85)', points: swapUsed }]}
           {fromMs}
           {toMs}
-          zoomed={isZoomed}
+          zoomed={isZoomed} {masking}
           {loading}
           onZoom={handleZoom}
           onResetZoom={handleReset}

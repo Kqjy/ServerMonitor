@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
-  let { hostId, range }: { hostId: number; range: Range } = $props();
+  let { hostId, range, sampleIntervalS = 10 }: { hostId: number; range: Range; sampleIntervalS?: number } = $props();
 
   let rx = $state<SeriesEntry[]>([]);
   let tx = $state<SeriesEntry[]>([]);
@@ -23,7 +23,10 @@
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
   let loading = $state(true);
+  let masking = $state(false);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -41,12 +44,16 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
+    const zoomed = chartZoom;
     let from: string;
     let to: string | undefined;
-    const b = rangeBoundsMs(range);
-    from = rangeToFrom(range);
-    to = rangeToTo(range);
-    if (chartZoom === null) {
+    if (zoomed) {
+      from = new Date(zoomed.fromMs).toISOString();
+      to = new Date(zoomed.toMs).toISOString();
+    } else {
+      const b = rangeBoundsMs(range);
+      from = rangeToFrom(range);
+      to = rangeToTo(range);
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -65,6 +72,8 @@
         api.series({ host: hostId, metric: 'conn_timewait', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
+      loadedStep = r.step_sec;
+      zoomFetched = zoomed !== null;
       rx = r.series;
       tx = t.series;
       rxPkts = rp.series;
@@ -77,10 +86,12 @@
       listen = l.points.at(-1)?.v ?? 0;
       timeWait = w.points.at(-1)?.v ?? 0;
       loading = false;
+      masking = false;
     } catch (err) {
       if (gen !== refreshGen) return;
       if ((err as { name?: string })?.name === 'AbortError') return;
       loading = false;
+      masking = false;
     }
   }
 
@@ -106,7 +117,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(refresh, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
@@ -118,12 +129,14 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) { masking = true; refresh(); }
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    if (zoomFetched) { masking = true; refresh(); }
   }
 
   function lastSum(entries: SeriesEntry[]): number {
@@ -175,7 +188,7 @@
       <DownloadCsv host={hostId} metric="net_rx_bytes" splitBy="iface" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(rx)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(rx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
   </section>
 
@@ -185,7 +198,7 @@
       <DownloadCsv host={hostId} metric="net_tx_bytes" splitBy="iface" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(tx)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(tx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
     </div>
   </section>
 
@@ -196,7 +209,7 @@
         <DownloadCsv host={hostId} metric="net_rx_packets" splitBy="iface" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(rxPkts)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(rxPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
       </div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -205,7 +218,7 @@
         <DownloadCsv host={hostId} metric="net_tx_packets" splitBy="iface" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(txPkts)} {fromMs} {toMs} zoomed={isZoomed} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(txPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
       </div>
     </section>
   </div>
@@ -218,7 +231,7 @@
           series={errorDropSeries}
           {fromMs}
           {toMs}
-          zoomed={isZoomed}
+          zoomed={isZoomed} {masking}
           {loading}
           onZoom={handleZoom}
           onResetZoom={handleReset}

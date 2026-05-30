@@ -2,6 +2,8 @@ package collectors
 
 import (
 	"context"
+	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -11,9 +13,9 @@ import (
 	"servermonitor/pkg/wire"
 )
 
-type fsCollector struct{}
+type fsCollector struct{ hostRoot string }
 
-func init() { Register(&fsCollector{}) }
+func init() { Register(&fsCollector{hostRoot: os.Getenv("SM_HOST_FS_ROOT")}) }
 
 func (c *fsCollector) Name() string        { return "fs" }
 func (c *fsCollector) Platforms() []string { return []string{"all"} }
@@ -29,7 +31,7 @@ func (c *fsCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		if skipFSType(p.Fstype) {
 			continue
 		}
-		u, err := disk.UsageWithContext(ctx, p.Mountpoint)
+		u, err := disk.UsageWithContext(ctx, fsUsagePath(c.hostRoot, p.Mountpoint))
 		if err != nil || u.Total == 0 {
 			continue
 		}
@@ -60,4 +62,11 @@ func skipFSType(t string) bool {
 		return true
 	}
 	return false
+}
+
+func fsUsagePath(hostRoot, mountpoint string) string {
+	if hostRoot == "" {
+		return mountpoint
+	}
+	return path.Join(hostRoot, mountpoint)
 }

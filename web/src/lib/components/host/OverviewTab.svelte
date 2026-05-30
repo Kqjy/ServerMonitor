@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesPoint, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, rangeMs, isPreset, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, rangeMs, isPreset, chooseStepSec, type Range } from '$lib/time';
   import { pct, bytes, dur } from '$lib/format';
   import { subscribeHost, appendLive } from '$lib/sse';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
@@ -9,7 +9,7 @@
   import Sparkline from '$lib/components/Sparkline.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
-  let { hostId, range }: { hostId: number; range: Range } = $props();
+  let { hostId, range, sampleIntervalS = 10 }: { hostId: number; range: Range; sampleIntervalS?: number } = $props();
 
   let cpu = $state<SeriesPoint[]>([]);
   let cpuUser = $state<SeriesPoint[]>([]);
@@ -33,7 +33,10 @@
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
   let loading = $state(true);
+  let masking = $state(false);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -45,12 +48,16 @@
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
+    const zoomed = chartZoom;
     let from: string;
     let to: string | undefined;
-    const b = rangeBoundsMs(range);
-    from = rangeToFrom(range);
-    to = rangeToTo(range);
-    if (chartZoom === null) {
+    if (zoomed) {
+      from = new Date(zoomed.fromMs).toISOString();
+      to = new Date(zoomed.toMs).toISOString();
+    } else {
+      const b = rangeBoundsMs(range);
+      from = rangeToFrom(range);
+      to = rangeToTo(range);
       fromMs = b.fromMs;
       toMs = b.toMs;
     }
@@ -77,6 +84,8 @@
         api.series({ host: hostId, metric: 'cpu_freq_mhz', from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
+      loadedStep = c.step_sec;
+      zoomFetched = zoomed !== null;
       cpu = c.points;
       cpuUser = cu.points;
       cpuSystem = cs.points;
@@ -101,10 +110,12 @@
       stealNow = st.points.at(-1)?.v ?? 0;
       freqNow = fq.points.at(-1)?.v ?? 0;
       loading = false;
+      masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
       loading = false;
+      masking = false;
     }
   }
 
@@ -133,7 +144,7 @@
   });
 
   onMount(() => {
-    timer = setInterval(refresh, 30_000);
+    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 30_000);
     unsub = subscribeHost(
       hostId,
       ['cpu_total_pct', 'cpu_user_pct', 'cpu_system_pct', 'cpu_iowait_pct', 'cpu_steal_pct', 'cpu_core_pct', 'cpu_freq_mhz', 'mem_used_pct', 'mem_used', 'load_avg_1', 'load_avg_5', 'load_avg_15', 'uptime_sec'],
@@ -215,12 +226,14 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) { masking = true; refresh(); }
   }
   function handleReset() {
     chartZoom = null;
     const b = rangeBoundsMs(range);
     fromMs = b.fromMs;
     toMs = b.toMs;
+    if (zoomFetched) { masking = true; refresh(); }
   }
 </script>
 
@@ -252,7 +265,7 @@
         series={[{ label: 'CPU %', points: cpu }]}
         {fromMs}
         {toMs}
-        zoomed={isZoomed}
+        zoomed={isZoomed} {masking}
         {loading}
         onZoom={handleZoom}
         onResetZoom={handleReset}
@@ -320,7 +333,7 @@
             series={[{ label: `core ${selectedCore}`, color: coreColor(selectedCoreNow), points: selectedCoreEntry.points }]}
             {fromMs}
             {toMs}
-            zoomed={isZoomed}
+            zoomed={isZoomed} {masking}
             {loading}
             onZoom={handleZoom}
             onResetZoom={handleReset}
@@ -346,7 +359,7 @@
         ]}
         {fromMs}
         {toMs}
-        zoomed={isZoomed}
+        zoomed={isZoomed} {masking}
         {loading}
         onZoom={handleZoom}
         onResetZoom={handleReset}
@@ -372,7 +385,7 @@
           ]}
           {fromMs}
           {toMs}
-          zoomed={isZoomed}
+          zoomed={isZoomed} {masking}
           {loading}
           onZoom={handleZoom}
           onResetZoom={handleReset}
@@ -396,7 +409,7 @@
         series={[{ label: 'Memory %', color: 'oklch(0.7 0.18 240)', points: memPct }]}
         {fromMs}
         {toMs}
-        zoomed={isZoomed}
+        zoomed={isZoomed} {masking}
         {loading}
         onZoom={handleZoom}
         onResetZoom={handleReset}
