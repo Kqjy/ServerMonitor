@@ -4,7 +4,7 @@
   import { api, type Host, type ActiveAlert } from '$lib/api';
   import { statusFor, timeAgo, severityClass, severityRank } from '$lib/format';
   import { subscribeAlerts } from '$lib/sse';
-  import { ranges, isPreset, rangeLabel, loadRange, saveRange, writeRangeToUrl, rangeEquals, type Range } from '$lib/time';
+  import { rangeLabel, loadRange, saveRange, writeRangeToUrl, rangeEquals, type Range } from '$lib/time';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import Tabs from '$lib/components/Tabs.svelte';
   import EditHostDialog from '$lib/components/EditHostDialog.svelte';
@@ -198,38 +198,29 @@
       </div>
       <div class="w-full sm:w-auto sm:ml-auto flex flex-wrap items-center gap-2 sm:gap-3 text-xs">
         {#if showRange}
-          <div class="flex flex-wrap items-center gap-1">
-            {#each ranges as r (r)}
-              <button
-                type="button"
-                onclick={() => { range = r; pickerOpen = false; }}
-                class="px-2 sm:px-2.5 py-1 rounded-md transition-colors {range === r ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">
-                {r}
-              </button>
-            {/each}
-            <div class="relative">
-              <button
-                type="button"
-                onclick={() => (pickerOpen = !pickerOpen)}
-                aria-haspopup="dialog"
-                aria-expanded={pickerOpen}
-                title="Pick a custom time range"
-                class="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-md transition-colors numeric {!isPreset(range) ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">
-                <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="4" width="18" height="17" rx="2" />
-                  <path d="M16 2v4M8 2v4M3 10h18" />
-                </svg>
-                <span>{!isPreset(range) ? rangeLabel(range) : 'Custom'}</span>
-              </button>
-              {#if pickerOpen}
-                {@const initial = !isPreset(range) ? range : null}
-                <CustomRangePicker
-                  fromMs={initial?.fromMs}
-                  toMs={initial?.toMs}
-                  onApply={(f, t) => { range = { fromMs: f, toMs: t }; pickerOpen = false; }}
-                  onCancel={() => (pickerOpen = false)} />
-              {/if}
-            </div>
+          <div class="relative">
+            <button
+              type="button"
+              onclick={() => (pickerOpen = !pickerOpen)}
+              aria-haspopup="dialog"
+              aria-expanded={pickerOpen}
+              title="Select time range"
+              class="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-md border border-zinc-800 transition-colors numeric text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800/40">
+              <svg viewBox="0 0 24 24" class="h-3.5 w-3.5 text-zinc-500" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7.5V12l3 1.5" />
+              </svg>
+              <span>{rangeLabel(range)}</span>
+              <svg viewBox="0 0 24 24" class="h-3 w-3 text-zinc-500" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            {#if pickerOpen}
+              <CustomRangePicker
+                value={range}
+                onApply={(r) => { range = r; pickerOpen = false; }}
+                onCancel={() => (pickerOpen = false)} />
+            {/if}
           </div>
           <span class="h-4 w-px bg-zinc-800 shrink-0"></span>
         {/if}

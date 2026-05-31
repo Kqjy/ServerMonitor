@@ -1,6 +1,9 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.1.6}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.1.7}
+    build:
+      context: ..
+      dockerfile: deploy/agent.Dockerfile
     restart: unless-stopped
     pid: host
     network_mode: host

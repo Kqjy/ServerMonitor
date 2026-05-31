@@ -3,9 +3,9 @@
   import { api, type ContainerSeriesPoint } from '$lib/api';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import { bytes } from '$lib/format';
-  import { loadPresetWin, savePresetWin } from '$lib/time';
+  import { chooseStepSec, loadPresetWin, savePresetWin } from '$lib/time';
 
-  let { hostId, cid, at = null, pinned = false }: { hostId: number; cid: string; at?: number | null; pinned?: boolean } = $props();
+  let { hostId, cid, at = null, pinned = false, sampleIntervalS = 10 }: { hostId: number; cid: string; at?: number | null; pinned?: boolean; sampleIntervalS?: number } = $props();
 
   type Win = '15m' | '1h' | '6h' | '24h';
   const windows: { key: Win; ms: number; label: string }[] = [
@@ -25,6 +25,7 @@
     prevWin = v;
   });
   let loading = $state(false);
+  let masking = $state(false);
   let points = $state<ContainerSeriesPoint[]>([]);
   let fromMs = $state(Date.now() - 60 * 60 * 1000);
   let toMs = $state(Date.now());
@@ -36,23 +37,35 @@
   let lastWin: Win | null = null;
   let lastAt: number | null = null;
   let lastPinned = false;
+  let loadedStep = 0;
+  let zoomFetched = false;
+  let fetchGen = 0;
   const minDeltaMs = 1_000;
 
-  async function fetchSpan(from: Date, to: Date) {
+  async function runFetch(from: Date, to: Date, masked: boolean) {
+    const gen = ++fetchGen;
     ac?.abort();
     ac = new AbortController();
-    loading = true;
+    if (masked) masking = true;
+    else loading = true;
     try {
       const resp = await api.containerSeries(hostId, cid, {
         from: from.toISOString(),
         to: to.toISOString(),
         signal: ac.signal
       });
+      if (gen !== fetchGen) return;
       points = resp.points;
+      loadedStep = resp.step_sec;
+      zoomFetched = chartZoom !== null;
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') points = [];
+      if (gen !== fetchGen) return;
+      if (!masked && (e as Error).name !== 'AbortError') points = [];
     } finally {
-      loading = false;
+      if (gen === fetchGen) {
+        loading = false;
+        masking = false;
+      }
     }
   }
 
@@ -63,6 +76,7 @@
     const pinChanged = pinned !== lastPinned;
     const pinValueChanged = pinned && at !== lastAt;
     const resetZoom = winChanged || pinChanged || pinValueChanged;
+    if (chartZoom !== null && !resetZoom) return;
     if (!resetZoom && Math.abs(anchor - lastAnchor) < minDeltaMs) return;
     lastAnchor = anchor;
     lastWin = win;
@@ -78,7 +92,7 @@
       toMs = to.getTime();
       fromMs = from.getTime();
     }
-    await fetchSpan(from, to);
+    await runFetch(from, to, false);
   }
 
   $effect(() => {
@@ -124,11 +138,17 @@
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) {
+      runFetch(new Date(f), new Date(t), true);
+    }
   }
   function handleReset() {
     chartZoom = null;
     fromMs = windowFromMs;
     toMs = windowToMs;
+    if (zoomFetched) {
+      runFetch(new Date(windowFromMs), new Date(windowToMs), true);
+    }
   }
 </script>
 
@@ -163,6 +183,7 @@
         yClampMin={0}
         yMaxDigits={2}
         zoomed={isZoomed}
+        {masking}
         onZoom={handleZoom}
         onResetZoom={handleReset}
         loading={loading && points.length === 0}
@@ -179,6 +200,7 @@
         {toMs}
         yClampMin={0}
         zoomed={isZoomed}
+        {masking}
         onZoom={handleZoom}
         onResetZoom={handleReset}
         loading={loading && points.length === 0}
@@ -194,6 +216,7 @@
         {toMs}
         yClampMin={0}
         zoomed={isZoomed}
+        {masking}
         onZoom={handleZoom}
         onResetZoom={handleReset}
         loading={loading && points.length === 0}

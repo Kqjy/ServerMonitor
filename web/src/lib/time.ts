@@ -1,42 +1,44 @@
-export type RangePreset = '15m' | '1h' | '6h' | '24h' | '7d';
+export const PRESETS = [
+  { id: '5m',  label: 'Last 5 minutes',  ms: 5 * 60_000 },
+  { id: '15m', label: 'Last 15 minutes', ms: 15 * 60_000 },
+  { id: '30m', label: 'Last 30 minutes', ms: 30 * 60_000 },
+  { id: '1h',  label: 'Last 1 hour',     ms: 60 * 60_000 },
+  { id: '3h',  label: 'Last 3 hours',    ms: 3 * 60 * 60_000 },
+  { id: '6h',  label: 'Last 6 hours',    ms: 6 * 60 * 60_000 },
+  { id: '12h', label: 'Last 12 hours',   ms: 12 * 60 * 60_000 },
+  { id: '24h', label: 'Last 24 hours',   ms: 24 * 60 * 60_000 },
+  { id: '2d',  label: 'Last 2 days',     ms: 2 * 24 * 60 * 60_000 },
+  { id: '7d',  label: 'Last 7 days',     ms: 7 * 24 * 60 * 60_000 },
+  { id: '30d', label: 'Last 30 days',    ms: 30 * 24 * 60 * 60_000 },
+] as const;
+
+export type RangePreset = (typeof PRESETS)[number]['id'];
 export type CustomRange = { fromMs: number; toMs: number };
 export type Range = RangePreset | CustomRange;
 
-export const ranges: RangePreset[] = ['15m', '1h', '6h', '24h', '7d'];
+const presetById = new Map<RangePreset, (typeof PRESETS)[number]>(
+  PRESETS.map((p) => [p.id, p] as const)
+);
+
+export const ranges: RangePreset[] = PRESETS.map((p) => p.id);
 
 export function isPreset(r: Range): r is RangePreset {
   return typeof r === 'string';
 }
 
+export function rangeMs(r: Range): number {
+  if (isPreset(r)) return presetById.get(r)?.ms ?? 60 * 60_000;
+  return r.toMs - r.fromMs;
+}
+
 export function rangeToFrom(r: Range): string {
-  if (isPreset(r)) {
-    switch (r) {
-      case '15m': return '-15m';
-      case '1h': return '-1h';
-      case '6h': return '-6h';
-      case '24h': return '-24h';
-      case '7d': return '-168h';
-    }
-  }
+  if (isPreset(r)) return `-${rangeMs(r) / 1000}s`;
   return new Date(r.fromMs).toISOString();
 }
 
 export function rangeToTo(r: Range): string | undefined {
   if (isPreset(r)) return undefined;
   return new Date(r.toMs).toISOString();
-}
-
-export function rangeMs(r: Range): number {
-  if (isPreset(r)) {
-    switch (r) {
-      case '15m': return 15 * 60_000;
-      case '1h':  return 60 * 60_000;
-      case '6h':  return 6 * 60 * 60_000;
-      case '24h': return 24 * 60 * 60_000;
-      case '7d':  return 7 * 24 * 60 * 60_000;
-    }
-  }
-  return r.toMs - r.fromMs;
 }
 
 export function rangeBoundsMs(r: Range, now: number = Date.now()): { fromMs: number; toMs: number } {
@@ -46,8 +48,12 @@ export function rangeBoundsMs(r: Range, now: number = Date.now()): { fromMs: num
   return { fromMs: r.fromMs, toMs: r.toMs };
 }
 
+export function presetLabel(id: RangePreset): string {
+  return presetById.get(id)?.label ?? id;
+}
+
 export function rangeLabel(r: Range): string {
-  if (isPreset(r)) return r;
+  if (isPreset(r)) return presetLabel(r);
   const f = new Date(r.fromMs);
   const t = new Date(r.toMs);
   return `${fmt(f)} – ${fmt(t, f)}`;

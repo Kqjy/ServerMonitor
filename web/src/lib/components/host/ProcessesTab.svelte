@@ -5,7 +5,7 @@
   import { bytes, pct, timeAgo } from '$lib/format';
   import ProcessDetail from './ProcessDetail.svelte';
 
-  let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
+  let { hostId, sampleIntervalS = 10 }: { hostId: number; sampleIntervalS?: number } = $props();
 
   let rows = $state<ProcessRow[]>([]);
   let updatedAt = $state<string | null>(null);
@@ -253,7 +253,7 @@
           {#if open}
             <tr class="bg-zinc-950/60">
               <td colspan="6" class="p-0">
-                <ProcessDetail {hostId} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} live={isLive} />
+                <ProcessDetail {hostId} {sampleIntervalS} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} live={isLive} />
               </td>
             </tr>
           {/if}

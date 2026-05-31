@@ -3,9 +3,9 @@
   import { api, type ProcessSeriesPoint } from '$lib/api';
   import MultiChart from '$lib/components/MultiChart.svelte';
   import { bytes } from '$lib/format';
-  import { loadPresetWin, savePresetWin } from '$lib/time';
+  import { chooseStepSec, loadPresetWin, savePresetWin } from '$lib/time';
 
-  let { hostId, pid, name = '', at = null, live = true }: { hostId: number; pid: number; name?: string; at?: number | null; live?: boolean } = $props();
+  let { hostId, pid, name = '', at = null, live = true, sampleIntervalS = 10 }: { hostId: number; pid: number; name?: string; at?: number | null; live?: boolean; sampleIntervalS?: number } = $props();
 
   type Win = '15m' | '1h' | '6h' | '24h';
   const windows: { key: Win; ms: number; label: string }[] = [
@@ -25,6 +25,7 @@
     prevWin = v;
   });
   let loading = $state(false);
+  let masking = $state(false);
   let points = $state<ProcessSeriesPoint[]>([]);
   let fromMs = $state(Date.now() - 60 * 60 * 1000);
   let toMs = $state(Date.now());
@@ -34,7 +35,39 @@
   let lastName = '';
   const minDeltaMs = 1_000;
   let chartZoom = $state<{ fromMs: number; toMs: number } | null>(null);
+  let loadedStep = 0;
+  let zoomFetched = false;
+  let fetchGen = 0;
   const isZoomed = $derived(chartZoom !== null);
+
+  async function runFetch(from: Date, to: Date, anchorMs: number, masked: boolean) {
+    const gen = ++fetchGen;
+    ac?.abort();
+    ac = new AbortController();
+    if (masked) masking = true;
+    else loading = true;
+    try {
+      const resp = await api.processSeries(hostId, pid, {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        name: name || undefined,
+        anchor: new Date(anchorMs).toISOString(),
+        signal: ac.signal
+      });
+      if (gen !== fetchGen) return;
+      points = resp.points;
+      loadedStep = resp.step_sec;
+      zoomFetched = chartZoom !== null;
+    } catch (e) {
+      if (gen !== fetchGen) return;
+      if (!masked && (e as Error).name !== 'AbortError') points = [];
+    } finally {
+      if (gen === fetchGen) {
+        loading = false;
+        masking = false;
+      }
+    }
+  }
 
   async function load() {
     const span = windows.find((w) => w.key === win)!.ms;
@@ -48,38 +81,21 @@
     lastAnchor = anchor;
     lastWin = win;
     lastName = name;
-    ac?.abort();
-    ac = new AbortController();
-    loading = true;
     const to = new Date(anchor);
     const from = new Date(anchor - span);
-    if (windowChanged) {
-      points = [];
-      toMs = to.getTime();
-      fromMs = from.getTime();
-    }
-    try {
-      const resp = await api.processSeries(hostId, pid, {
-        from: from.toISOString(),
-        to: to.toISOString(),
-        name: name || undefined,
-        anchor: new Date(anchor).toISOString(),
-        signal: ac.signal
-      });
-      points = resp.points;
-      toMs = to.getTime();
-      fromMs = from.getTime();
-    } catch (e) {
-      if ((e as Error).name !== 'AbortError') points = [];
-    } finally {
-      loading = false;
-    }
+    if (windowChanged) points = [];
+    toMs = to.getTime();
+    fromMs = from.getTime();
+    await runFetch(from, to, anchor, false);
   }
 
   function handleZoom(f: number, t: number) {
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
     toMs = t;
+    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) {
+      runFetch(new Date(f), new Date(t), t, true);
+    }
   }
   function handleReset() {
     chartZoom = null;
@@ -87,6 +103,9 @@
     const anchor = lastAnchor || Date.now();
     toMs = anchor;
     fromMs = anchor - span;
+    if (zoomFetched) {
+      runFetch(new Date(anchor - span), new Date(anchor), anchor, true);
+    }
   }
 
   $effect(() => {
@@ -144,6 +163,7 @@
         {fromMs}
         {toMs}
         zoomed={isZoomed}
+        {masking}
         onZoom={handleZoom}
         onResetZoom={handleReset}
         loading={loading && points.length === 0}
@@ -159,6 +179,7 @@
         {fromMs}
         {toMs}
         zoomed={isZoomed}
+        {masking}
         onZoom={handleZoom}
         onResetZoom={handleReset}
         loading={loading && points.length === 0}

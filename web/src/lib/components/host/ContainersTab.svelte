@@ -5,7 +5,7 @@
   import { bytes, pct, timeAgo } from '$lib/format';
   import ContainerDetail from './ContainerDetail.svelte';
 
-  let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
+  let { hostId, sampleIntervalS = 10 }: { hostId: number; sampleIntervalS?: number } = $props();
 
   let rows = $state<ContainerRow[]>([]);
   let atMs = $state<number | null>(null);
@@ -220,7 +220,7 @@
             {#if open}
               <tr class="bg-zinc-950/60">
                 <td colspan="7" class="p-0">
-                  <ContainerDetail {hostId} cid={c.cid} at={atMs ?? lastDataMs} pinned={atMs !== null} />
+                  <ContainerDetail {hostId} {sampleIntervalS} cid={c.cid} at={atMs ?? lastDataMs} pinned={atMs !== null} />
                 </td>
               </tr>
             {/if}
