@@ -61,13 +61,13 @@ func (d *Dispatcher) Send(ctx context.Context, kind, name string, cfg []byte, n 
 }
 
 type smtpConfig struct {
-	Host       string   `json:"host"`
-	Port       int      `json:"port"`
-	Username   string   `json:"username"`
-	Password   string   `json:"password"`
-	From       string   `json:"from"`
-	To         []string `json:"to"`
-	StartTLS   bool     `json:"starttls"`
+	Host     string   `json:"host"`
+	Port     int      `json:"port"`
+	Username string   `json:"username"`
+	Password string   `json:"password"`
+	From     string   `json:"from"`
+	To       []string `json:"to"`
+	StartTLS bool     `json:"starttls"`
 }
 
 func (d *Dispatcher) sendSMTP(ctx context.Context, cfg []byte, n Notification) error {

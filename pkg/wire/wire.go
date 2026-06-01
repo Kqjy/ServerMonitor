@@ -61,6 +61,8 @@ type HostInfo struct {
 	Collectors      []string                   `json:"collectors,omitempty"`
 	CollectorStatus map[string]CollectorStatus `json:"collector_status,omitempty"`
 	Tags            map[string]string          `json:"tags,omitempty"`
+
+	ExternallyManaged *bool `json:"externally_managed,omitempty"`
 }
 
 type Batch struct {

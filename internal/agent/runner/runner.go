@@ -23,11 +23,12 @@ var ErrDeregistered = errors.New("host deregistered by server")
 const Version = version.Version
 
 type Runner struct {
-	cfg        *config.Config
-	client     *transport.Client
-	logger     *slog.Logger
-	collectors []collectors.Collector
-	intervalCh chan time.Duration
+	cfg               *config.Config
+	client            *transport.Client
+	logger            *slog.Logger
+	collectors        []collectors.Collector
+	intervalCh        chan time.Duration
+	externallyManaged bool
 }
 
 func New(cfg *config.Config, client *transport.Client, logger *slog.Logger) *Runner {
@@ -38,6 +39,10 @@ func New(cfg *config.Config, client *transport.Client, logger *slog.Logger) *Run
 		collectors: collectors.Filtered(cfg.Enabled, cfg.Disabled),
 		intervalCh: make(chan time.Duration, 1),
 	}
+}
+
+func (r *Runner) SetExternallyManaged(v bool) {
+	r.externallyManaged = v
 }
 
 func (r *Runner) SetInterval(d time.Duration) {
@@ -67,15 +72,17 @@ func (r *Runner) HostInfo() wire.HostInfo {
 			statuses[c.Name()] = sr.Status()
 		}
 	}
+	managed := r.externallyManaged
 	return wire.HostInfo{
-		Hostname:        hn,
-		OS:              runtime.GOOS,
-		Arch:            runtime.GOARCH,
-		Kernel:          kernel,
-		AgentVersion:    Version,
-		Collectors:      names,
-		CollectorStatus: statuses,
-		Tags:            r.cfg.Tags,
+		Hostname:          hn,
+		OS:                runtime.GOOS,
+		Arch:              runtime.GOARCH,
+		Kernel:            kernel,
+		AgentVersion:      Version,
+		Collectors:        names,
+		CollectorStatus:   statuses,
+		Tags:              r.cfg.Tags,
+		ExternallyManaged: &managed,
 	}
 }
 

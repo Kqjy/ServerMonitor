@@ -16,11 +16,11 @@ import (
 )
 
 type Row struct {
-	Time    time.Time
-	HostID  int64
-	Metric  int16
-	Labels  []byte
-	Value   float64
+	Time   time.Time
+	HostID int64
+	Metric int16
+	Labels []byte
+	Value  float64
 }
 
 type Batcher struct {

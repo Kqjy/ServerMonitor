@@ -8,10 +8,10 @@ import (
 
 func TestVerifyBuiltAcceptsRealDist(t *testing.T) {
 	sub := fstest.MapFS{
-		"index.html":                       &fstest.MapFile{Data: []byte("<html></html>")},
-		"_app/version.json":                &fstest.MapFile{Data: []byte("{}")},
-		"_app/immutable/entry/start.js":    &fstest.MapFile{Data: []byte("export {}")},
-		"_app/immutable/nodes/0.js":        &fstest.MapFile{Data: []byte("export {}")},
+		"index.html":                    &fstest.MapFile{Data: []byte("<html></html>")},
+		"_app/version.json":             &fstest.MapFile{Data: []byte("{}")},
+		"_app/immutable/entry/start.js": &fstest.MapFile{Data: []byte("export {}")},
+		"_app/immutable/nodes/0.js":     &fstest.MapFile{Data: []byte("export {}")},
 	}
 	if err := verifyBuilt(sub); err != nil {
 		t.Fatalf("expected build to pass, got %v", err)

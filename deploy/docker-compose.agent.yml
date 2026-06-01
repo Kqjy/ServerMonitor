@@ -1,6 +1,6 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.1.8}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.1.9}
     build:
       context: ..
       dockerfile: deploy/agent.Dockerfile
@@ -19,11 +19,11 @@ services:
     environment:
       SM_SERVER_URL: ${SM_SERVER_URL:?set SM_SERVER_URL in .env.agent}
       SM_TOKEN: ${SM_TOKEN:?set SM_TOKEN in .env.agent}
-      SM_SERVER_PUBKEY: ${SM_SERVER_PUBKEY:-}
       SM_INTERVAL_S: ${SM_INTERVAL_S:-}
       SM_SPOOL_PATH: /var/lib/servermonitor/spool.db
       SM_HOST_FS_ROOT: /host
       SM_AUTO_UPGRADE: "false"
+      SM_EXTERNALLY_MANAGED: "true"
     tmpfs:
       - /tmp
     volumes:

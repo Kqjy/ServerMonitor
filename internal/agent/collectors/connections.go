@@ -22,8 +22,9 @@ const (
 )
 
 const (
-	connStateOK       = "ok"
-	connStateNoOwners = "no_owners"
+	connStateOK            = "ok"
+	connStateNoOwners      = "no_owners"
+	connStatePartialOwners = "partial_owners"
 )
 
 type connCollector struct {
@@ -36,8 +37,10 @@ type connCollector struct {
 
 func init() { Register(&connCollector{}) }
 
-func (c *connCollector) Name() string        { return "connections" }
-func (c *connCollector) Platforms() []string { return []string{"linux", "darwin", "windows", "freebsd"} }
+func (c *connCollector) Name() string { return "connections" }
+func (c *connCollector) Platforms() []string {
+	return []string{"linux", "darwin", "windows", "freebsd"}
+}
 
 func (c *connCollector) Status() wire.CollectorStatus {
 	c.mu.Lock()
@@ -161,11 +164,20 @@ func protoLabel(c gopsnet.ConnectionStat) string {
 }
 
 func (c *connCollector) updateOwnerStateLocked(resolved, total int) bool {
-	if total == 0 || resolved > 0 {
+	state := connStateOK
+	if total > 0 {
+		switch {
+		case resolved == 0:
+			state = connStateNoOwners
+		case resolved*2 < total:
+			state = connStatePartialOwners
+		}
+	}
+	if state == connStateOK {
 		c.state, c.stateMsg, c.warned = connStateOK, "", false
 		return false
 	}
-	c.state = connStateNoOwners
+	c.state = state
 	c.stateMsg = portOwnerHint(resolved, total)
 	if c.warned {
 		return false

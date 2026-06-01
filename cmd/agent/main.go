@@ -114,6 +114,14 @@ func main() {
 	client.SetHealthPath(cfg.HealthPath)
 	r := runner.New(cfg, client, logger)
 
+	managed, managedReason := upgrade.Managed()
+	r.SetExternallyManaged(managed)
+	if managed {
+		logger.Info("agent self-upgrade disabled: externally managed",
+			"reason", managedReason,
+			"hint", "update by redeploying a new agent image tag (bump SM_AGENT_IMAGE, then docker compose up -d --pull always --no-build)")
+	}
+
 	pk := &pubkeyHolder{v: cfg.ServerPubkey}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -147,6 +155,7 @@ func main() {
 			failedVersion string
 			failedCount   int
 			nextAttempt   time.Time
+			warnedManaged bool
 		)
 		for {
 			select {
@@ -169,6 +178,17 @@ func main() {
 				}
 				latest := upd.LatestVersion
 				if latest == "" || !version.IsNewer(latest, runner.Version) {
+					continue
+				}
+				if managed {
+					if !warnedManaged {
+						logger.Info("agent upgrade available but this agent is externally managed; not self-upgrading",
+							"current", runner.Version,
+							"latest", latest,
+							"reason", managedReason,
+							"hint", "rebuild & push a new image tag, bump SM_AGENT_IMAGE, then redeploy (docker compose up -d --pull always --no-build)")
+						warnedManaged = true
+					}
 					continue
 				}
 				autoUpgrade := cfg.AutoUpgradeEnabled()

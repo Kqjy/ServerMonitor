@@ -9,10 +9,10 @@ import (
 )
 
 type RetentionPolicies struct {
-	Raw          string
-	Aggregate5m  string
-	Processes    string
-	Containers   string
+	Raw           string
+	Aggregate5m   string
+	Processes     string
+	Containers    string
 	CompressAfter string
 }
 

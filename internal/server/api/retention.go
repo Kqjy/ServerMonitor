@@ -7,13 +7,13 @@ import (
 )
 
 type RetentionConfig struct {
-	Raw          string
-	Aggregate5m  string
-	Processes    string
-	Containers   string
+	Raw           string
+	Aggregate5m   string
+	Processes     string
+	Containers    string
 	CompressAfter string
 
-	RawCutoff       time.Duration
+	RawCutoff         time.Duration
 	Aggregate5mCutoff time.Duration
 }
 

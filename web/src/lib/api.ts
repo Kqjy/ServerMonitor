@@ -14,6 +14,7 @@ export interface Host {
   update_available?: boolean;
   auto_upgrade: boolean;
   supports_remote_upgrade: boolean;
+  externally_managed?: boolean;
   upgrade_pending?: boolean;
   sample_interval_s: number;
   enabled_collectors?: string[];

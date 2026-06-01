@@ -26,6 +26,7 @@
   let poll: ReturnType<typeof setInterval> | null = null;
   let copied = $state<string | null>(null);
 
+  let enablePortOwners = $state(false);
   let enableDocker = $state(false);
   let enableSmart = $state(false);
   let enableGpu = $state(false);
@@ -97,6 +98,7 @@
 
   const shellOneLiner = $derived.by(() => {
     const vars = [`SM_INTERVAL=${interval}`];
+    if (enablePortOwners) vars.push('SM_ENABLE_PORT_OWNERS=1');
     if (enableDocker)  vars.push('SM_ENABLE_DOCKER=1');
     if (enableSmart)   vars.push('SM_ENABLE_SMART=1');
     if (enableGpu)     vars.push('SM_ENABLE_GPU=1');
@@ -331,6 +333,10 @@ Lock-Path $cfg
               <div class="space-y-2 pb-3 border-b border-zinc-800/60">
                 <div class="text-[11px] uppercase tracking-wider text-zinc-500">Optional capabilities</div>
                 <p class="text-[11px] text-zinc-600 -mt-1">Off by default. Each grants extra privilege to <span class="font-mono">sm-agent</span> for that collector.</p>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enablePortOwners} class="mt-0.5 accent-emerald-500" />
+                  <span><span class="text-zinc-100">Listening-port owners</span> <span class="text-zinc-500">— grants <span class="font-mono">CAP_DAC_READ_SEARCH</span> + <span class="font-mono">CAP_SYS_PTRACE</span> to map ports to PIDs; lets the agent read other processes' memory and environment (secrets)</span></span>
+                </label>
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableDocker} class="mt-0.5 accent-emerald-500" />
                   <span><span class="text-zinc-100">Docker containers</span> <span class="text-zinc-500">— joins <span class="font-mono">docker</span> group (effectively root on host)</span></span>

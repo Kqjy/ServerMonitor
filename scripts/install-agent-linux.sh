@@ -11,11 +11,12 @@ ENABLE_SMART="${SM_ENABLE_SMART:-0}"
 ENABLE_DOCKER="${SM_ENABLE_DOCKER:-0}"
 ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
+ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-smart] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
@@ -24,14 +25,15 @@ Admin token MUST come from SM_ADMIN_TOKEN env var or --admin-token-file PATH.
 The --admin-token flag is deliberately not supported here: argv is visible in
 /proc/<pid>/cmdline to any local user during the install window.
 
-By default the agent gets only CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE and no
-supplementary group memberships. Each --enable-* flag (or SM_ENABLE_<NAME>=1
-env var) opts into one extra collector's grant:
-  --enable-smart    adds CAP_SYS_RAWIO + 'disk' group, auto-installs smartmontools via apt/dnf/yum/apk/pacman/zypper
-  --enable-docker   adds 'docker' group membership (containers collector)
-  --enable-gpu      adds 'video' group membership (some nvidia-smi setups)
-  --enable-network  adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
-  --enable-all      shortcut for all of the above
+By default the agent gets no Linux capabilities and no supplementary group
+memberships. Each --enable-* flag (or SM_ENABLE_<NAME>=1 env var) opts into one
+extra collector's grant:
+  --enable-port-owners  adds CAP_DAC_READ_SEARCH + CAP_SYS_PTRACE so the Ports tab can map a listening socket to its PID/process; this lets the unprivileged sm-agent read other processes' memory and environment (secrets), so enable it only where that owner mapping is worth the exposure
+  --enable-smart        adds CAP_SYS_RAWIO + 'disk' group, auto-installs smartmontools via apt/dnf/yum/apk/pacman/zypper
+  --enable-docker       adds 'docker' group membership (containers collector)
+  --enable-gpu          adds 'video' group membership (some nvidia-smi setups)
+  --enable-network      adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
+  --enable-all          shortcut for all of the above
 
 Examples:
   SM_ADMIN_TOKEN=xxx $0 --server https://monitor.example.com --binary ./sm-agent
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --hostname)          HOSTNAME_OVERRIDE="$2"; shift 2 ;;
     --interval)          INTERVAL="$2"; shift 2 ;;
     --binary)            BIN_PATH="$2"; shift 2 ;;
+    --enable-port-owners) ENABLE_PORT_OWNERS=1; shift ;;
     --enable-smart)      ENABLE_SMART=1; shift ;;
     --enable-docker)     ENABLE_DOCKER=1; shift ;;
     --enable-gpu)        ENABLE_GPU=1; shift ;;
@@ -62,6 +65,7 @@ if [ "$ENABLE_ALL" = "1" ]; then
   ENABLE_DOCKER=1
   ENABLE_GPU=1
   ENABLE_NETWORK=1
+  ENABLE_PORT_OWNERS=1
 fi
 
 install_smartmontools() {
@@ -155,9 +159,10 @@ unset SM_ADMIN_TOKEN
 chown sm-agent:sm-agent /etc/servermonitor/agent.toml
 chmod 0600 /etc/servermonitor/agent.toml
 
-CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
-[ "$ENABLE_SMART" = "1" ]   && CAPS="$CAPS CAP_SYS_RAWIO"
-[ "$ENABLE_NETWORK" = "1" ] && CAPS="$CAPS CAP_NET_ADMIN CAP_NET_RAW"
+CAPS=""
+[ "$ENABLE_PORT_OWNERS" = "1" ] && CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
+[ "$ENABLE_SMART" = "1" ]       && CAPS="${CAPS:+$CAPS }CAP_SYS_RAWIO"
+[ "$ENABLE_NETWORK" = "1" ]     && CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN CAP_NET_RAW"
 
 cat > /etc/systemd/system/sm-agent.service <<UNIT
 [Unit]

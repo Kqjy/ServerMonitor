@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,27 @@ import (
 
 const downloadTimeout = 5 * time.Minute
 const maxAgentBinaryBytes int64 = 256 << 20
+
+func Managed() (bool, string) {
+	if v, ok := os.LookupEnv("SM_EXTERNALLY_MANAGED"); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			b, err := strconv.ParseBool(s)
+			if err != nil {
+				return true, "SM_EXTERNALLY_MANAGED=" + s + " is not a boolean; treating agent as externally managed"
+			}
+			if b {
+				return true, "SM_EXTERNALLY_MANAGED is set"
+			}
+			return false, ""
+		}
+	}
+	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+		if _, err := os.Stat(marker); err == nil {
+			return true, "containerized (" + marker + " present)"
+		}
+	}
+	return false, ""
+}
 
 type Options struct {
 	ServerURL    string

@@ -25,11 +25,11 @@ var (
 )
 
 const (
-	SessionCookie       = "sm_session"
-	SessionTTL          = 30 * 24 * time.Hour
-	MinPasswordLength   = 12
-	MaxFailedLogins     = 10
-	LockoutDuration     = 15 * time.Minute
+	SessionCookie     = "sm_session"
+	SessionTTL        = 30 * 24 * time.Hour
+	MinPasswordLength = 12
+	MaxFailedLogins   = 10
+	LockoutDuration   = 15 * time.Minute
 )
 
 var weakPasswordPrefixes = []string{
@@ -63,10 +63,10 @@ func validatePassword(p string) error {
 }
 
 type User struct {
-	ID           int32
-	Username     string
-	Role         string
-	CreatedAt    time.Time
+	ID        int32
+	Username  string
+	Role      string
+	CreatedAt time.Time
 }
 
 type Service struct {

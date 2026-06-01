@@ -37,8 +37,8 @@ type Config struct {
 	AgentSigningKeyFile  string
 }
 
-func (c *Config) ServesTLS() bool       { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
-func (c *Config) BehindTLSProxy() bool  { return c.TrustProxyTLS }
+func (c *Config) ServesTLS() bool         { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
+func (c *Config) BehindTLSProxy() bool    { return c.TrustProxyTLS }
 func (c *Config) SecureBrowserSide() bool { return c.ServesTLS() || c.BehindTLSProxy() }
 
 func Load() (*Config, error) {

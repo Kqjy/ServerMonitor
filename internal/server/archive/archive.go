@@ -21,11 +21,11 @@ import (
 )
 
 type Config struct {
-	Bucket        string
-	Region        string
-	Prefix        string
-	Cutoff        time.Duration
-	UsePathStyle  bool
+	Bucket       string
+	Region       string
+	Prefix       string
+	Cutoff       time.Duration
+	UsePathStyle bool
 }
 
 type Archiver struct {
@@ -36,14 +36,14 @@ type Archiver struct {
 }
 
 type Record struct {
-	Bucket   int64             `parquet:"bucket,timestamp(microsecond)"`
-	HostID   int64             `parquet:"host_id"`
-	Metric   int32             `parquet:"metric"`
-	Labels   string            `parquet:"labels,zstd"`
-	Avg      float64           `parquet:"avg"`
-	Min      float64           `parquet:"min"`
-	Max      float64           `parquet:"max"`
-	Last     float64           `parquet:"last"`
+	Bucket int64   `parquet:"bucket,timestamp(microsecond)"`
+	HostID int64   `parquet:"host_id"`
+	Metric int32   `parquet:"metric"`
+	Labels string  `parquet:"labels,zstd"`
+	Avg    float64 `parquet:"avg"`
+	Min    float64 `parquet:"min"`
+	Max    float64 `parquet:"max"`
+	Last   float64 `parquet:"last"`
 }
 
 func New(pool *pgxpool.Pool, cfg Config, logger *slog.Logger) (*Archiver, error) {

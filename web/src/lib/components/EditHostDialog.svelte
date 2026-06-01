@@ -91,16 +91,21 @@
       </div>
       <div>
         <div class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Auto-update agent</div>
-        <label class="flex items-start gap-3 cursor-pointer">
+        <label class="flex items-start gap-3 {host.externally_managed ? 'cursor-not-allowed' : 'cursor-pointer'}">
           <input
             type="checkbox"
             bind:checked={autoUpgrade}
-            class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-emerald-500 focus:ring-emerald-500/40 focus:ring-offset-0"
+            disabled={host.externally_managed}
+            class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-emerald-500 focus:ring-emerald-500/40 focus:ring-offset-0 disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <span class="text-xs text-zinc-300 leading-relaxed">
-            {autoUpgrade ? 'On' : 'Off'} — when on, this agent installs new versions automatically after the server is upgraded.
-            {#if !host.supports_remote_upgrade && host.agent_version}
-              <span class="block mt-1 text-amber-400">Agent v{host.agent_version} does not support remote upgrades; re-install to v0.1.1+ first.</span>
+            {#if host.externally_managed}
+              <span class="text-zinc-400">This agent runs from a container image and updates by redeploying a new image tag; auto-update does not apply.</span>
+            {:else}
+              {autoUpgrade ? 'On' : 'Off'} — when on, this agent installs new versions automatically after the server is upgraded.
+              {#if !host.supports_remote_upgrade && host.agent_version}
+                <span class="block mt-1 text-amber-400">Agent v{host.agent_version} does not support remote upgrades; re-install to v0.1.1+ first.</span>
+              {/if}
             {/if}
           </span>
         </label>

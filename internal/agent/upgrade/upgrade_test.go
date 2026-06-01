@@ -100,3 +100,33 @@ func TestVerifyStagedBinaryMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+func TestManagedEnvTruthy(t *testing.T) {
+	t.Setenv("SM_EXTERNALLY_MANAGED", "true")
+	managed, reason := Managed()
+	if !managed {
+		t.Fatal("expected managed=true when SM_EXTERNALLY_MANAGED=true")
+	}
+	if !strings.Contains(reason, "SM_EXTERNALLY_MANAGED") {
+		t.Fatalf("expected env reason, got %q", reason)
+	}
+}
+
+func TestManagedEnvFalseAuthoritative(t *testing.T) {
+	t.Setenv("SM_EXTERNALLY_MANAGED", "false")
+	managed, reason := Managed()
+	if managed {
+		t.Fatalf("expected managed=false when SM_EXTERNALLY_MANAGED=false (explicit env overrides container detection), got reason %q", reason)
+	}
+}
+
+func TestManagedEnvUnparseableTreatedAsManaged(t *testing.T) {
+	t.Setenv("SM_EXTERNALLY_MANAGED", "yes")
+	managed, reason := Managed()
+	if !managed {
+		t.Fatal("expected managed=true for a set but non-boolean SM_EXTERNALLY_MANAGED rather than a silent fall-through")
+	}
+	if !strings.Contains(reason, "yes") {
+		t.Fatalf("expected reason to surface the offending value, got %q", reason)
+	}
+}

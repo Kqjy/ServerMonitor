@@ -10,12 +10,14 @@ ENABLE_SMART="${SM_ENABLE_SMART:-0}"
 ENABLE_DOCKER="${SM_ENABLE_DOCKER:-0}"
 ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
+ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
 if [ "$ENABLE_ALL" = "1" ]; then
     ENABLE_SMART=1
     ENABLE_DOCKER=1
     ENABLE_GPU=1
     ENABLE_NETWORK=1
+    ENABLE_PORT_OWNERS=1
 fi
 
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -134,9 +136,10 @@ chmod 0600 "$TMP_CFG"
 chown sm-agent:sm-agent "$TMP_CFG"
 mv -f "$TMP_CFG" /etc/servermonitor/agent.toml
 
-CAPS="CAP_DAC_READ_SEARCH"
-[ "$ENABLE_SMART" = "1" ]   && CAPS="$CAPS CAP_SYS_RAWIO"
-[ "$ENABLE_NETWORK" = "1" ] && CAPS="$CAPS CAP_NET_ADMIN CAP_NET_RAW"
+CAPS=""
+[ "$ENABLE_PORT_OWNERS" = "1" ] && CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
+[ "$ENABLE_SMART" = "1" ]       && CAPS="${CAPS:+$CAPS }CAP_SYS_RAWIO"
+[ "$ENABLE_NETWORK" = "1" ]     && CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN CAP_NET_RAW"
 
 cat >/etc/systemd/system/sm-agent.service <<UNIT
 [Unit]

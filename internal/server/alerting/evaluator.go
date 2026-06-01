@@ -41,8 +41,8 @@ type Rule struct {
 }
 
 type HostSelector struct {
-	All  bool             `json:"all,omitempty"`
-	IDs  []int64          `json:"ids,omitempty"`
+	All  bool              `json:"all,omitempty"`
+	IDs  []int64           `json:"ids,omitempty"`
 	Tags map[string]string `json:"tags,omitempty"`
 }
 
@@ -155,11 +155,11 @@ func (e *Engine) loadRules(ctx context.Context) ([]Rule, error) {
 	out := []Rule{}
 	for rows.Next() {
 		var (
-			r           Rule
-			hostSelRaw  []byte
-			labelSel    map[string]string
-			metricID    int16
-			channelArr  []int32
+			r          Rule
+			hostSelRaw []byte
+			labelSel   map[string]string
+			metricID   int16
+			channelArr []int32
 		)
 		if err := rows.Scan(&r.ID, &r.Name, &hostSelRaw, &metricID, &labelSel,
 			&r.Comparator, &r.Threshold, &r.WindowS, &r.ForS, &r.Agg,
@@ -445,10 +445,10 @@ func (e *Engine) transition(
 	channels map[int32]Channel,
 ) error {
 	var (
-		state         string
-		since         time.Time
-		lastNotified  *time.Time
-		lastValue     *float64
+		state        string
+		since        time.Time
+		lastNotified *time.Time
+		lastValue    *float64
 	)
 	row := e.pool.QueryRow(ctx, `
 		SELECT state, since, last_notified, last_value

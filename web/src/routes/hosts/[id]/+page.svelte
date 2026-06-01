@@ -161,7 +161,14 @@
         {#if host.update_available}
           <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
             <span class="text-sky-300">Update to v{host.latest_agent_version} available</span>
-            {#if host.supports_remote_upgrade}
+            {#if host.externally_managed}
+              <span
+                class="text-zinc-400"
+                title="This agent runs from a container image (or a read-only filesystem) and cannot replace its own binary. Rebuild the agent image, bump SM_AGENT_IMAGE, and redeploy to update."
+              >
+                Managed externally — redeploy a new agent image to update
+              </span>
+            {:else if host.supports_remote_upgrade}
               {#if host.upgrade_pending}
                 <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
                   <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>

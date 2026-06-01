@@ -145,13 +145,14 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			}
 		}
 		_ = hosts.Touch(r.Context(), hostID, storage.HostInfoUpdate{
-			OS:              batch.Host.OS,
-			Arch:            batch.Host.Arch,
-			Kernel:          batch.Host.Kernel,
-			AgentVersion:    batch.Host.AgentVersion,
-			Collectors:      batch.Host.Collectors,
-			CollectorStatus: collStatus,
-			Tags:            batch.Host.Tags,
+			OS:                batch.Host.OS,
+			Arch:              batch.Host.Arch,
+			Kernel:            batch.Host.Kernel,
+			AgentVersion:      batch.Host.AgentVersion,
+			Collectors:        batch.Host.Collectors,
+			CollectorStatus:   collStatus,
+			Tags:              batch.Host.Tags,
+			ExternallyManaged: batch.Host.ExternallyManaged,
 		})
 
 		hub.Broadcast(hostID, batch.Points)

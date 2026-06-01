@@ -14,8 +14,10 @@ type loadCollector struct{}
 
 func init() { Register(&loadCollector{}) }
 
-func (c *loadCollector) Name() string        { return "load" }
-func (c *loadCollector) Platforms() []string { return []string{"linux", "darwin", "freebsd", "openbsd"} }
+func (c *loadCollector) Name() string { return "load" }
+func (c *loadCollector) Platforms() []string {
+	return []string{"linux", "darwin", "freebsd", "openbsd"}
+}
 
 func (c *loadCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := time.Now()

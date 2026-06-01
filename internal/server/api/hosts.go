@@ -38,6 +38,7 @@ type hostDTO struct {
 	UpdateAvailable       bool                          `json:"update_available,omitempty"`
 	AutoUpgrade           bool                          `json:"auto_upgrade"`
 	SupportsRemoteUpgrade bool                          `json:"supports_remote_upgrade"`
+	ExternallyManaged     bool                          `json:"externally_managed,omitempty"`
 	UpgradePending        bool                          `json:"upgrade_pending,omitempty"`
 	SampleIntervalS       int                           `json:"sample_interval_s"`
 	EnabledCollectors     []string                      `json:"enabled_collectors,omitempty"`
@@ -70,6 +71,7 @@ func toDTO(h storage.Host) hostDTO {
 		UpdateAvailable:       h.AgentVersion != "" && version.IsNewer(version.Version, h.AgentVersion),
 		AutoUpgrade:           h.AutoUpgrade,
 		SupportsRemoteUpgrade: supportsRemoteUpgrade(h.AgentVersion),
+		ExternallyManaged:     h.ExternallyManaged,
 		UpgradePending:        h.UpgradeRequestedAt != nil,
 		SampleIntervalS:       h.SampleIntervalS,
 		EnabledCollectors:     h.EnabledCollectors,
@@ -392,6 +394,10 @@ func requestHostUpgradeHandler(db *storage.DB, hosts *storage.Hosts) http.Handle
 				return
 			}
 			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if h.ExternallyManaged {
+			writeError(w, http.StatusPreconditionFailed, "host is externally managed (containerized or read-only filesystem); upgrade by rebuilding its agent image, bumping SM_AGENT_IMAGE, and redeploying, not via remote upgrade")
 			return
 		}
 		if !supportsRemoteUpgrade(h.AgentVersion) {

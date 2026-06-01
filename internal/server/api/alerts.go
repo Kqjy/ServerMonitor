@@ -446,4 +446,3 @@ func deleteChannelHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
-
