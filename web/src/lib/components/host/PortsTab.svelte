@@ -1,9 +1,19 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, type PortRow } from '$lib/api';
+  import { api, type PortRow, type CollectorStatus } from '$lib/api';
   import { timeAgo } from '$lib/format';
 
-  let { hostId }: { hostId: number; sampleIntervalS?: number } = $props();
+  let {
+    hostId,
+    collectorStatus = {}
+  }: {
+    hostId: number;
+    sampleIntervalS?: number;
+    collectorStatus?: Record<string, CollectorStatus>;
+  } = $props();
+
+  const ownerStatus = $derived(collectorStatus.connections);
+  const ownersUnresolved = $derived(ownerStatus?.state === 'no_owners');
 
   let rows = $state<PortRow[]>([]);
   let atMs = $state<number | null>(null);
@@ -206,6 +216,16 @@
       {/each}
     </div>
   </div>
+
+  {#if ownersUnresolved}
+    <div class="px-4 sm:px-5 py-3 border-b border-amber-900/40 bg-amber-950/20 text-xs text-amber-100/90 space-y-1">
+      <p>The agent could not map listening sockets to their owning processes, so the Process and PID columns are blank. Port numbers and bindings below are still accurate.</p>
+      <p class="text-amber-100/70">On Linux this means the agent lacks <span class="font-mono">CAP_SYS_PTRACE</span> or is confined by AppArmor / another LSM; a containerized agent also needs <span class="font-mono">apparmor=unconfined</span>.</p>
+      {#if ownerStatus?.message}
+        <p class="text-amber-100/60 text-[11px] font-mono pt-0.5">{ownerStatus.message}</p>
+      {/if}
+    </div>
+  {/if}
 
   {#if rows.length === 0}
     <div class="p-12 text-center">

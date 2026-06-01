@@ -7,8 +7,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 ## 1. Build and push the image (once, on a build host with the source)
 
 ```
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.1.7 .
-docker push registry.example.com/servermonitor-agent:0.1.7
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.1.8 .
+docker push registry.example.com/servermonitor-agent:0.1.8
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -41,7 +41,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
 SM_SERVER_PUBKEY=<hex from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.1.7
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.1.8
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) — the token authenticates the agent. Do not commit it.
@@ -86,4 +86,5 @@ docker compose -f deploy/docker-compose.agent.yml exec sm-agent \
 - **Upgrades**: auto-upgrade is disabled in containers (`SM_AUTO_UPGRADE=false`). To upgrade, build and push a new image tag, bump `SM_AGENT_IMAGE`, then `docker compose ... up -d --pull always --no-build` (a bare `up -d` would try to build the new tag from source rather than pull it). Host-installed agents still self-upgrade normally.
 - **Interval**: a sampling interval pushed from the server applies immediately but is not persisted across container restarts (config is env-only). Set `SM_INTERVAL_S` in `.env.agent` to pin it across restarts; the compose recipe forwards it into the container.
 - **SMART / RAID / Wi-Fi**: not covered by this recipe — they need extra device access and host capabilities. Use the host install where you need them.
+- **Port / process owner attribution**: the Ports tab lists every listening socket, but the PID and process columns are blank in this recipe (the host detail page shows a banner explaining why). Mapping a socket to its owning process means walking `/proc/<pid>/fd`, which is ptrace-gated, and Docker's default `docker-default` AppArmor profile only permits `ptrace` between same-profile peers — so it blocks the agent from reading unconfined host processes **even with** `CAP_SYS_PTRACE`. To enable attribution, add `apparmor=unconfined` to the service's `security_opt`. That lifts AppArmor confinement from the agent container (it keeps `no-new-privileges` and its dropped-capability set), so weigh it against the fact that this agent already runs with `pid: host` and read-only host-FS visibility. The host install attributes owners without this trade-off.
 - **Container metrics** come from the Docker socket; on hosts using Podman/containerd without a Docker-compatible socket they are skipped, and every other collector still works.

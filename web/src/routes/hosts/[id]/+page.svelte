@@ -249,7 +249,7 @@
       {:else if tabModel === 'network'}<NetworkTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'processes'}<ProcessesTab hostId={id} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'containers'}<ContainersTab hostId={id} sampleIntervalS={host.sample_interval_s} />
-      {:else if tabModel === 'ports'}<PortsTab hostId={id} sampleIntervalS={host.sample_interval_s} />
+      {:else if tabModel === 'ports'}<PortsTab hostId={id} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} />
       {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {/if}

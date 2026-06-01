@@ -2,6 +2,9 @@ package collectors
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -18,15 +21,33 @@ const (
 	sockDgram  = 2
 )
 
+const (
+	connStateOK       = "ok"
+	connStateNoOwners = "no_owners"
+)
+
 type connCollector struct {
-	mu     sync.Mutex
-	cached []wire.Port
+	mu       sync.Mutex
+	cached   []wire.Port
+	state    string
+	stateMsg string
+	warned   bool
 }
 
 func init() { Register(&connCollector{}) }
 
 func (c *connCollector) Name() string        { return "connections" }
 func (c *connCollector) Platforms() []string { return []string{"linux", "darwin", "windows", "freebsd"} }
+
+func (c *connCollector) Status() wire.CollectorStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state := c.state
+	if state == "" {
+		state = connStateOK
+	}
+	return wire.CollectorStatus{State: state, Message: c.stateMsg}
+}
 
 func (c *connCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := time.Now()
@@ -88,9 +109,23 @@ func (c *connCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		})
 	}
 
+	total := len(listening)
+	resolved := 0
+	for _, conn := range listening {
+		if conn.Pid > 0 {
+			resolved++
+		}
+	}
+
 	c.mu.Lock()
 	c.cached = out
+	logHint := c.updateOwnerStateLocked(resolved, total)
+	msg := c.stateMsg
 	c.mu.Unlock()
+
+	if logHint {
+		slog.Warn("listening-port owner attribution failed", "collector", "connections", "detail", msg)
+	}
 
 	return []wire.Point{
 		point(now, metrics.ConnEstab, nil, float64(established)),
@@ -123,4 +158,26 @@ func protoLabel(c gopsnet.ConnectionStat) string {
 		return "udp"
 	}
 	return ""
+}
+
+func (c *connCollector) updateOwnerStateLocked(resolved, total int) bool {
+	if total == 0 || resolved > 0 {
+		c.state, c.stateMsg, c.warned = connStateOK, "", false
+		return false
+	}
+	c.state = connStateNoOwners
+	c.stateMsg = portOwnerHint(resolved, total)
+	if c.warned {
+		return false
+	}
+	c.warned = true
+	return true
+}
+
+func portOwnerHint(resolved, total int) string {
+	base := fmt.Sprintf("resolved %d/%d listening-socket owners", resolved, total)
+	if runtime.GOOS == "linux" {
+		return base + " — agent likely lacks CAP_SYS_PTRACE or is AppArmor/LSM-confined"
+	}
+	return base + " — agent lacks privilege to read listening-socket owners"
 }
