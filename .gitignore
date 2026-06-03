@@ -27,6 +27,7 @@ Thumbs.db
 .idea/
 .claude/
 .gocache/
+.tmp-gocache/
 /deregistered
 deregistered
 

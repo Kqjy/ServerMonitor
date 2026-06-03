@@ -53,7 +53,7 @@
   <div class="flex flex-wrap items-end justify-between gap-3 mb-5 sm:mb-6">
     <div class="min-w-0">
       <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Alerts</h1>
-      <p class="text-xs sm:text-sm text-zinc-500 mt-1">Threshold rules and recent fires</p>
+      <p class="text-xs sm:text-sm text-zinc-500 mt-1">Threshold rules and recent alerts</p>
     </div>
     <button
       type="button"
@@ -140,7 +140,7 @@
     <h2 class="text-sm uppercase tracking-wider text-zinc-500 mb-3">Recent history</h2>
     <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
       {#if history.length === 0}
-        <div class="px-5 py-8 text-center text-zinc-500 text-sm">No fires yet</div>
+        <div class="px-5 py-8 text-center text-zinc-500 text-sm">No alerts triggered yet</div>
       {:else}
         <div class="overflow-x-auto">
           <table class="w-full text-sm">
@@ -165,7 +165,7 @@
                     {#if h.resolved_at}
                       <span class="text-emerald-400">resolved</span>
                     {:else}
-                      <span class="text-rose-400">firing</span>
+                      <span class="text-rose-400">triggered</span>
                     {/if}
                   </td>
                   <td class="px-4 sm:px-5 py-2 text-zinc-500 text-xs font-mono whitespace-nowrap">
@@ -206,7 +206,7 @@
 <ConfirmDialog
   open={toDelete !== null}
   title="Delete alert rule"
-  message={toDelete ? `Delete rule "${toDelete.name}"? Its history rows will be retained, but no new fires will be generated.` : ''}
+  message={toDelete ? `Delete rule "${toDelete.name}"? Its history rows will be retained, but no new alerts will be triggered.` : ''}
   confirmLabel="Delete"
   danger
   onconfirm={doDelete}

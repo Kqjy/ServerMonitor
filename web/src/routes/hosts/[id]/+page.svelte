@@ -134,7 +134,7 @@
       <div class="mb-4 rounded-lg border px-4 py-3 {severityClass(topSeverity, 'banner')}">
         <div class="flex items-center gap-2 text-sm font-medium">
           <span class="h-2 w-2 rounded-full bg-current"></span>
-          {activeAlerts.length} alert{activeAlerts.length === 1 ? '' : 's'} firing on this host
+          {activeAlerts.length} alert{activeAlerts.length === 1 ? '' : 's'} triggered on this host
         </div>
         <ul class="mt-2 space-y-1 text-xs">
           {#each activeAlerts as a (a.rule_id + ':' + (a.label_key ?? ''))}
@@ -168,8 +168,37 @@
               >
                 Managed externally — redeploy a new agent image to update
               </span>
+            {:else if host.upgrade_stalled}
+              <span
+                class="text-amber-400"
+                title="The agent kept failing to replace its own binary — typically a read-only filesystem or a containerized deploy. Auto-update is paused. If this host runs the agent from a container image, redeploy a new image tag; otherwise re-run the install script or check the agent logs."
+              >
+                Self-update failing — still on v{host.agent_version || '?'}; redeploy or re-install to update
+              </span>
+              {#if host.supports_remote_upgrade}
+                {#if host.upgrade_pending}
+                  <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+                    <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+                    Pending next check-in
+                  </span>
+                {:else}
+                  <button
+                    type="button"
+                    onclick={requestUpgrade}
+                    disabled={upgradeBusy}
+                    class="px-2.5 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
+                  >
+                    {upgradeBusy ? 'Sending…' : 'Retry update'}
+                  </button>
+                {/if}
+              {/if}
             {:else if host.supports_remote_upgrade}
-              {#if host.upgrade_pending}
+              {#if host.upgrading}
+                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+                  <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+                  Updating…
+                </span>
+              {:else if host.upgrade_pending}
                 <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
                   <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
                   Pending next check-in

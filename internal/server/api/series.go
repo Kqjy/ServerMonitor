@@ -578,6 +578,11 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 			step = minInterval
 		}
 
+		aggFn := "avg"
+		if strings.EqualFold(q.Get("agg"), "max") {
+			aggFn = "max"
+		}
+
 		result := make(map[string]batchSeriesEntry, len(hostIDs))
 		for _, id := range hostIDs {
 			result[strconv.FormatInt(id, 10)] = batchSeriesEntry{Points: []seriesPoint{}}
@@ -585,7 +590,7 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 
 		if to.After(from) {
 			rows, err := db.Pool.Query(r.Context(), `
-				SELECT host_id, time_bucket($1::interval, time) AS bucket, avg(value)
+				SELECT host_id, time_bucket($1::interval, time) AS bucket, `+aggFn+`(value)
 				FROM metric_points
 				WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
 				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)

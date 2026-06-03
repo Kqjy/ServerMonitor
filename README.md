@@ -79,6 +79,24 @@ A host that only runs *Glances* in a container is not itself containerized — t
 
 ---
 
+## Uninstalling an agent
+
+To remove an agent that was installed directly on a host, run the matching uninstall script. Each stops and deletes the service, removes the binaries, config, spool, and the dedicated service account.
+
+**Linux**
+```bash
+sudo ./scripts/uninstall-agent-linux.sh
+```
+
+**Windows (PowerShell, admin)**
+```powershell
+.\scripts\uninstall-agent-windows.ps1
+```
+
+Pass `--keep-data` (Linux) / `-KeepData` (Windows) to preserve `agent.toml` and the disk spool so a later reinstall keeps the same host identity. Uninstalling stops the host from reporting but does **not** drop its stored history — use **Settings → Remove** in the web UI for that. (For a containerized agent, `docker compose -f deploy/docker-compose.agent.yml down -v` instead.)
+
+---
+
 ## What the agent collects
 
 Everything Glances reports, gated by platform:
@@ -226,7 +244,7 @@ ServerMonitor/
     metrics/                 canonical metric IDs + units
   web/                       SvelteKit 2 + Svelte 5 + Tailwind v4 + uPlot
   deploy/                    Dockerfile + docker-compose + .env.example
-  scripts/                   Linux + Windows agent install scripts
+  scripts/                   Linux + Windows agent install + uninstall scripts
   migrations/                see internal/server/storage/migrations/
   CLAUDE.md                  developer guide
 ```

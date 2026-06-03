@@ -14,6 +14,7 @@
   let limit = $state(50);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
+  let atOldest = $state(false);
   let expandedPid = $state<number | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -44,17 +45,9 @@
     const opts: { limit: number; at?: string } = { limit };
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
     const fetched = await api.processes(hostId, opts);
-    if (fetched.length > 0) {
-      rows = fetched;
-      updatedAt = maxRowTime(fetched);
-    } else if (atMs === null && rows.length === 0) {
-      const fallback = await api.processes(hostId, { limit, dir: 'prev' });
-      rows = fallback;
-      updatedAt = maxRowTime(fallback);
-    } else if (atMs !== null) {
-      rows = [];
-      updatedAt = null;
-    }
+    rows = fetched;
+    updatedAt = maxRowTime(fetched);
+    if (fetched.length > 0) atOldest = false;
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -72,12 +65,13 @@
         const newest = maxRowTime(fetched);
         updatedAt = newest;
         atMs = newest ? new Date(newest).getTime() : null;
+        atOldest = false;
       } else if (dir === 'next') {
         atMs = null;
+        atOldest = false;
         await refresh();
       } else {
-        rows = [];
-        updatedAt = null;
+        atOldest = true;
       }
     } finally {
       stepping = false;
@@ -120,16 +114,19 @@
     const v = (e.currentTarget as HTMLInputElement).value;
     if (!v) {
       atMs = null;
+      atOldest = false;
       refresh();
       return;
     }
     const d = new Date(v);
     if (isNaN(d.getTime())) return;
     atMs = d.getTime();
+    atOldest = false;
     refresh();
   }
   function resetToNow() {
     atMs = null;
+    atOldest = false;
     refresh();
   }
 
@@ -142,6 +139,8 @@
         : ''
   );
   const isLive = $derived(atMs === null);
+  const canStepPrev = $derived(!stepping && !atOldest);
+  const canStepNext = $derived(!stepping && !isLive);
 
   const sorted = $derived.by(() => {
     const cp = [...rows];
@@ -165,7 +164,7 @@
         <button
           type="button"
           onclick={() => step('prev')}
-          disabled={stepping}
+          disabled={!canStepPrev}
           aria-label="Previous snapshot"
           title="Previous snapshot"
           class="p-1 rounded-md border border-zinc-800 text-zinc-300 hover:bg-zinc-800/40 disabled:opacity-40 disabled:cursor-default transition-colors">
@@ -181,7 +180,7 @@
         <button
           type="button"
           onclick={() => step('next')}
-          disabled={isLive || stepping}
+          disabled={!canStepNext}
           aria-label="Next snapshot"
           title="Next snapshot"
           class="p-1 rounded-md border border-zinc-800 text-zinc-300 hover:bg-zinc-800/40 disabled:opacity-40 disabled:cursor-default transition-colors">
@@ -210,6 +209,21 @@
     </div>
   </header>
 
+  {#if rows.length === 0}
+    <div class="p-12 text-center">
+      <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
+        <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+        </svg>
+      </div>
+      <h2 class="text-base font-medium text-zinc-100">No processes reported</h2>
+      <p class="mt-1 text-sm text-zinc-500 max-w-md mx-auto">
+        {isLive
+          ? 'The agent has not reported any process snapshots for this host yet.'
+          : 'No process data within 2 minutes of the selected moment.'}
+      </p>
+    </div>
+  {:else}
   <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
@@ -261,4 +275,5 @@
       </tbody>
     </table>
   </div>
+  {/if}
 </div>

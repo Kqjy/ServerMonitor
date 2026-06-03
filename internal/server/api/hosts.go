@@ -39,7 +39,9 @@ type hostDTO struct {
 	AutoUpgrade           bool                          `json:"auto_upgrade"`
 	SupportsRemoteUpgrade bool                          `json:"supports_remote_upgrade"`
 	ExternallyManaged     bool                          `json:"externally_managed,omitempty"`
+	UpgradeStalled        bool                          `json:"upgrade_stalled,omitempty"`
 	UpgradePending        bool                          `json:"upgrade_pending,omitempty"`
+	Upgrading             bool                          `json:"upgrading,omitempty"`
 	SampleIntervalS       int                           `json:"sample_interval_s"`
 	EnabledCollectors     []string                      `json:"enabled_collectors,omitempty"`
 	CollectorStatus       map[string]collectorStatusDTO `json:"collector_status,omitempty"`
@@ -52,6 +54,8 @@ type hostDTO struct {
 
 const minRemoteUpgradeVersion = "0.1.1"
 
+const upgradeStallWindow = 15 * time.Minute
+
 func supportsRemoteUpgrade(agentVersion string) bool {
 	if agentVersion == "" {
 		return false
@@ -60,6 +64,8 @@ func supportsRemoteUpgrade(agentVersion string) bool {
 }
 
 func toDTO(h storage.Host) hostDTO {
+	updateAvailable := h.AgentVersion != "" && version.IsNewer(version.Version, h.AgentVersion)
+	stalled := h.UpgradeStallSince != nil && time.Since(*h.UpgradeStallSince) >= upgradeStallWindow
 	d := hostDTO{
 		ID:                    h.ID,
 		Hostname:              h.Hostname,
@@ -68,11 +74,13 @@ func toDTO(h storage.Host) hostDTO {
 		Kernel:                h.Kernel,
 		AgentVersion:          h.AgentVersion,
 		LatestAgentVersion:    version.Version,
-		UpdateAvailable:       h.AgentVersion != "" && version.IsNewer(version.Version, h.AgentVersion),
+		UpdateAvailable:       updateAvailable,
 		AutoUpgrade:           h.AutoUpgrade,
 		SupportsRemoteUpgrade: supportsRemoteUpgrade(h.AgentVersion),
 		ExternallyManaged:     h.ExternallyManaged,
+		UpgradeStalled:        stalled,
 		UpgradePending:        h.UpgradeRequestedAt != nil,
+		Upgrading:             updateAvailable && !stalled && h.UpgradeDispatchedAt != nil,
 		SampleIntervalS:       h.SampleIntervalS,
 		EnabledCollectors:     h.EnabledCollectors,
 		Tags:                  h.Tags,

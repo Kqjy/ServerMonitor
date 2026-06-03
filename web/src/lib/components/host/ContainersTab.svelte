@@ -10,6 +10,7 @@
   let rows = $state<ContainerRow[]>([]);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
+  let atOldest = $state(false);
   let expandedCid = $state<string | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -27,13 +28,8 @@
     const opts: { at?: string } = {};
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
     const fetched = await api.containers(hostId, opts);
-    if (fetched.length > 0) {
-      rows = fetched;
-    } else if (atMs === null && rows.length === 0) {
-      rows = await api.containers(hostId, { dir: 'prev' });
-    } else if (atMs !== null) {
-      rows = [];
-    }
+    rows = fetched;
+    if (fetched.length > 0) atOldest = false;
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -53,11 +49,13 @@
           if (t > max) max = t;
         }
         atMs = max > 0 ? max : null;
+        atOldest = false;
       } else if (dir === 'next') {
         atMs = null;
+        atOldest = false;
         await refresh();
       } else {
-        rows = [];
+        atOldest = true;
       }
     } finally {
       stepping = false;
@@ -86,16 +84,19 @@
     const v = (e.currentTarget as HTMLInputElement).value;
     if (!v) {
       atMs = null;
+      atOldest = false;
       refresh();
       return;
     }
     const d = new Date(v);
     if (isNaN(d.getTime())) return;
     atMs = d.getTime();
+    atOldest = false;
     refresh();
   }
   function resetToNow() {
     atMs = null;
+    atOldest = false;
     refresh();
   }
 
@@ -115,6 +116,8 @@
         : ''
   );
   const isLive = $derived(atMs === null);
+  const canStepPrev = $derived(!stepping && !atOldest);
+  const canStepNext = $derived(!stepping && !isLive);
   const running = $derived(rows.filter((r) => r.state.toLowerCase() === 'running'));
   const stopped = $derived(rows.filter((r) => r.state.toLowerCase() !== 'running'));
 </script>
@@ -127,7 +130,7 @@
         <button
           type="button"
           onclick={() => step('prev')}
-          disabled={stepping}
+          disabled={!canStepPrev}
           aria-label="Previous snapshot"
           title="Previous snapshot"
           class="p-1 rounded-md border border-zinc-800 text-zinc-300 hover:bg-zinc-800/40 disabled:opacity-40 disabled:cursor-default transition-colors">
@@ -143,7 +146,7 @@
         <button
           type="button"
           onclick={() => step('next')}
-          disabled={isLive || stepping}
+          disabled={!canStepNext}
           aria-label="Next snapshot"
           title="Next snapshot"
           class="p-1 rounded-md border border-zinc-800 text-zinc-300 hover:bg-zinc-800/40 disabled:opacity-40 disabled:cursor-default transition-colors">

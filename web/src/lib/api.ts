@@ -15,7 +15,9 @@ export interface Host {
   auto_upgrade: boolean;
   supports_remote_upgrade: boolean;
   externally_managed?: boolean;
+  upgrade_stalled?: boolean;
   upgrade_pending?: boolean;
+  upgrading?: boolean;
   sample_interval_s: number;
   enabled_collectors?: string[];
   collector_status?: Record<string, CollectorStatus>;
@@ -327,6 +329,7 @@ export const api = {
     from?: string;
     to?: string;
     step?: number;
+    agg?: 'avg' | 'max';
     signal?: AbortSignal;
   }): Promise<BatchSeriesResp> => {
     const CHUNK = 200;
@@ -337,6 +340,7 @@ export const api = {
       if (params.from) q.set('from', params.from);
       if (params.to) q.set('to', params.to);
       if (params.step) q.set('step', String(params.step));
+      if (params.agg) q.set('agg', params.agg);
       return request<BatchSeriesResp>(`/api/v1/series/batch?${q}`, { signal: params.signal });
     };
     if (params.hosts.length <= CHUNK) return fetchChunk(params.hosts);

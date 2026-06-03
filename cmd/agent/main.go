@@ -138,10 +138,13 @@ func main() {
 				if !ok {
 					return
 				}
-				if err := persistInterval(*configPath, s); err != nil {
-					logger.Warn("persist interval failed", "err", err)
-				} else {
+				switch err := persistInterval(*configPath, s); {
+				case err == nil:
 					logger.Info("interval updated from server", "interval_s", s)
+				case errors.Is(err, errNoConfigFile):
+					logger.Debug("interval applied in memory; running with env-var identity, nothing to persist", "interval_s", s)
+				default:
+					logger.Warn("persist interval failed", "err", err)
 				}
 				r.SetInterval(time.Duration(s) * time.Second)
 			}
@@ -165,14 +168,18 @@ func main() {
 				if !ok {
 					return
 				}
-				if upd.ServerPubkey != "" && pk.setIfEmpty(upd.ServerPubkey) {
-					if err := persistServerPubkey(*configPath, upd.ServerPubkey); err != nil {
-						logger.Warn("pinned server pubkey in memory but failed to persist to agent.toml; will retry after next restart",
-							"err", err,
-							"config", *configPath)
-					} else {
+				if upd.ServerPubkey != "" && !managed && pk.setIfEmpty(upd.ServerPubkey) {
+					switch err := persistServerPubkey(*configPath, upd.ServerPubkey); {
+					case err == nil:
 						logger.Info("pinned server pubkey from ingest ack",
 							"pubkey", upd.ServerPubkey,
+							"config", *configPath)
+					case errors.Is(err, errNoConfigFile):
+						logger.Info("pinned server pubkey in memory; running with env-var identity, nothing to persist",
+							"config", *configPath)
+					default:
+						logger.Warn("pinned server pubkey in memory but failed to persist to agent.toml; will retry after next restart",
+							"err", err,
 							"config", *configPath)
 					}
 				}
@@ -315,11 +322,16 @@ func persistServerPubkey(path, pubkey string) error {
 
 var configFileMu sync.Mutex
 
+var errNoConfigFile = errors.New("no on-disk config to persist into (env-var identity)")
+
 func persistConfigField(path, key, replacement string) error {
 	configFileMu.Lock()
 	defer configFileMu.Unlock()
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return errNoConfigFile
+		}
 		return err
 	}
 	lines := strings.Split(string(data), "\n")

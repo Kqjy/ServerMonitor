@@ -331,6 +331,25 @@ type channelDTO struct {
 	Enabled bool            `json:"enabled"`
 }
 
+func redactChannelConfig(kind string, config json.RawMessage) json.RawMessage {
+	if kind != "smtp" {
+		return config
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(config, &m); err != nil {
+		return config
+	}
+	if _, ok := m["password"]; !ok {
+		return config
+	}
+	m["password"] = json.RawMessage(`""`)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return config
+	}
+	return out
+}
+
 func listChannelsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rows, err := pool.Query(r.Context(), `SELECT id, name, kind, config, enabled FROM notification_channels ORDER BY id`)
@@ -346,6 +365,7 @@ func listChannelsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			c.Config = redactChannelConfig(c.Kind, c.Config)
 			out = append(out, c)
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -400,6 +420,19 @@ func createChannelHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+const updateChannelSQL = `
+	UPDATE notification_channels SET
+	  name=$2,
+	  kind=$3,
+	  enabled=$5,
+	  config = CASE
+	    WHEN $3 = 'smtp' AND COALESCE(NULLIF($4::jsonb->>'password',''), '') = ''
+	    THEN jsonb_set($4::jsonb, '{password}', COALESCE(config->'password', '""'::jsonb))
+	    ELSE $4::jsonb
+	  END
+	WHERE id=$1
+`
+
 func updateChannelHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.Atoi(chi.URLParam(r, "id"))
@@ -420,9 +453,7 @@ func updateChannelHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		if in.Enabled != nil {
 			enabled = *in.Enabled
 		}
-		_, err = pool.Exec(r.Context(), `
-			UPDATE notification_channels SET name=$2, kind=$3, config=$4, enabled=$5 WHERE id=$1
-		`, id, in.Name, in.Kind, []byte(in.Config), enabled)
+		_, err = pool.Exec(r.Context(), updateChannelSQL, id, in.Name, in.Kind, []byte(in.Config), enabled)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

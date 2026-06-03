@@ -144,7 +144,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 				collStatus[k] = storage.CollectorStatus{State: v.State, Message: v.Message}
 			}
 		}
-		_ = hosts.Touch(r.Context(), hostID, storage.HostInfoUpdate{
+		reported := batch.Host.AgentVersion
+		shouldSelfUpgrade := reported != "" && supportsRemoteUpgrade(reported) && version.IsNewer(version.Version, reported)
+		stallSince, _ := hosts.Touch(r.Context(), hostID, storage.HostInfoUpdate{
 			OS:                batch.Host.OS,
 			Arch:              batch.Host.Arch,
 			Kernel:            batch.Host.Kernel,
@@ -153,7 +155,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			CollectorStatus:   collStatus,
 			Tags:              batch.Host.Tags,
 			ExternallyManaged: batch.Host.ExternallyManaged,
+			ShouldSelfUpgrade: shouldSelfUpgrade,
 		})
+		selfUpgradeStalled := stallSince != nil && time.Since(*stallSince) >= upgradeStallWindow
 
 		hub.Broadcast(hostID, batch.Points)
 
@@ -170,8 +174,11 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 				ack.IntervalS = host.SampleIntervalS
 			}
 			auto := host.AutoUpgrade
+			if selfUpgradeStalled {
+				auto = false
+			}
 			ack.AutoUpgrade = &auto
-			if host.UpgradeRequestedAt != nil && version.IsNewer(version.Version, batch.Host.AgentVersion) {
+			if !selfUpgradeStalled && host.UpgradeRequestedAt != nil && version.IsNewer(version.Version, batch.Host.AgentVersion) {
 				ack.UpgradeNow = true
 				if clrErr := hosts.ClearUpgradeRequest(r.Context(), hostID); clrErr != nil {
 					logger.Warn("clear upgrade request", "host", hostID, "err", clrErr)

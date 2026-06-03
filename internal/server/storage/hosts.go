@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -25,22 +28,24 @@ type CollectorStatus struct {
 }
 
 type Host struct {
-	ID                 int64
-	Hostname           string
-	OS                 string
-	Arch               string
-	Kernel             string
-	AgentVersion       string
-	SampleIntervalS    int
-	EnabledCollectors  []string
-	CollectorStatus    map[string]CollectorStatus
-	Tags               map[string]string
-	LastSeen           *time.Time
-	CreatedAt          time.Time
-	DeletedAt          *time.Time
-	AutoUpgrade        bool
-	UpgradeRequestedAt *time.Time
-	ExternallyManaged  bool
+	ID                  int64
+	Hostname            string
+	OS                  string
+	Arch                string
+	Kernel              string
+	AgentVersion        string
+	SampleIntervalS     int
+	EnabledCollectors   []string
+	CollectorStatus     map[string]CollectorStatus
+	Tags                map[string]string
+	LastSeen            *time.Time
+	CreatedAt           time.Time
+	DeletedAt           *time.Time
+	AutoUpgrade         bool
+	UpgradeRequestedAt  *time.Time
+	ExternallyManaged   bool
+	UpgradeStallSince   *time.Time
+	UpgradeDispatchedAt *time.Time
 }
 
 func tokenHash(token string) []byte {
@@ -102,7 +107,15 @@ func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
 		UPDATE hosts SET
 		  hostname = COALESCE($2, hostname),
 		  sample_interval_s = COALESCE($3, sample_interval_s),
-		  auto_upgrade = COALESCE($4, auto_upgrade)
+		  auto_upgrade = COALESCE($4, auto_upgrade),
+		  upgrade_stall_since = CASE
+		    WHEN $4::boolean IS FALSE AND upgrade_requested_at IS NULL THEN NULL
+		    ELSE upgrade_stall_since
+		  END,
+		  upgrade_dispatched_at = CASE
+		    WHEN $4::boolean IS FALSE AND upgrade_requested_at IS NULL THEN NULL
+		    ELSE upgrade_dispatched_at
+		  END
 		WHERE id = $1 AND deleted_at IS NULL
 	`, id, u.Hostname, u.SampleIntervalS, u.AutoUpgrade)
 	if err != nil {
@@ -121,7 +134,7 @@ func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
 
 func (h *Hosts) RequestUpgrade(ctx context.Context, id int64) error {
 	res, err := h.db.Pool.Exec(ctx, `
-		UPDATE hosts SET upgrade_requested_at = now()
+		UPDATE hosts SET upgrade_requested_at = now(), upgrade_stall_since = NULL, upgrade_dispatched_at = NULL
 		WHERE id = $1 AND deleted_at IS NULL
 	`, id)
 	if err != nil {
@@ -216,7 +229,8 @@ func (h *Hosts) refresh(ctx context.Context) error {
 		       COALESCE(kernel,''), COALESCE(agent_version,''),
 		       sample_interval_s, enabled_collectors, tags, collector_status,
 		       last_seen, created_at, deleted_at,
-		       auto_upgrade, upgrade_requested_at, externally_managed
+		       auto_upgrade, upgrade_requested_at, externally_managed, upgrade_stall_since,
+		       upgrade_dispatched_at
 		FROM hosts
 	`)
 	if err != nil {
@@ -238,7 +252,8 @@ func (h *Hosts) refresh(ctx context.Context) error {
 			&host.Kernel, &host.AgentVersion,
 			&host.SampleIntervalS, &host.EnabledCollectors, &tags, &collStatus,
 			&host.LastSeen, &host.CreatedAt, &host.DeletedAt,
-			&host.AutoUpgrade, &host.UpgradeRequestedAt, &host.ExternallyManaged,
+			&host.AutoUpgrade, &host.UpgradeRequestedAt, &host.ExternallyManaged, &host.UpgradeStallSince,
+			&host.UpgradeDispatchedAt,
 		); err != nil {
 			return err
 		}
@@ -308,15 +323,22 @@ func (h *Hosts) List(ctx context.Context) ([]Host, error) {
 		}
 		out = append(out, host)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := strings.ToLower(out[i].Hostname), strings.ToLower(out[j].Hostname)
+		if a != b {
+			return a < b
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 
-func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) error {
+func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) (*time.Time, error) {
 	tags := []byte("{}")
 	if len(info.Tags) > 0 {
 		b, err := json.Marshal(info.Tags)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		tags = b
 	}
@@ -324,11 +346,13 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) error 
 	if len(info.CollectorStatus) > 0 {
 		b, err := json.Marshal(info.CollectorStatus)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		collStatus = b
 	}
-	_, err := h.db.Pool.Exec(ctx, `
+	var stallSince *time.Time
+	var dispatchedAt *time.Time
+	err := h.db.Pool.QueryRow(ctx, `
 		UPDATE hosts SET
 		  os = COALESCE(NULLIF($2,''), os),
 		  arch = COALESCE(NULLIF($3,''), arch),
@@ -338,26 +362,53 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) error 
 		  tags = CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE tags END,
 		  collector_status = CASE WHEN $8::jsonb <> '{}'::jsonb THEN $8::jsonb ELSE collector_status END,
 		  externally_managed = COALESCE($9::boolean, externally_managed),
+		  upgrade_stall_since = CASE
+		    WHEN $10::boolean AND NOT COALESCE($9::boolean, externally_managed)
+		         AND (upgrade_dispatched_at IS NOT NULL OR auto_upgrade OR upgrade_requested_at IS NOT NULL)
+		    THEN CASE WHEN agent_version IS DISTINCT FROM COALESCE(NULLIF($5,''), agent_version)
+		              THEN now()
+		              ELSE COALESCE(upgrade_stall_since, now()) END
+		    ELSE NULL
+		  END,
+		  upgrade_dispatched_at = CASE
+		    WHEN $10::boolean AND NOT COALESCE($9::boolean, externally_managed)
+		         AND (upgrade_dispatched_at IS NOT NULL OR auto_upgrade OR upgrade_requested_at IS NOT NULL)
+		    THEN COALESCE(upgrade_dispatched_at, now())
+		    ELSE NULL
+		  END,
 		  last_seen = now()
 		WHERE id = $1 AND deleted_at IS NULL
-	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus, info.ExternallyManaged)
+		RETURNING upgrade_stall_since, upgrade_dispatched_at
+	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus, info.ExternallyManaged, info.ShouldSelfUpgrade).Scan(&stallSince, &dispatchedAt)
 	if err != nil {
-		return err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	h.mu.RLock()
 	cached, cacheOK := h.byID[id]
 	cacheValid := time.Since(h.cachedAt) < h.cacheTTL
 	h.mu.RUnlock()
 	if !cacheValid || !cacheOK {
-		return nil
+		return stallSince, nil
 	}
 	tagsChanged := len(info.Tags) > 0 && !maps.Equal(info.Tags, cached.Tags)
 	statusChanged := len(info.CollectorStatus) > 0 && !maps.Equal(info.CollectorStatus, cached.CollectorStatus)
 	managedChanged := info.ExternallyManaged != nil && *info.ExternallyManaged != cached.ExternallyManaged
-	if tagsChanged || statusChanged || managedChanged {
+	stallChanged := !timePtrEqual(stallSince, cached.UpgradeStallSince)
+	dispatchChanged := !timePtrEqual(dispatchedAt, cached.UpgradeDispatchedAt)
+	if tagsChanged || statusChanged || managedChanged || stallChanged || dispatchChanged {
 		h.invalidate()
 	}
-	return nil
+	return stallSince, nil
+}
+
+func timePtrEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
 }
 
 type HostInfoUpdate struct {
@@ -369,4 +420,5 @@ type HostInfoUpdate struct {
 	CollectorStatus   map[string]CollectorStatus
 	Tags              map[string]string
 	ExternallyManaged *bool
+	ShouldSelfUpgrade bool
 }

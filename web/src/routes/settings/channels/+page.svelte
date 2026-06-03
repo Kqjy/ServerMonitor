@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { api, type Channel } from '$lib/api';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
@@ -10,6 +10,8 @@
   let formName = $state('');
   let busy = $state(false);
   let formError = $state<string | null>(null);
+  let editingId = $state<number | null>(null);
+  let editingEnabled = $state(true);
 
   let smtpHost = $state('');
   let smtpPort = $state(587);
@@ -27,12 +29,15 @@
   }
 
   function resetForm() {
+    editingId = null;
+    editingEnabled = true;
     formName = '';
     smtpHost = ''; smtpPort = 587; smtpUser = ''; smtpPass = ''; smtpFrom = ''; smtpTo = '';
     webhookUrl = ''; webhookFormat = 'generic';
+    formError = null;
   }
 
-  async function create(e: Event) {
+  async function save(e: Event) {
     e.preventDefault();
     if (!formName.trim()) {
       formError = 'Name is required';
@@ -55,7 +60,12 @@
       } else {
         config = { url: webhookUrl.trim(), format: webhookFormat };
       }
-      await api.channelCreate({ name: formName.trim(), kind: formKind, config, enabled: true });
+      const input = { name: formName.trim(), kind: formKind, config, enabled: editingId === null ? true : editingEnabled };
+      if (editingId === null) {
+        await api.channelCreate(input);
+      } else {
+        await api.channelUpdate(editingId, input);
+      }
       resetForm();
       await refresh();
     } catch (err) {
@@ -63,6 +73,30 @@
     } finally {
       busy = false;
     }
+  }
+
+  async function edit(c: Channel) {
+    editingId = c.id;
+    editingEnabled = c.enabled;
+    formKind = c.kind;
+    formName = c.name;
+    formError = null;
+    const cfg = (c.config ?? {}) as Record<string, unknown>;
+    if (c.kind === 'smtp') {
+      smtpHost = (cfg.host as string) ?? '';
+      smtpPort = (cfg.port as number) ?? 587;
+      smtpUser = (cfg.username as string) ?? '';
+      smtpPass = (cfg.password as string) ?? '';
+      smtpFrom = (cfg.from as string) ?? '';
+      smtpTo = Array.isArray(cfg.to) ? (cfg.to as string[]).join(', ') : ((cfg.to as string) ?? '');
+      webhookUrl = ''; webhookFormat = 'generic';
+    } else {
+      webhookUrl = (cfg.url as string) ?? '';
+      webhookFormat = (cfg.format as 'generic' | 'discord' | 'slack' | 'ntfy') || 'generic';
+      smtpHost = ''; smtpPort = 587; smtpUser = ''; smtpPass = ''; smtpFrom = ''; smtpTo = '';
+    }
+    await tick();
+    document.getElementById('channel-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   async function toggle(c: Channel) {
@@ -110,7 +144,7 @@
           </thead>
           <tbody class="divide-y divide-zinc-800/70">
             {#each channels as c (c.id)}
-              <tr class="hover:bg-zinc-900/60">
+              <tr class="hover:bg-zinc-900/60 {editingId === c.id ? 'bg-sky-950/20' : ''}">
                 <td class="px-4 sm:px-5 py-2 text-zinc-100 font-mono text-xs whitespace-nowrap">{c.name}</td>
                 <td class="px-3 py-2 text-zinc-400 text-xs uppercase whitespace-nowrap">{c.kind}</td>
                 <td class="px-3 py-2 text-xs whitespace-nowrap">
@@ -118,6 +152,7 @@
                 </td>
                 <td class="px-4 sm:px-5 py-2 text-xs whitespace-nowrap">
                   <div class="flex items-center gap-1">
+                    <button type="button" onclick={() => edit(c)} class="px-2 py-1 rounded-md hover:bg-zinc-800/60 text-zinc-300">Edit</button>
                     <button type="button" onclick={() => toggle(c)} class="px-2 py-1 rounded-md hover:bg-zinc-800/60 text-zinc-300">{c.enabled ? 'Disable' : 'Enable'}</button>
                     <button type="button" onclick={() => (toRemove = c)} class="px-2 py-1 rounded-md hover:bg-rose-950/40 text-rose-300">Delete</button>
                   </div>
@@ -130,11 +165,11 @@
     {/if}
   </section>
 
-  <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40">
+  <section id="channel-form" class="mt-6 rounded-xl border bg-zinc-900/40 {editingId !== null ? 'border-sky-800/60' : 'border-zinc-800'}">
     <header class="px-4 sm:px-5 py-3 border-b border-zinc-800">
-      <h2 class="text-sm font-medium text-zinc-100">Add channel</h2>
+      <h2 class="text-sm font-medium text-zinc-100">{editingId === null ? 'Add channel' : 'Edit channel'}</h2>
     </header>
-    <form onsubmit={create} class="p-4 sm:p-5 space-y-4">
+    <form onsubmit={save} class="p-4 sm:p-5 space-y-4">
       <div class="flex items-center gap-1 text-xs">
         {#each ['webhook', 'smtp'] as k (k)}
           <button
@@ -167,7 +202,7 @@
           </div>
           <div>
             <label class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5" for="spass">Password</label>
-            <input id="spass" type="password" bind:value={smtpPass} class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+            <input id="spass" type="password" autocomplete="new-password" bind:value={smtpPass} placeholder={editingId === null ? '' : 'Leave blank to keep current'} class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono placeholder:text-zinc-600" />
           </div>
           <div>
             <label class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5" for="sfrom">From</label>
@@ -198,9 +233,14 @@
         <div class="rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{formError}</div>
       {/if}
 
-      <div class="flex justify-end">
+      <div class="flex justify-end gap-2">
+        {#if editingId !== null}
+          <button type="button" onclick={resetForm} disabled={busy} class="text-sm px-4 py-2 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50">
+            Cancel
+          </button>
+        {/if}
         <button type="submit" disabled={busy} class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50">
-          {busy ? 'Adding…' : 'Add channel'}
+          {busy ? (editingId === null ? 'Adding…' : 'Saving…') : (editingId === null ? 'Add channel' : 'Save changes')}
         </button>
       </div>
     </form>
