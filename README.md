@@ -51,25 +51,26 @@ The `.env` you must set:
 
 ## Installing an agent on a remote host
 
-After the server is running, you can install the agent on any Linux or Windows host that should be monitored. The install scripts use `ADMIN_TOKEN` to register the host with the server and write `agent.toml` automatically.
+After the server is running, you can install the agent on any Linux or Windows host that should be monitored. The install scripts register the host with the server and write `agent.toml` automatically. Supply the admin token through the `SM_ADMIN_TOKEN` environment variable (as shown below) or a file (`--admin-token-file` on Linux, `-AdminTokenFile` on Windows) — it is never accepted as a command-line argument, since arguments are visible to other local users while the script runs. On Linux, put the assignment **after** `sudo` so it survives into the elevated environment.
 
 **Linux**
 ```bash
-sudo ./scripts/install-agent-linux.sh \
-  --server  https://monitor.example.com \
-  --admin-token "$ADMIN_TOKEN" \
-  --binary  ./sm-agent
+sudo SM_ADMIN_TOKEN="$ADMIN_TOKEN" ./scripts/install-agent-linux.sh \
+  --server https://monitor.example.com \
+  --binary ./sm-agent
 ```
 
 **Windows (PowerShell, admin)**
 ```powershell
+$env:SM_ADMIN_TOKEN = $env:ADMIN_TOKEN
 .\scripts\install-agent-windows.ps1 `
-  -ServerUrl   https://monitor.example.com `
-  -AdminToken  $env:ADMIN_TOKEN `
-  -BinaryPath  .\sm-agent.exe
+  -ServerUrl https://monitor.example.com `
+  -BinaryPath .\sm-agent.exe
 ```
 
 Both scripts wrap `sm-agent register` (which calls `POST /api/v1/admin/hosts`), then enable the service (`systemd` on Linux, `sc.exe` on Windows). Within ~10 seconds the host appears in the dashboard with a live CPU sparkline.
+
+**Reconfiguring an installed agent.** Re-running an installer on a host that already has `agent.toml` reconfigures the service in place rather than registering again: it re-derives capabilities and group memberships (Linux) or the service account and privileges (Windows) from the `--enable-*` / `SM_ENABLE_*` flags and restarts — no token, no re-registration, identity and binary untouched. So to flip a capability (e.g. add NVMe SMART with `--enable-smart-nvme`), just re-run with the flag added. Pass `--reinstall` / `-Reinstall` (or `SM_REINSTALL=1`) to force a full fresh install instead.
 
 **Docker (containerized agent)**
 
@@ -114,7 +115,7 @@ Everything Glances reports, gated by platform:
 | Containers (Docker) | ✓ | ✓ | ✓ | docker/docker — no-op if daemon unreachable |
 | Sensors (temperatures) | ✓ | ✓ | ✓ | gopsutil |
 | NVIDIA GPU | ✓ | ✓ | — | shells `nvidia-smi`; no-op if absent |
-| SMART | ✓ | ✓ | ✓ | shells `smartctl --json`; no-op if absent |
+| SMART | ✓ | ✓ | ✓ | shells `smartctl --json`; no-op if absent. Linux NVMe SMART needs `CAP_SYS_ADMIN` (`--enable-smart-nvme`); `--enable-smart`/`CAP_SYS_RAWIO` covers SATA/SAS only |
 | RAID arrays | ✓ | — | — | parses `/proc/mdstat` |
 | Wi-Fi signal | ✓ | — | — | parses `/proc/net/wireless` |
 | Uptime | ✓ | ✓ | ✓ | gopsutil |
@@ -204,7 +205,8 @@ go build -o bin/agent.exe  ./cmd/agent
 
 Then in another shell, register and run a local agent:
 ```powershell
-.\bin\agent.exe register --server http://localhost:8080 --admin-token dev-admin-token
+$env:SM_ADMIN_TOKEN = "dev-admin-token"
+.\bin\agent.exe register --server http://localhost:8080 --insecure
 .\bin\agent.exe
 ```
 

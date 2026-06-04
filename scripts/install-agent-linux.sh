@@ -8,18 +8,26 @@ INTERVAL=10
 BIN_PATH=""
 HOSTNAME_OVERRIDE=""
 ENABLE_SMART="${SM_ENABLE_SMART:-0}"
+ENABLE_SMART_NVME="${SM_ENABLE_SMART_NVME:-0}"
 ENABLE_DOCKER="${SM_ENABLE_DOCKER:-0}"
 ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
 ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
+REINSTALL="${SM_REINSTALL:-0}"
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--reinstall]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
+
+Re-running on a host that already has /etc/servermonitor/agent.toml reconfigures
+the service in place: it re-derives capabilities and group memberships from the
+--enable-* flags and restarts, without re-registering and without an admin token
+(--server and --binary are not required in that mode). Pass --reinstall, or set
+SM_REINSTALL=1, to force a full fresh install instead.
 
 Admin token MUST come from SM_ADMIN_TOKEN env var or --admin-token-file PATH.
 The --admin-token flag is deliberately not supported here: argv is visible in
@@ -29,11 +37,12 @@ By default the agent gets no Linux capabilities and no supplementary group
 memberships. Each --enable-* flag (or SM_ENABLE_<NAME>=1 env var) opts into one
 extra collector's grant:
   --enable-port-owners  adds CAP_DAC_READ_SEARCH + CAP_SYS_PTRACE so the Ports tab can map a listening socket to its PID/process; this lets the unprivileged sm-agent read other processes' memory and environment (secrets), so enable it only where that owner mapping is worth the exposure
-  --enable-smart        adds CAP_SYS_RAWIO + 'disk' group, auto-installs smartmontools via apt/dnf/yum/apk/pacman/zypper
+  --enable-smart        adds CAP_SYS_RAWIO + 'disk' group, auto-installs smartmontools via apt/dnf/yum/apk/pacman/zypper. Covers SATA/SAS SMART (SG_IO) only; NVMe SMART needs CAP_SYS_ADMIN (see --enable-smart-nvme)
+  --enable-smart-nvme   implies --enable-smart and additionally adds CAP_SYS_ADMIN so smartctl can issue NVME_IOCTL_ADMIN_CMD on NVMe drives. CAP_SYS_ADMIN is near-root and widens the agent well beyond the rest of this hardened unit, so enable it only where NVMe SMART telemetry is worth that exposure
   --enable-docker       adds 'docker' group membership (containers collector)
   --enable-gpu          adds 'video' group membership (some nvidia-smi setups)
   --enable-network      adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
-  --enable-all          shortcut for all of the above
+  --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme; CAP_SYS_ADMIN must be opted into explicitly
 
 Examples:
   SM_ADMIN_TOKEN=xxx $0 --server https://monitor.example.com --binary ./sm-agent
@@ -51,10 +60,12 @@ while [[ $# -gt 0 ]]; do
     --binary)            BIN_PATH="$2"; shift 2 ;;
     --enable-port-owners) ENABLE_PORT_OWNERS=1; shift ;;
     --enable-smart)      ENABLE_SMART=1; shift ;;
+    --enable-smart-nvme) ENABLE_SMART_NVME=1; shift ;;
     --enable-docker)     ENABLE_DOCKER=1; shift ;;
     --enable-gpu)        ENABLE_GPU=1; shift ;;
     --enable-network)    ENABLE_NETWORK=1; shift ;;
     --enable-all)        ENABLE_ALL=1; shift ;;
+    --reinstall)         REINSTALL=1; shift ;;
     -h|--help)           usage ;;
     *) echo "unknown arg $1" >&2; usage ;;
   esac
@@ -67,6 +78,41 @@ if [ "$ENABLE_ALL" = "1" ]; then
   ENABLE_NETWORK=1
   ENABLE_PORT_OWNERS=1
 fi
+
+[ "$ENABLE_SMART_NVME" = "1" ] && ENABLE_SMART=1
+
+has_nvme_device() {
+  local dev
+  for dev in /dev/nvme*; do
+    [ -e "$dev" ] && return 0
+  done
+  return 1
+}
+
+warn_nvme_smart() {
+  has_nvme_device || return 0
+  if [ "$ENABLE_SMART_NVME" = "1" ]; then
+    cat >&2 <<'WARN'
+
+WARNING: --enable-smart-nvme grants CAP_SYS_ADMIN to the sm-agent service.
+         NVMe SMART reads issue NVME_IOCTL_ADMIN_CMD, which the kernel gates
+         behind CAP_SYS_ADMIN regardless of file or group permissions.
+         CAP_SYS_ADMIN is near-root and widens the agent well beyond the rest
+         of this hardened unit. Keep it only where NVMe SMART is worth that.
+
+WARN
+  else
+    cat >&2 <<'WARN'
+
+WARNING: NVMe device(s) detected, but --enable-smart grants only CAP_SYS_RAWIO.
+         CAP_SYS_RAWIO covers SATA/SAS SMART (SG_IO); it does NOT cover NVMe,
+         whose SMART reads need CAP_SYS_ADMIN. smartctl will scan these devices
+         but report no SMART data for them. To collect NVMe SMART, re-run with
+         --enable-smart-nvme (adds CAP_SYS_ADMIN, near-root). SATA/SAS is fine.
+
+WARN
+  fi
+}
 
 install_smartmontools() {
   if command -v smartctl >/dev/null 2>&1; then
@@ -99,6 +145,22 @@ install_smartmontools() {
 }
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+
+RECONFIGURE=0
+if [ "$REINSTALL" != "1" ] && [[ -f /etc/servermonitor/agent.toml ]]; then
+  RECONFIGURE=1
+  [[ -x /opt/servermonitor/sm-agent ]] || { echo "found /etc/servermonitor/agent.toml but no agent binary at /opt/servermonitor/sm-agent; re-run with --reinstall for a full install" >&2; exit 1; }
+  cat >&2 <<'NOTE'
+
+reconfiguring the existing sm-agent install in place: re-applying capabilities
+and group memberships from the --enable-* flags, keeping the current identity
+and binary. No re-registration and no admin token needed. To force a full fresh
+install instead (re-register, rewrite config), re-run with --reinstall.
+
+NOTE
+fi
+
+if [ "$RECONFIGURE" != "1" ]; then
 [[ -z "$SERVER_URL" || -z "$BIN_PATH" ]] && usage
 
 if [[ -z "$ADMIN_TOKEN" && -n "$ADMIN_TOKEN_FILE" ]]; then
@@ -126,30 +188,35 @@ if [[ ${#BIN_DIR_PERMS} -ge 2 && "${BIN_DIR_PERMS: -2:1}" =~ [2367] && "$BIN_DIR
   echo "refusing: binary source dir $BIN_DIR is group-writable and not root-owned (mode $BIN_DIR_PERMS owner uid $BIN_DIR_OWNER)" >&2
   exit 1
 fi
+fi
 
 id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group --comment 'ServerMonitor agent' sm-agent
 
 [ "$ENABLE_SMART" = "1" ] && install_smartmontools
+[ "$ENABLE_SMART" = "1" ] && warn_nvme_smart
 
-EXTRA_GROUPS=()
-[ "$ENABLE_SMART" = "1" ]  && EXTRA_GROUPS+=(disk)
-[ "$ENABLE_DOCKER" = "1" ] && EXTRA_GROUPS+=(docker)
-[ "$ENABLE_GPU" = "1" ]    && EXTRA_GROUPS+=(video)
-for grp in "${EXTRA_GROUPS[@]}"; do
+WANTED_GROUPS=()
+[ "$ENABLE_SMART" = "1" ]  && WANTED_GROUPS+=(disk)
+[ "$ENABLE_DOCKER" = "1" ] && WANTED_GROUPS+=(docker)
+[ "$ENABLE_GPU" = "1" ]    && WANTED_GROUPS+=(video)
+PRESENT_GROUPS=()
+for grp in "${WANTED_GROUPS[@]}"; do
   if getent group "$grp" >/dev/null 2>&1; then
-    usermod -aG "$grp" sm-agent
+    PRESENT_GROUPS+=("$grp")
   else
     echo "note: group '$grp' not present; skipping (re-run after creating it)" >&2
   fi
 done
+usermod -G "$(IFS=,; printf '%s' "${PRESENT_GROUPS[*]:-}")" sm-agent
 
-install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
+[ "$RECONFIGURE" = "1" ] || install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
 
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
 install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
-install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
+[ "$RECONFIGURE" = "1" ] || install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
 
+if [ "$RECONFIGURE" != "1" ]; then
 ARGS=(--server "$SERVER_URL" --interval "$INTERVAL")
 [[ -n "$HOSTNAME_OVERRIDE" ]] && ARGS+=(--hostname "$HOSTNAME_OVERRIDE")
 SM_ADMIN_TOKEN="$ADMIN_TOKEN" /usr/local/bin/sm-agent register "${ARGS[@]}"
@@ -158,10 +225,12 @@ unset SM_ADMIN_TOKEN
 
 chown sm-agent:sm-agent /etc/servermonitor/agent.toml
 chmod 0600 /etc/servermonitor/agent.toml
+fi
 
 CAPS=""
 [ "$ENABLE_PORT_OWNERS" = "1" ] && CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
 [ "$ENABLE_SMART" = "1" ]       && CAPS="${CAPS:+$CAPS }CAP_SYS_RAWIO"
+[ "$ENABLE_SMART_NVME" = "1" ]  && CAPS="${CAPS:+$CAPS }CAP_SYS_ADMIN"
 [ "$ENABLE_NETWORK" = "1" ]     && CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN CAP_NET_RAW"
 
 cat > /etc/systemd/system/sm-agent.service <<UNIT
@@ -211,8 +280,14 @@ UNIT
 chmod 0644 /etc/systemd/system/sm-agent.service
 
 systemctl daemon-reload
-systemctl enable --now sm-agent.service
+systemctl enable sm-agent.service >/dev/null 2>&1 || true
+systemctl restart sm-agent.service
 systemctl status --no-pager sm-agent.service || true
 
 echo
-echo "installed. tail logs with: journalctl -u sm-agent -f"
+if [ "$RECONFIGURE" = "1" ]; then
+  echo "reconfigured. agent restarted with the updated capabilities."
+else
+  echo "installed."
+fi
+echo "tail logs with: journalctl -u sm-agent -f"

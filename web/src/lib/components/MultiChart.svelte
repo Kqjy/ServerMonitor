@@ -68,6 +68,7 @@
   let lastAppliedFromS = 0;
   let lastAppliedToS = 0;
   let lastHadData = false;
+  let hidden = $state(new Set<string>());
 
   function currentFromS(): number {
     return (fromMs ?? 0) / 1000;
@@ -180,6 +181,7 @@
           const c = s.color ?? palette[i % palette.length];
           return {
             label: s.label,
+            show: !hidden.has(s.label),
             stroke: c,
             width: s.stroke ?? 1.5,
             spanGaps: true,
@@ -193,6 +195,29 @@
     };
     plot = new uPlot(opts, data, host);
     plot.setScale('x', { min: fromS, max: toS });
+  }
+
+  function applyVisibility() {
+    if (!plot) return;
+    series.forEach((s, i) => {
+      const sr = plot!.series[i + 1];
+      if (!sr) return;
+      const show = !hidden.has(s.label);
+      if ((sr.show !== false) !== show) plot!.setSeries(i + 1, { show });
+    });
+  }
+
+  function toggle(label: string) {
+    const next = new Set(hidden);
+    if (next.has(label)) next.delete(label);
+    else next.add(label);
+    hidden = next;
+    applyVisibility();
+  }
+
+  function toggleAll() {
+    hidden = hidden.size > 0 ? new Set<string>() : new Set(series.map((s) => s.label));
+    applyVisibility();
   }
 
   function hasData(s: Series[]) {
@@ -289,12 +314,28 @@
 </div>
 
 {#if series.length > 1}
-  <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-400 numeric">
-    {#each series as s, i (s.label)}
-      <span class="inline-flex items-center gap-1.5">
-        <span class="inline-block h-1.5 w-3 rounded-sm" style="background: {s.color ?? palette[i % palette.length]}"></span>
-        <span>{s.label}</span>
-      </span>
-    {/each}
+  <div class="mt-2 flex items-start justify-between gap-3">
+    <div class="flex flex-wrap gap-x-3 gap-y-1 text-[11px] numeric">
+      {#each series as s, i (s.label)}
+        {@const off = hidden.has(s.label)}
+        <button
+          type="button"
+          onclick={() => toggle(s.label)}
+          aria-pressed={!off}
+          title={off ? 'Show series' : 'Hide series'}
+          class="inline-flex items-center gap-1.5 transition-opacity {off ? 'opacity-40 hover:opacity-70' : 'text-zinc-400 hover:text-zinc-200'}">
+          <span class="inline-block h-1.5 w-3 rounded-sm" style="background: {s.color ?? palette[i % palette.length]}"></span>
+          <span class:line-through={off}>{s.label}</span>
+        </button>
+      {/each}
+    </div>
+    {#if series.length > 2}
+      <button
+        type="button"
+        onclick={toggleAll}
+        class="shrink-0 text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-300 px-1.5 py-0.5 rounded border border-zinc-800 hover:border-zinc-700 transition-colors">
+        {hidden.size > 0 ? 'Show all' : 'Hide all'}
+      </button>
+    {/if}
   </div>
 {/if}

@@ -29,6 +29,7 @@
   let enablePortOwners = $state(false);
   let enableDocker = $state(false);
   let enableSmart = $state(false);
+  let enableSmartNvme = $state(false);
   let enableGpu = $state(false);
   let enableNetwork = $state(false);
   let adminService = $state(false);
@@ -101,6 +102,7 @@
     if (enablePortOwners) vars.push('SM_ENABLE_PORT_OWNERS=1');
     if (enableDocker)  vars.push('SM_ENABLE_DOCKER=1');
     if (enableSmart)   vars.push('SM_ENABLE_SMART=1');
+    if (enableSmart && enableSmartNvme) vars.push('SM_ENABLE_SMART_NVME=1');
     if (enableGpu)     vars.push('SM_ENABLE_GPU=1');
     if (enableNetwork) vars.push('SM_ENABLE_NETWORK=1');
     const preserve = vars.map((v) => v.split('=')[0]).join(',');
@@ -343,8 +345,14 @@ Lock-Path $cfg
                 </label>
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableSmart} class="mt-0.5 accent-emerald-500" />
-                  <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— joins <span class="font-mono">disk</span> group, grants <span class="font-mono">CAP_SYS_RAWIO</span>, auto-installs <span class="font-mono">smartmontools</span></span></span>
+                  <span><span class="text-zinc-100">Disk SMART</span> <span class="text-zinc-500">— joins <span class="font-mono">disk</span> group, grants <span class="font-mono">CAP_SYS_RAWIO</span>, auto-installs <span class="font-mono">smartmontools</span>. Covers SATA/SAS only</span></span>
                 </label>
+                {#if enableSmart}
+                  <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none ml-6">
+                    <input type="checkbox" bind:checked={enableSmartNvme} class="mt-0.5 accent-amber-500" />
+                    <span><span class="text-zinc-100">Include NVMe drives</span> <span class="text-zinc-500">— additionally grants <span class="font-mono">CAP_SYS_ADMIN</span> (NVMe SMART needs it; <span class="font-mono">CAP_SYS_RAWIO</span> does not cover NVMe). <span class="text-amber-300/80">Near-root — enable only where NVMe SMART is worth the exposure.</span></span></span>
+                  </label>
+                {/if}
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableGpu} class="mt-0.5 accent-emerald-500" />
                   <span><span class="text-zinc-100">GPU (nvidia)</span> <span class="text-zinc-500">— joins <span class="font-mono">video</span> group</span></span>

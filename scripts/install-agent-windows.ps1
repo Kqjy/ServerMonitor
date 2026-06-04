@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][string]$ServerUrl,
+    [string]$ServerUrl,
     [string]$AdminTokenFile,
     [string]$HostnameOverride,
     [int]$IntervalS = 10,
-    [Parameter(Mandatory=$true)][string]$BinaryPath,
-    [switch]$AdminService
+    [string]$BinaryPath,
+    [switch]$AdminService,
+    [switch]$Reinstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,20 +21,35 @@ function Assert-Elevated {
 Assert-Elevated
 
 if ($env:SM_ADMIN_SERVICE -eq '1') { $AdminService = $true }
+if ($env:SM_REINSTALL -eq '1') { $Reinstall = $true }
 
-$AdminToken = $env:SM_ADMIN_TOKEN
-if (-not $AdminToken -and $AdminTokenFile) {
-    if (-not (Test-Path -Path $AdminTokenFile)) { throw "admin-token-file not found: $AdminTokenFile" }
-    $AdminToken = (Get-Content -Raw -Path $AdminTokenFile).Trim()
-}
-if (-not $AdminToken) {
-    throw "admin token required: set `$env:SM_ADMIN_TOKEN or pass -AdminTokenFile PATH"
+$configDir0 = Join-Path $env:ProgramData 'ServerMonitor'
+$cfgPath0   = Join-Path $configDir0 'agent.toml'
+$Reconfigure = (-not $Reinstall) -and (Test-Path -LiteralPath $cfgPath0)
+if ($Reconfigure) {
+    Write-Host ''
+    Write-Host 'reconfiguring the existing sm-agent install in place: re-applying the service'
+    Write-Host 'account, privileges, and group memberships, keeping the current identity and'
+    Write-Host 'binary. No re-registration and no admin token needed. Pass -Reinstall (or set'
+    Write-Host '$env:SM_REINSTALL=1) to force a full fresh install instead.'
+    Write-Host ''
 }
 
-if ($ServerUrl -notmatch '^https://') {
-    throw "server URL must start with https:// (admin token would leak over http)"
+if (-not $Reconfigure) {
+    $AdminToken = $env:SM_ADMIN_TOKEN
+    if (-not $AdminToken -and $AdminTokenFile) {
+        if (-not (Test-Path -Path $AdminTokenFile)) { throw "admin-token-file not found: $AdminTokenFile" }
+        $AdminToken = (Get-Content -Raw -Path $AdminTokenFile).Trim()
+    }
+    if (-not $AdminToken) {
+        throw "admin token required: set `$env:SM_ADMIN_TOKEN or pass -AdminTokenFile PATH"
+    }
+
+    if ($ServerUrl -notmatch '^https://') {
+        throw "server URL must start with https:// (admin token would leak over http)"
+    }
+    if (-not (Test-Path -Path $BinaryPath)) { throw "binary not found: $BinaryPath" }
 }
-if (-not (Test-Path -Path $BinaryPath)) { throw "binary not found: $BinaryPath" }
 
 function Get-VirtualServiceSid {
     param([Parameter(Mandatory=$true)][string]$Name)
@@ -98,24 +114,34 @@ Lock-Acl -Path $runtimeDir -ServiceAccess Modify
 
 $exe        = Join-Path $installDir 'sm-agent.exe'
 $runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
-Copy-Item -Force -Path $BinaryPath -Destination $exe
-Copy-Item -Force -Path $BinaryPath -Destination $runtimeExe
-Lock-Acl -Path $exe        -ServiceAccess Read
-Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+if ($Reconfigure) {
+    if (-not (Test-Path -LiteralPath $runtimeExe)) {
+        throw "found $cfgPath0 but no agent binary at $runtimeExe; re-run with -Reinstall for a full install"
+    }
+    if (Test-Path -LiteralPath $exe) { Lock-Acl -Path $exe -ServiceAccess Read }
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+} else {
+    Copy-Item -Force -Path $BinaryPath -Destination $exe
+    Copy-Item -Force -Path $BinaryPath -Destination $runtimeExe
+    Lock-Acl -Path $exe        -ServiceAccess Read
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+}
 
 $cfgPath = Join-Path $configDir 'agent.toml'
 
-$prevToken = $env:SM_ADMIN_TOKEN
-$env:SM_ADMIN_TOKEN = $AdminToken
-try {
-    $regArgs = @('register', '--server', $ServerUrl, '--interval', $IntervalS, '--config', $cfgPath)
-    if ($HostnameOverride) { $regArgs += @('--hostname', $HostnameOverride) }
-    & $exe @regArgs
-    if ($LASTEXITCODE -ne 0) { throw "register failed" }
-} finally {
-    $env:SM_ADMIN_TOKEN = $prevToken
-    $AdminToken = $null
-    [System.GC]::Collect()
+if (-not $Reconfigure) {
+    $prevToken = $env:SM_ADMIN_TOKEN
+    $env:SM_ADMIN_TOKEN = $AdminToken
+    try {
+        $regArgs = @('register', '--server', $ServerUrl, '--interval', $IntervalS, '--config', $cfgPath)
+        if ($HostnameOverride) { $regArgs += @('--hostname', $HostnameOverride) }
+        & $exe @regArgs
+        if ($LASTEXITCODE -ne 0) { throw "register failed" }
+    } finally {
+        $env:SM_ADMIN_TOKEN = $prevToken
+        $AdminToken = $null
+        [System.GC]::Collect()
+    }
 }
 
 if (Test-Path -Path $cfgPath) { Lock-Acl -Path $cfgPath -ServiceAccess Modify }
@@ -172,7 +198,12 @@ if ($AdminService) {
 
 Start-Service -Name 'sm-agent'
 Get-Service -Name 'sm-agent'
-"installed. service runs as $svcAccount. config: $cfgPath"
+if ($Reconfigure) {
+    "reconfigured. service restarted as $svcAccount. config: $cfgPath"
+} else {
+    "installed. service runs as $svcAccount. config: $cfgPath"
+}
 if (-not $AdminService) {
     "note: SMART and full-process collectors require admin; pass -AdminService (or SM_ADMIN_SERVICE=1) to install as LocalSystem if you need them."
+    "note: this includes NVMe SMART -- on Windows it works under the Admin service (LocalSystem) with a recent smartmontools, and unlike Linux needs no extra capability."
 }

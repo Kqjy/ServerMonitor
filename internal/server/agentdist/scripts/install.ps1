@@ -4,7 +4,8 @@ param(
     [switch]$Insecure,
     [switch]$PersistInsecure,
     [switch]$AdminService,
-    [switch]$EnableSmart
+    [switch]$EnableSmart,
+    [switch]$Reinstall
 )
 
 $Token = $env:SM_TOKEN
@@ -18,23 +19,40 @@ if ($env:SM_ENABLE_SMART -eq '1')  { $EnableSmart  = $true }
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
 
-if (-not $Token) {
-    $sec = Read-Host -Prompt 'Agent token' -AsSecureString
-    $Token = [System.Net.NetworkCredential]::new('', $sec).Password
-}
-if (-not $Token) { throw 'agent token required: set $env:SM_TOKEN or enter at the prompt' }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'run from an elevated PowerShell (Run as Administrator)'
 }
 
-if ($ServerUrl -notmatch '^https://') {
-    if (-not $Insecure) {
-        throw "refusing non-https:// server URL '$ServerUrl' (agent token would leak); pass -Insecure to override (debug only)"
-    }
+if ($env:SM_REINSTALL -eq '1') { $Reinstall = $true }
+$cfgPath = Join-Path (Join-Path $env:ProgramData 'ServerMonitor') 'agent.toml'
+$Reconfigure = (-not $Reinstall) -and (Test-Path -LiteralPath $cfgPath)
+if ($Reconfigure) {
+    Write-Host ''
+    Write-Host 'reconfiguring the existing sm-agent install in place: re-applying the service'
+    Write-Host 'account, privileges, and group memberships, keeping the current identity and'
+    Write-Host 'binary. No re-download and no token needed. Set $env:SM_REINSTALL=1 to force a'
+    Write-Host 'full fresh install instead.'
+    Write-Host ''
 }
 
-$arch = if ([Environment]::Is64BitOperatingSystem) { 'amd64' } else { throw 'unsupported arch (32-bit Windows is not supported)' }
-$platform = "windows-$arch"
+if (-not $Reconfigure) {
+    if (-not $Token) {
+        $sec = Read-Host -Prompt 'Agent token' -AsSecureString
+        $Token = [System.Net.NetworkCredential]::new('', $sec).Password
+    }
+    if (-not $Token) { throw 'agent token required: set $env:SM_TOKEN or enter at the prompt' }
+}
+
+if (-not $Reconfigure) {
+    if ($ServerUrl -notmatch '^https://') {
+        if (-not $Insecure) {
+            throw "refusing non-https:// server URL '$ServerUrl' (agent token would leak); pass -Insecure to override (debug only)"
+        }
+    }
+
+    $arch = if ([Environment]::Is64BitOperatingSystem) { 'amd64' } else { throw 'unsupported arch (32-bit Windows is not supported)' }
+    $platform = "windows-$arch"
+}
 
 function Install-Smartmontools {
     $candidates = @(
@@ -133,18 +151,31 @@ $runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
 $cfgPath    = Join-Path $configDir 'agent.toml'
 $spoolPath  = Join-Path $configDir 'spool.db'
 
-if ($Insecure) {
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+if ($Reconfigure) {
+    if (-not (Test-Path -LiteralPath $runtimeExe)) {
+        throw "found $cfgPath but no agent binary at $runtimeExe; set `$env:SM_REINSTALL=1 for a full install"
+    }
+    if (Test-Path -LiteralPath $exe) { Lock-Acl -Path $exe -ServiceAccess Read }
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+    Lock-Acl -Path $cfgPath    -ServiceAccess Modify
+    if (Test-Path -LiteralPath $spoolPath) { Lock-Acl -Path $spoolPath -ServiceAccess Modify }
 }
 
-Write-Host "downloading $ServerUrl agent for $platform ..."
-Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=$platform" -Headers @{ 'X-Agent-Token' = $Token } -OutFile $exe
-Copy-Item -Force -Path $exe -Destination $runtimeExe
-Lock-Acl -Path $exe        -ServiceAccess Read
-Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+if (-not $Reconfigure) {
+    if ($Insecure) {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    }
 
-$insecureLine = if ($Insecure -and $PersistInsecure) { 'true' } else { 'false' }
-$cfg = @"
+    Write-Host "downloading $ServerUrl agent for $platform ..."
+    Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=$platform" -Headers @{ 'X-Agent-Token' = $Token } -OutFile $exe
+    Copy-Item -Force -Path $exe -Destination $runtimeExe
+    Lock-Acl -Path $exe        -ServiceAccess Read
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+}
+
+if (-not $Reconfigure) {
+    $insecureLine = if ($Insecure -and $PersistInsecure) { 'true' } else { 'false' }
+    $cfg = @"
 server_url = "$ServerUrl"
 token      = "$Token"
 interval_s = $IntervalS
@@ -152,12 +183,13 @@ spool_path = "$($spoolPath -replace '\\', '\\')"
 insecure_skip_verify = $insecureLine
 "@
 
-$tmpCfg = [System.IO.Path]::Combine($configDir, [System.IO.Path]::GetRandomFileName())
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($tmpCfg, $cfg, $utf8NoBom)
-Lock-Acl -Path $tmpCfg -ServiceAccess Modify
-Move-Item -Force -LiteralPath $tmpCfg -Destination $cfgPath
-Lock-Acl -Path $cfgPath -ServiceAccess Modify
+    $tmpCfg = [System.IO.Path]::Combine($configDir, [System.IO.Path]::GetRandomFileName())
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmpCfg, $cfg, $utf8NoBom)
+    Lock-Acl -Path $tmpCfg -ServiceAccess Modify
+    Move-Item -Force -LiteralPath $tmpCfg -Destination $cfgPath
+    Lock-Acl -Path $cfgPath -ServiceAccess Modify
+}
 
 if (-not $AdminService) {
     foreach ($g in @('docker-users','Performance Monitor Users')) {
@@ -211,12 +243,17 @@ if ($EnableSmart) { Install-Smartmontools }
 Start-Service -Name 'sm-agent'
 
 Write-Host ''
-Write-Host "installed. agent is running as $svcAccount."
+if ($Reconfigure) {
+    Write-Host "reconfigured. agent restarted as $svcAccount."
+} else {
+    Write-Host "installed. agent is running as $svcAccount."
+}
 Write-Host "service: Get-Service sm-agent"
 Write-Host "logs:    Get-WinEvent -LogName Application -ProviderName 'sm-agent'"
 if (-not $AdminService) {
     Write-Host ''
     Write-Host 'note: SMART and full-process collectors require admin. Pass -AdminService or set $env:SM_ADMIN_SERVICE=1 to install as LocalSystem if you need them.'
+    Write-Host 'note: this includes NVMe SMART -- on Windows it works under the Admin service (LocalSystem) with a recent smartmontools, and unlike Linux needs no extra capability.'
 }
 if (-not $EnableSmart) {
     Write-Host 'note: pass -EnableSmart (or set $env:SM_ENABLE_SMART=1) to auto-install smartmontools for the SMART collector.'

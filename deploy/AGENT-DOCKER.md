@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.2.0 .
-docker push registry.example.com/servermonitor-agent:0.2.0
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.2.1 .
+docker push registry.example.com/servermonitor-agent:0.2.1
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.2.0
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.2.1
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -116,6 +116,8 @@ An interval pushed from the server applies immediately but is **not** persisted 
 ### SMART / RAID / Wi-Fi
 
 Not covered by this recipe — they need extra device access and host capabilities. Use the host install where you need them.
+
+On the host install, note that `--enable-smart` (`CAP_SYS_RAWIO` + `disk` group) covers **SATA/SAS** SMART only. **NVMe** SMART reads use `NVME_IOCTL_ADMIN_CMD`, which the kernel gates behind `CAP_SYS_ADMIN` — so NVMe-only hosts (e.g. most modern bare-metal/Proxmox) need `--enable-smart-nvme` (`SM_ENABLE_SMART_NVME=1`). That cap is near-root, kept as a separate opt-in, and is **not** part of `--enable-all`.
 
 ### Port / process owner attribution
 

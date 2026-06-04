@@ -30,6 +30,11 @@
     realloc: number | null;
     pending: number | null;
     tempC: number | null;
+    written: number | null;
+    read: number | null;
+    percentUsed: number | null;
+    mediaErrors: number | null;
+    unsafeShutdowns: number | null;
   };
 
   let read = $state<SeriesEntry[]>([]);
@@ -38,6 +43,8 @@
   let writeOps = $state<SeriesEntry[]>([]);
   let fs = $state<{ mount: string; fstype: string; used: number; total: number; pct: number }[]>([]);
   let smartTemps = $state<SeriesEntry[]>([]);
+  let smartWritten = $state<SeriesEntry[]>([]);
+  let smartRead = $state<SeriesEntry[]>([]);
   let smart = $state<SmartRow[]>([]);
   let fromMs = $state(0);
   let toMs = $state(0);
@@ -77,7 +84,7 @@
       toMs = b.toMs;
     }
     try {
-      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, sTemp, sHealthy, sHours, sRealloc, sPending] = await Promise.all([
+      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe] = await Promise.all([
         api.seriesMulti({ host: hostId, metric: 'disk_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_write_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_read_ops', from, to, splitBy: 'device', signal: ac.signal }),
@@ -89,7 +96,12 @@
         api.seriesMulti({ host: hostId, metric: 'smart_healthy', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_power_on_hours', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_realloc_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal })
+        api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_data_written_bytes', from, to, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_data_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
       loadedStep = r.step_sec;
@@ -119,7 +131,7 @@
 
       const byDev: Record<string, SmartRow> = {};
       const ensureDev = (d: string): SmartRow => {
-        if (!byDev[d]) byDev[d] = { device: d, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null };
+        if (!byDev[d]) byDev[d] = { device: d, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null, written: null, read: null, percentUsed: null, mediaErrors: null, unsafeShutdowns: null };
         return byDev[d];
       };
       for (const e of sHealthy.series) {
@@ -148,8 +160,37 @@
         const v = e.points.at(-1)?.v;
         if (v !== undefined) ensureDev(d).tempC = v;
       }
+      for (const e of sWritten.series) {
+        const d = e.labels.device;
+        if (!d) continue;
+        const v = e.points.at(-1)?.v;
+        if (v !== undefined) ensureDev(d).written = v;
+      }
+      for (const e of sRead.series) {
+        const d = e.labels.device;
+        if (!d) continue;
+        const v = e.points.at(-1)?.v;
+        if (v !== undefined) ensureDev(d).read = v;
+      }
+      for (const e of sUsed.series) {
+        const d = e.labels.device;
+        if (!d) continue;
+        ensureDev(d).percentUsed = e.points.at(-1)?.v ?? null;
+      }
+      for (const e of sMedia.series) {
+        const d = e.labels.device;
+        if (!d) continue;
+        ensureDev(d).mediaErrors = e.points.at(-1)?.v ?? null;
+      }
+      for (const e of sUnsafe.series) {
+        const d = e.labels.device;
+        if (!d) continue;
+        ensureDev(d).unsafeShutdowns = e.points.at(-1)?.v ?? null;
+      }
       smart = Object.values(byDev).sort((a, b) => a.device.localeCompare(b.device));
       smartTemps = sTemp.series;
+      smartWritten = sWritten.series;
+      smartRead = sRead.series;
 
       loading = false;
       masking = false;
@@ -171,6 +212,8 @@
       readOps = [];
       writeOps = [];
       smartTemps = [];
+      smartWritten = [];
+      smartRead = [];
     }
     prevRange = current;
   });
@@ -310,6 +353,17 @@
           {/if}
         </div>
       </section>
+    {:else if smartStatus?.state === 'read_failed'}
+      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
+        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
+        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
+          <p>Devices were detected, but the agent could not read SMART data from them.</p>
+          <p class="text-amber-100/70 text-xs">On Linux this usually affects NVMe drives: <span class="font-mono">smartctl</span> reads them via <span class="font-mono">NVME_IOCTL_ADMIN_CMD</span>, which the kernel gates behind <span class="font-mono">CAP_SYS_ADMIN</span>. The agent's <span class="font-mono">CAP_SYS_RAWIO</span> covers SATA/SAS only. Re-run the installer with <span class="font-mono">--enable-smart-nvme</span> (<span class="font-mono">SM_ENABLE_SMART_NVME=1</span>) to additionally grant it. On Windows, install the agent as the Admin service.</p>
+          {#if smartStatus.message}
+            <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
+          {/if}
+        </div>
+      </section>
     {:else}
       <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
         <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
@@ -322,6 +376,11 @@
   {/if}
 
   {#if smart.length > 0}
+    {#if smartStatus?.state === 'read_failed'}
+      <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-2.5 text-xs text-amber-100/80">
+        Some devices were detected but could not be read{smartStatus.message ? ` — ${smartStatus.message}` : ''}. On Linux this usually means an NVMe drive that needs <span class="font-mono">CAP_SYS_ADMIN</span> (re-run the installer with <span class="font-mono">--enable-smart-nvme</span>).
+      </div>
+    {/if}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">SMART health</header>
       <div class="overflow-x-auto">
@@ -332,6 +391,11 @@
               <th class="text-left font-medium px-3 py-2.5">Status</th>
               <th class="text-right font-medium px-3 py-2.5">Temp</th>
               <th class="text-right font-medium px-3 py-2.5">Power on</th>
+              <th class="text-right font-medium px-3 py-2.5">Written</th>
+              <th class="text-right font-medium px-3 py-2.5">Read</th>
+              <th class="text-right font-medium px-3 py-2.5">Used</th>
+              <th class="text-right font-medium px-3 py-2.5">Media err</th>
+              <th class="text-right font-medium px-3 py-2.5">Unsafe</th>
               <th class="text-right font-medium px-3 py-2.5">Realloc</th>
               <th class="text-right font-medium px-5 py-2.5">Pending</th>
             </tr>
@@ -351,6 +415,11 @@
                 </td>
                 <td class="px-3 py-2 text-right numeric text-zinc-300">{row.tempC !== null ? `${row.tempC.toFixed(0)} °C` : '—'}</td>
                 <td class="px-3 py-2 text-right numeric text-zinc-400">{row.powerOnHours !== null ? dur(row.powerOnHours * 3600) : '—'}</td>
+                <td class="px-3 py-2 text-right numeric text-zinc-300">{row.written !== null ? bytes(row.written) : '—'}</td>
+                <td class="px-3 py-2 text-right numeric text-zinc-400">{row.read !== null ? bytes(row.read) : '—'}</td>
+                <td class="px-3 py-2 text-right numeric {row.percentUsed !== null && row.percentUsed > 90 ? 'text-rose-300' : row.percentUsed !== null && row.percentUsed > 80 ? 'text-amber-300' : 'text-zinc-400'}">{row.percentUsed !== null ? pct(row.percentUsed, 0) : '—'}</td>
+                <td class="px-3 py-2 text-right numeric {row.mediaErrors !== null && row.mediaErrors > 0 ? 'text-rose-300' : 'text-zinc-400'}">{row.mediaErrors ?? '—'}</td>
+                <td class="px-3 py-2 text-right numeric text-zinc-400">{row.unsafeShutdowns ?? '—'}</td>
                 <td class="px-3 py-2 text-right numeric {row.realloc !== null && row.realloc > 0 ? 'text-amber-300' : 'text-zinc-400'}">{row.realloc ?? '—'}</td>
                 <td class="px-5 py-2 text-right numeric {row.pending !== null && row.pending > 0 ? 'text-rose-300' : 'text-zinc-400'}">{row.pending ?? '—'}</td>
               </tr>
@@ -368,6 +437,30 @@
         </header>
         <div class="px-3 py-3">
           <MultiChart series={toSeries(smartTemps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} />
+        </div>
+      </section>
+    {/if}
+
+    {#if smartWritten.length > 0}
+      <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+        <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+          <div class="text-xs uppercase tracking-wider text-zinc-500">Data written</div>
+          <DownloadCsv host={hostId} metric="smart_data_written_bytes" splitBy="device" {range} />
+        </header>
+        <div class="px-3 py-3">
+          <MultiChart series={toSeries(smartWritten)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v) => bytes(v)} />
+        </div>
+      </section>
+    {/if}
+
+    {#if smartRead.length > 0}
+      <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+        <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+          <div class="text-xs uppercase tracking-wider text-zinc-500">Data read</div>
+          <DownloadCsv host={hostId} metric="smart_data_read_bytes" splitBy="device" {range} />
+        </header>
+        <div class="px-3 py-3">
+          <MultiChart series={toSeries(smartRead)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v) => bytes(v)} />
         </div>
       </section>
     {/if}

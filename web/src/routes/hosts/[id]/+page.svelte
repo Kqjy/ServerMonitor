@@ -8,6 +8,7 @@
   import StatusDot from '$lib/components/StatusDot.svelte';
   import Tabs from '$lib/components/Tabs.svelte';
   import EditHostDialog from '$lib/components/EditHostDialog.svelte';
+  import ReconfigureDialog from '$lib/components/ReconfigureDialog.svelte';
   import CustomRangePicker from '$lib/components/CustomRangePicker.svelte';
   import OverviewTab from '$lib/components/host/OverviewTab.svelte';
   import MemoryTab from '$lib/components/host/MemoryTab.svelte';
@@ -30,6 +31,7 @@
   let range = $state<Range>(loadRange($page.url.searchParams));
   let timer: ReturnType<typeof setInterval> | null = null;
   let editing = $state(false);
+  let reconfiguring = $state(false);
   let pickerOpen = $state(false);
   let upgradeBusy = $state(false);
   let upgradeError = $state<string | null>(null);
@@ -262,6 +264,18 @@
         {/if}
         <button
           type="button"
+          aria-label="Reconfigure agent"
+          title="Reconfigure agent capabilities"
+          onclick={() => (reconfiguring = true)}
+          class="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-md text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/40 transition-colors shrink-0"
+        >
+          <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
+          </svg>
+          <span class="hidden sm:inline">Reconfigure</span>
+        </button>
+        <button
+          type="button"
           aria-label="Edit host"
           title="Edit hostname and interval"
           onclick={() => (editing = true)}
@@ -297,6 +311,10 @@
         onclose={() => (editing = false)}
         onsaved={async () => { editing = false; await refresh(); }}
       />
+    {/if}
+
+    {#if reconfiguring}
+      <ReconfigureDialog host={host} onclose={() => (reconfiguring = false)} />
     {/if}
   {/if}
 </div>
