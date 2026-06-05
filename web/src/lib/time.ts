@@ -135,13 +135,21 @@ export function savePresetWin(key: string, value: string): void {
 
 const stepBuckets = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
 
+const rollupMinRangeMs = 12 * 60 * 60 * 1000;
+const caStepMin = 300;
+
 export function chooseStepSec(durationMs: number, intervalS: number): number {
   if (!(intervalS > 0)) intervalS = 10;
   let raw = Math.floor(durationMs / 1000 / 720);
   if (raw < intervalS) raw = intervalS;
+  let step = stepBuckets[stepBuckets.length - 1];
   for (const b of stepBuckets) {
-    if (b >= raw) return b;
+    if (b >= raw) {
+      step = b;
+      break;
+    }
   }
-  return stepBuckets[stepBuckets.length - 1];
+  if (durationMs >= rollupMinRangeMs && step < caStepMin) step = caStepMin;
+  return step;
 }
 

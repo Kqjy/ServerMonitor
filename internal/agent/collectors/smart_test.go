@@ -117,6 +117,27 @@ func TestDeviceLabel(t *testing.T) {
 	}
 }
 
+func TestSmartReadArgs(t *testing.T) {
+	cases := []struct {
+		dev  smartDevice
+		want string
+	}{
+		{smartDevice{name: "/dev/sda", devType: "scsi"}, "-a --json=c /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: "ata"}, "-a --json=c /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: ""}, "-a --json=c /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: "sat"}, "-a --json=c -d sat /dev/sda"},
+		{smartDevice{name: "/dev/nvme0", devType: "nvme"}, "-a --json=c -d nvme /dev/nvme0"},
+		{smartDevice{name: "/dev/sdb", devType: "nvme"}, "-a --json=c -d nvme /dev/sdb"},
+		{smartDevice{name: "/dev/bus/0", devType: "megaraid,0"}, "-a --json=c -d megaraid,0 /dev/bus/0"},
+		{smartDevice{name: "/dev/bus/0", devType: "sat+megaraid,7"}, "-a --json=c -d sat+megaraid,7 /dev/bus/0"},
+	}
+	for _, tc := range cases {
+		if got := strings.Join(smartReadArgs(tc.dev), " "); got != tc.want {
+			t.Errorf("smartReadArgs(%+v) = %q, want %q", tc.dev, got, tc.want)
+		}
+	}
+}
+
 func TestSmartPointsNVMe(t *testing.T) {
 	const body = `{
 		"temperature": {"current": 52},

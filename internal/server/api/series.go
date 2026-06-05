@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/storage"
@@ -43,7 +46,81 @@ type multiSeriesResp struct {
 	Series  []seriesEntry `json:"series"`
 }
 
-const caStepMin = 300
+type bucketAcc struct {
+	sum float64
+	n   int64
+}
+
+type labelGroup struct {
+	labels  map[string]string
+	buckets map[int64]*bucketAcc
+}
+
+const (
+	caStepMin      = 300
+	rollupMinRange = 12 * time.Hour
+	rollupLiveTail = 15 * time.Minute
+)
+
+func rollupBoundary(now, from, to time.Time, step *int) time.Time {
+	if to.Sub(from) < rollupMinRange {
+		return time.Time{}
+	}
+	if *step < caStepMin {
+		*step = caStepMin
+	}
+	b := now.Add(-rollupLiveTail).Unix()
+	b -= b % int64(*step)
+	return time.Unix(b, 0).UTC()
+}
+
+func coldRawClamp(from, rawAvail, coldCutoff, rawStart time.Time) (time.Time, time.Time, bool) {
+	lo := from
+	if lo.Before(rawAvail) {
+		lo = rawAvail
+	}
+	hi := coldCutoff
+	if hi.After(rawStart) {
+		hi = rawStart
+	}
+	return lo, hi, hi.After(lo)
+}
+
+func coldRawGaps(lo, hi time.Time, covered []archive.Interval) [][2]time.Time {
+	step := time.Duration(caStepMin) * time.Second
+	gaps := [][2]time.Time{}
+	cursor := lo
+	for _, c := range covered {
+		gapHi := c.From
+		if gapHi.After(hi) {
+			gapHi = hi
+		}
+		if gapHi.After(cursor) {
+			gaps = append(gaps, [2]time.Time{cursor, gapHi})
+		}
+		if covEnd := c.To.Add(step); covEnd.After(cursor) {
+			cursor = covEnd
+		}
+	}
+	if hi.After(cursor) {
+		gaps = append(gaps, [2]time.Time{cursor, hi})
+	}
+	return gaps
+}
+
+func queryRows(ctx context.Context, db *storage.DB, sql string, args []any, scan func(pgx.Rows) error) error {
+	rows, err := db.Pool.Query(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
 
 func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, ret RetentionConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -104,8 +181,90 @@ func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, r
 		}
 
 		coldCutoff := now.Add(-coldRetention)
-		rawCutoff := now.Add(-rawRetention)
-		out := make([]seriesPoint, 0, 600)
+		rawAvail := now.Add(-rawRetention)
+		rawStart := rawAvail
+		if b := rollupBoundary(now, from, to, &step); b.After(rawStart) {
+			rawStart = b
+		}
+		acc := map[int64]*bucketAcc{}
+		add := func(t time.Time, sum float64, n int64) {
+			k := t.Unix()
+			a := acc[k]
+			if a == nil {
+				a = &bucketAcc{}
+				acc[k] = a
+			}
+			a.sum += sum
+			a.n += n
+		}
+		coldStep := step
+		if coldStep < caStepMin {
+			coldStep = caStepMin
+		}
+		addSlot := func(slot time.Time, v float64) {
+			bucket := (slot.Unix() / int64(coldStep)) * int64(coldStep)
+			add(time.Unix(bucket, 0).UTC(), v, 1)
+		}
+
+		readRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT time_bucket($1::interval, time) AS bucket, sum(value), count(*)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
+				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+				GROUP BY bucket
+				ORDER BY bucket ASC
+			`, []any{intervalString(step), hostID, int16(metricID), lo, hi, labelArg}, func(rows pgx.Rows) error {
+				var (
+					t   time.Time
+					sum float64
+					n   int64
+				)
+				if err := rows.Scan(&t, &sum, &n); err != nil {
+					return err
+				}
+				add(t, sum, n)
+				return nil
+			})
+		}
+		readColdRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT time_bucket($1::interval, time) AS slot, avg(value)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
+				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+				GROUP BY slot
+				ORDER BY slot ASC
+			`, []any{intervalString(caStepMin), hostID, int16(metricID), lo, hi, labelArg}, func(rows pgx.Rows) error {
+				var (
+					t time.Time
+					v float64
+				)
+				if err := rows.Scan(&t, &v); err != nil {
+					return err
+				}
+				addSlot(t, v)
+				return nil
+			})
+		}
+
+		var coldCovered []archive.Interval
+		if ar != nil && from.Before(coldCutoff) && rawAvail.Before(coldCutoff) {
+			covered, err := ar.CoverageIntervals(r.Context(), hostID, from, coldCutoff)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "archive coverage failed: "+err.Error())
+				return
+			}
+			coldCovered = covered
+		}
+		if lo, hi, ok := coldRawClamp(from, rawAvail, coldCutoff, rawStart); ok {
+			for _, g := range coldRawGaps(lo, hi, coldCovered) {
+				if err := readColdRaw(g[0], g[1]); err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+		}
 
 		if ar != nil && from.Before(coldCutoff) {
 			coldTo := to
@@ -117,34 +276,8 @@ func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, r
 				writeError(w, http.StatusInternalServerError, "archive read failed: "+err.Error())
 				return
 			}
-			coldStep := step
-			if coldStep < caStepMin {
-				coldStep = caStepMin
-			}
-			type coldAcc struct {
-				sum float64
-				n   int
-			}
-			agg := map[int64]*coldAcc{}
 			for _, rec := range recs {
-				t := time.UnixMicro(rec.Bucket)
-				bucket := (t.Unix() / int64(coldStep)) * int64(coldStep)
-				a, ok := agg[bucket]
-				if !ok {
-					a = &coldAcc{}
-					agg[bucket] = a
-				}
-				a.sum += rec.Avg
-				a.n++
-			}
-			buckets := make([]int64, 0, len(agg))
-			for b := range agg {
-				buckets = append(buckets, b)
-			}
-			sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
-			for _, b := range buckets {
-				a := agg[b]
-				out = append(out, seriesPoint{Ts: time.Unix(b, 0).UTC(), V: a.sum / float64(a.n)})
+				addSlot(time.UnixMicro(rec.Bucket), rec.Avg)
 			}
 		}
 
@@ -153,81 +286,55 @@ func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, r
 			caFrom = coldCutoff
 		}
 		caTo := to
-		if caTo.After(rawCutoff) {
-			caTo = rawCutoff
+		if caTo.After(rawStart) {
+			caTo = rawStart
 		}
 		if caTo.After(caFrom) {
 			caStep := step
 			if caStep < caStepMin {
 				caStep = caStepMin
 			}
-			rows, err := db.Pool.Query(r.Context(), `
-				SELECT time_bucket($1::interval, bucket) AS b, avg(avg)
+			err := queryRows(r.Context(), db, `
+				SELECT time_bucket($1::interval, bucket) AS b, sum(avg), count(*)
 				FROM metric_points_5m
 				WHERE host_id = $2 AND metric = $3 AND bucket >= $4 AND bucket < $5
 				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
 				GROUP BY b
 				ORDER BY b ASC
-			`, intervalString(caStep), hostID, int16(metricID), caFrom, caTo, labelArg)
+			`, []any{intervalString(caStep), hostID, int16(metricID), caFrom, caTo, labelArg}, func(rows pgx.Rows) error {
+				var (
+					t   time.Time
+					sum float64
+					n   int64
+				)
+				if err := rows.Scan(&t, &sum, &n); err != nil {
+					return err
+				}
+				add(t, sum, n)
+				return nil
+			})
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			for rows.Next() {
-				var (
-					t time.Time
-					v float64
-				)
-				if err := rows.Scan(&t, &v); err != nil {
-					rows.Close()
-					writeError(w, http.StatusInternalServerError, err.Error())
-					return
-				}
-				out = append(out, seriesPoint{Ts: t, V: v})
-			}
-			rowsErr := rows.Err()
-			rows.Close()
-			if rowsErr != nil {
-				writeError(w, http.StatusInternalServerError, rowsErr.Error())
 				return
 			}
 		}
 
 		rawFrom := from
-		if rawFrom.Before(rawCutoff) {
-			rawFrom = rawCutoff
+		if rawFrom.Before(rawStart) {
+			rawFrom = rawStart
 		}
 		if to.After(rawFrom) {
-			rows, err := db.Pool.Query(r.Context(), `
-				SELECT time_bucket($1::interval, time) AS bucket, avg(value)
-				FROM metric_points
-				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
-				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
-				GROUP BY bucket
-				ORDER BY bucket ASC
-			`, intervalString(step), hostID, int16(metricID), rawFrom, to, labelArg)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer rows.Close()
-
-			for rows.Next() {
-				var (
-					t time.Time
-					v float64
-				)
-				if err := rows.Scan(&t, &v); err != nil {
-					writeError(w, http.StatusInternalServerError, err.Error())
-					return
-				}
-				out = append(out, seriesPoint{Ts: t, V: v})
-			}
-			if err := rows.Err(); err != nil {
+			if err := readRaw(rawFrom, to); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
+
+		out := make([]seriesPoint, 0, len(acc))
+		for k, a := range acc {
+			out = append(out, seriesPoint{Ts: time.Unix(k, 0).UTC(), V: a.sum / float64(a.n)})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Ts.Before(out[j].Ts) })
 
 		if strings.EqualFold(q.Get("format"), "csv") {
 			writeSeriesCSV(w, host.Hostname, metricName, metricID.Meta().Unit, out)
@@ -292,22 +399,101 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 		}
 
 		coldCutoff := now.Add(-coldRetention)
-		rawCutoff := now.Add(-rawRetention)
-		grouped := map[string]*seriesEntry{}
+		rawAvail := now.Add(-rawRetention)
+		rawStart := rawAvail
+		if b := rollupBoundary(now, from, to, &step); b.After(rawStart) {
+			rawStart = b
+		}
+		groups := map[string]*labelGroup{}
 		order := []string{}
-		ingest := func(labels map[string]string, t time.Time, v float64) {
+		add := func(labels map[string]string, t time.Time, sum float64, n int64) {
 			key := splitKey(labels, splitBy)
-			entry, ok := grouped[key]
+			g, ok := groups[key]
 			if !ok {
 				entryLabels := labels
 				if splitBy != "" {
 					entryLabels = map[string]string{splitBy: labels[splitBy]}
 				}
-				entry = &seriesEntry{Labels: entryLabels}
-				grouped[key] = entry
+				g = &labelGroup{labels: entryLabels, buckets: map[int64]*bucketAcc{}}
+				groups[key] = g
 				order = append(order, key)
 			}
-			entry.Points = append(entry.Points, seriesPoint{Ts: t, V: v})
+			k := t.Unix()
+			a := g.buckets[k]
+			if a == nil {
+				a = &bucketAcc{}
+				g.buckets[k] = a
+			}
+			a.sum += sum
+			a.n += n
+		}
+		coldStep := step
+		if coldStep < caStepMin {
+			coldStep = caStepMin
+		}
+		addSlot := func(labels map[string]string, slot time.Time, v float64) {
+			bucket := (slot.Unix() / int64(coldStep)) * int64(coldStep)
+			add(labels, time.Unix(bucket, 0).UTC(), v, 1)
+		}
+
+		readRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT labels, time_bucket($1::interval, time) AS bucket, sum(value), count(*)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
+				GROUP BY labels, bucket
+				ORDER BY labels, bucket ASC
+			`, []any{intervalString(step), hostID, int16(metricID), lo, hi}, func(rows pgx.Rows) error {
+				var (
+					labels map[string]string
+					t      time.Time
+					sum    float64
+					n      int64
+				)
+				if err := rows.Scan(&labels, &t, &sum, &n); err != nil {
+					return err
+				}
+				add(labels, t, sum, n)
+				return nil
+			})
+		}
+		readColdRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT labels, time_bucket($1::interval, time) AS slot, avg(value)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
+				GROUP BY labels, slot
+				ORDER BY labels, slot ASC
+			`, []any{intervalString(caStepMin), hostID, int16(metricID), lo, hi}, func(rows pgx.Rows) error {
+				var (
+					labels map[string]string
+					t      time.Time
+					v      float64
+				)
+				if err := rows.Scan(&labels, &t, &v); err != nil {
+					return err
+				}
+				addSlot(labels, t, v)
+				return nil
+			})
+		}
+
+		var coldCovered []archive.Interval
+		if ar != nil && from.Before(coldCutoff) && rawAvail.Before(coldCutoff) {
+			covered, err := ar.CoverageIntervals(r.Context(), hostID, from, coldCutoff)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "archive coverage failed: "+err.Error())
+				return
+			}
+			coldCovered = covered
+		}
+		if lo, hi, ok := coldRawClamp(from, rawAvail, coldCutoff, rawStart); ok {
+			for _, g := range coldRawGaps(lo, hi, coldCovered) {
+				if err := readColdRaw(g[0], g[1]); err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
 		}
 
 		if ar != nil && from.Before(coldCutoff) {
@@ -320,21 +506,6 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 				writeError(w, http.StatusInternalServerError, "archive read failed: "+err.Error())
 				return
 			}
-			coldStep := step
-			if coldStep < caStepMin {
-				coldStep = caStepMin
-			}
-			type coldKey struct {
-				labelKey string
-				bucket   int64
-			}
-			type coldAcc struct {
-				sum    float64
-				n      int
-				labels map[string]string
-			}
-			agg := map[coldKey]*coldAcc{}
-			order := []coldKey{}
 			for _, rec := range recs {
 				var labels map[string]string
 				if rec.Labels != "" {
@@ -342,27 +513,7 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 						continue
 					}
 				}
-				t := time.UnixMicro(rec.Bucket)
-				bucket := (t.Unix() / int64(coldStep)) * int64(coldStep)
-				k := coldKey{labelKey: splitKey(labels, splitBy), bucket: bucket}
-				a, ok := agg[k]
-				if !ok {
-					a = &coldAcc{labels: labels}
-					agg[k] = a
-					order = append(order, k)
-				}
-				a.sum += rec.Avg
-				a.n++
-			}
-			sort.Slice(order, func(i, j int) bool {
-				if order[i].labelKey != order[j].labelKey {
-					return order[i].labelKey < order[j].labelKey
-				}
-				return order[i].bucket < order[j].bucket
-			})
-			for _, k := range order {
-				a := agg[k]
-				ingest(a.labels, time.Unix(k.bucket, 0).UTC(), a.sum/float64(a.n))
+				addSlot(labels, time.UnixMicro(rec.Bucket), rec.Avg)
 			}
 		}
 
@@ -371,85 +522,59 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 			caFrom = coldCutoff
 		}
 		caTo := to
-		if caTo.After(rawCutoff) {
-			caTo = rawCutoff
+		if caTo.After(rawStart) {
+			caTo = rawStart
 		}
 		if caTo.After(caFrom) {
 			caStep := step
 			if caStep < caStepMin {
 				caStep = caStepMin
 			}
-			rows, err := db.Pool.Query(r.Context(), `
-				SELECT labels, time_bucket($1::interval, bucket) AS b, avg(avg)
+			err := queryRows(r.Context(), db, `
+				SELECT labels, time_bucket($1::interval, bucket) AS b, sum(avg), count(*)
 				FROM metric_points_5m
 				WHERE host_id = $2 AND metric = $3 AND bucket >= $4 AND bucket < $5
 				GROUP BY labels, b
 				ORDER BY labels, b ASC
-			`, intervalString(caStep), hostID, int16(metricID), caFrom, caTo)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			for rows.Next() {
+			`, []any{intervalString(caStep), hostID, int16(metricID), caFrom, caTo}, func(rows pgx.Rows) error {
 				var (
 					labels map[string]string
 					t      time.Time
-					v      float64
+					sum    float64
+					n      int64
 				)
-				if err := rows.Scan(&labels, &t, &v); err != nil {
-					rows.Close()
-					writeError(w, http.StatusInternalServerError, err.Error())
-					return
+				if err := rows.Scan(&labels, &t, &sum, &n); err != nil {
+					return err
 				}
-				ingest(labels, t, v)
-			}
-			rowsErr := rows.Err()
-			rows.Close()
-			if rowsErr != nil {
-				writeError(w, http.StatusInternalServerError, rowsErr.Error())
+				add(labels, t, sum, n)
+				return nil
+			})
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
 
 		rawFrom := from
-		if rawFrom.Before(rawCutoff) {
-			rawFrom = rawCutoff
+		if rawFrom.Before(rawStart) {
+			rawFrom = rawStart
 		}
 		if to.After(rawFrom) {
-			rows, err := db.Pool.Query(r.Context(), `
-				SELECT labels, time_bucket($1::interval, time) AS bucket, avg(value)
-				FROM metric_points
-				WHERE host_id = $2 AND metric = $3 AND time >= $4 AND time < $5
-				GROUP BY labels, bucket
-				ORDER BY labels, bucket ASC
-			`, intervalString(step), hostID, int16(metricID), rawFrom, to)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer rows.Close()
-
-			for rows.Next() {
-				var (
-					labels map[string]string
-					t      time.Time
-					v      float64
-				)
-				if err := rows.Scan(&labels, &t, &v); err != nil {
-					writeError(w, http.StatusInternalServerError, err.Error())
-					return
-				}
-				ingest(labels, t, v)
-			}
-			if err := rows.Err(); err != nil {
+			if err := readRaw(rawFrom, to); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
 
 		series := make([]seriesEntry, 0, len(order))
-		for _, k := range order {
-			series = append(series, *grouped[k])
+		for _, key := range order {
+			g := groups[key]
+			pts := make([]seriesPoint, 0, len(g.buckets))
+			for k, a := range g.buckets {
+				pts = append(pts, seriesPoint{Ts: time.Unix(k, 0).UTC(), V: a.sum / float64(a.n)})
+			}
+			sort.Slice(pts, func(i, j int) bool { return pts[i].Ts.Before(pts[j].Ts) })
+			series = append(series, seriesEntry{Labels: g.labels, Points: pts})
 		}
 
 		if strings.EqualFold(q.Get("format"), "csv") {
@@ -476,6 +601,40 @@ type batchSeriesResp struct {
 	Unit    string                      `json:"unit"`
 	StepSec int                         `json:"step_sec"`
 	Hosts   map[string]batchSeriesEntry `json:"hosts"`
+}
+
+type hostBucketKey struct {
+	host   int64
+	bucket int64
+}
+
+type batchBucket struct {
+	sum float64
+	n   int64
+	max float64
+	has bool
+}
+
+func (a *batchBucket) addAvg(sum float64, n int64) {
+	a.sum += sum
+	a.n += n
+}
+
+func (a *batchBucket) addMax(v float64) {
+	if !a.has || v > a.max {
+		a.max = v
+		a.has = true
+	}
+}
+
+func (a *batchBucket) value(aggMax bool) float64 {
+	if aggMax {
+		return a.max
+	}
+	if a.n > 0 {
+		return a.sum / float64(a.n)
+	}
+	return 0
 }
 
 const batchSeriesMaxHosts = 200
@@ -565,11 +724,6 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 			writeError(w, http.StatusBadRequest, "to must be after from")
 			return
 		}
-		if ret.RawCutoff > 0 {
-			if rawCutoff := now.Add(-ret.RawCutoff); from.Before(rawCutoff) {
-				from = rawCutoff
-			}
-		}
 
 		step, _ := strconv.Atoi(q.Get("step"))
 		if step <= 0 {
@@ -578,49 +732,156 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 			step = minInterval
 		}
 
-		aggFn := "avg"
-		if strings.EqualFold(q.Get("agg"), "max") {
-			aggFn = "max"
-		}
+		aggMax := strings.EqualFold(q.Get("agg"), "max")
 
 		result := make(map[string]batchSeriesEntry, len(hostIDs))
 		for _, id := range hostIDs {
 			result[strconv.FormatInt(id, 10)] = batchSeriesEntry{Points: []seriesPoint{}}
 		}
 
-		if to.After(from) {
-			rows, err := db.Pool.Query(r.Context(), `
-				SELECT host_id, time_bucket($1::interval, time) AS bucket, `+aggFn+`(value)
+		rawAgg, caAgg := "sum(value), count(*)", "sum(avg), count(*)"
+		if aggMax {
+			rawAgg, caAgg = "max(value)", "max(max)"
+		}
+		acc := map[hostBucketKey]*batchBucket{}
+		bucketFor := func(hostID int64, t time.Time) *batchBucket {
+			k := hostBucketKey{host: hostID, bucket: t.Unix()}
+			a := acc[k]
+			if a == nil {
+				a = &batchBucket{}
+				acc[k] = a
+			}
+			return a
+		}
+		addRow := func(rows pgx.Rows) error {
+			var (
+				hostID int64
+				t      time.Time
+			)
+			if aggMax {
+				var v float64
+				if err := rows.Scan(&hostID, &t, &v); err != nil {
+					return err
+				}
+				bucketFor(hostID, t).addMax(v)
+				return nil
+			}
+			var (
+				sum float64
+				n   int64
+			)
+			if err := rows.Scan(&hostID, &t, &sum, &n); err != nil {
+				return err
+			}
+			bucketFor(hostID, t).addAvg(sum, n)
+			return nil
+		}
+
+		rawAvail := now.Add(-ret.RawCutoff)
+		if ret.RawCutoff <= 0 {
+			rawAvail = from
+		}
+		rawStart := rawAvail
+		if b := rollupBoundary(now, from, to, &step); b.After(rawStart) {
+			rawStart = b
+		}
+		caStep := step
+		if caStep < caStepMin {
+			caStep = caStepMin
+		}
+
+		readRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT host_id, time_bucket($1::interval, time) AS bucket, `+rawAgg+`
 				FROM metric_points
 				WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
 				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
 				GROUP BY host_id, bucket
 				ORDER BY host_id, bucket ASC
-			`, intervalString(step), hostIDs, int16(metricID), from, to, labelArg)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer rows.Close()
-			for rows.Next() {
+			`, []any{intervalString(step), hostIDs, int16(metricID), lo, hi, labelArg}, addRow)
+		}
+		readColdRawAvg := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT host_id, time_bucket($1::interval, time) AS slot, avg(value)
+				FROM metric_points
+				WHERE host_id = ANY($2) AND metric = $3 AND time >= $4 AND time < $5
+				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+				GROUP BY host_id, slot
+				ORDER BY host_id, slot ASC
+			`, []any{intervalString(caStepMin), hostIDs, int16(metricID), lo, hi, labelArg}, func(rows pgx.Rows) error {
 				var (
 					hostID int64
 					t      time.Time
 					v      float64
 				)
 				if err := rows.Scan(&hostID, &t, &v); err != nil {
+					return err
+				}
+				bucket := (t.Unix() / int64(caStep)) * int64(caStep)
+				bucketFor(hostID, time.Unix(bucket, 0).UTC()).addAvg(v, 1)
+				return nil
+			})
+		}
+
+		caFrom := from
+		var coldCutoff time.Time
+		if ret.Aggregate5mCutoff > 0 {
+			coldCutoff = now.Add(-ret.Aggregate5mCutoff)
+			if caFrom.Before(coldCutoff) {
+				caFrom = coldCutoff
+			}
+		}
+		if !coldCutoff.IsZero() {
+			if lo, hi, ok := coldRawClamp(from, rawAvail, coldCutoff, rawStart); ok {
+				readCold := readColdRawAvg
+				if aggMax {
+					readCold = readRaw
+				}
+				if err := readCold(lo, hi); err != nil {
 					writeError(w, http.StatusInternalServerError, err.Error())
 					return
 				}
-				key := strconv.FormatInt(hostID, 10)
-				entry := result[key]
-				entry.Points = append(entry.Points, seriesPoint{Ts: t, V: v})
-				result[key] = entry
 			}
-			if err := rows.Err(); err != nil {
+		}
+		caTo := to
+		if caTo.After(rawStart) {
+			caTo = rawStart
+		}
+		if caTo.After(caFrom) {
+			err := queryRows(r.Context(), db, `
+				SELECT host_id, time_bucket($1::interval, bucket) AS b, `+caAgg+`
+				FROM metric_points_5m
+				WHERE host_id = ANY($2) AND metric = $3 AND bucket >= $4 AND bucket < $5
+				  AND ($6::jsonb = '{}'::jsonb OR labels @> $6::jsonb)
+				GROUP BY host_id, b
+				ORDER BY host_id, b ASC
+			`, []any{intervalString(caStep), hostIDs, int16(metricID), caFrom, caTo, labelArg}, addRow)
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+		}
+
+		rawFrom := from
+		if rawFrom.Before(rawStart) {
+			rawFrom = rawStart
+		}
+		if to.After(rawFrom) {
+			if err := readRaw(rawFrom, to); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+
+		for k, a := range acc {
+			key := strconv.FormatInt(k.host, 10)
+			entry := result[key]
+			entry.Points = append(entry.Points, seriesPoint{Ts: time.Unix(k.bucket, 0).UTC(), V: a.value(aggMax)})
+			result[key] = entry
+		}
+		for _, id := range hostIDs {
+			pts := result[strconv.FormatInt(id, 10)].Points
+			sort.Slice(pts, func(i, j int) bool { return pts[i].Ts.Before(pts[j].Ts) })
 		}
 
 		writeJSON(w, http.StatusOK, batchSeriesResp{

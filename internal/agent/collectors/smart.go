@@ -126,6 +126,22 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 	return true
 }
 
+func smartReadArgs(dev smartDevice) []string {
+	args := []string{"-a", "--json=c"}
+	if !smartTypeAutoDetect(dev.devType) {
+		args = append(args, "-d", dev.devType)
+	}
+	return append(args, dev.name)
+}
+
+func smartTypeAutoDetect(scanType string) bool {
+	switch scanType {
+	case "", "scsi", "ata":
+		return true
+	}
+	return false
+}
+
 func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	if !c.ensure(ctx) {
 		return nil, nil
@@ -139,12 +155,7 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 			return out, nil
 		default:
 		}
-		args := []string{"-a", "--json=c"}
-		if dev.devType != "" {
-			args = append(args, "-d", dev.devType)
-		}
-		args = append(args, dev.name)
-		body, _ := run(ctx, c.smartctl, args...)
+		body, _ := run(ctx, c.smartctl, smartReadArgs(dev)...)
 		var s smartView
 		parseErr := json.Unmarshal(body, &s)
 		exitStatus := 0

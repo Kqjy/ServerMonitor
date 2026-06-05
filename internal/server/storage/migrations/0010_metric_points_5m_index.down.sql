@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS metric_points_5m_host_metric_bucket_idx;

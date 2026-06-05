@@ -283,6 +283,32 @@ func (a *Archiver) Read(ctx context.Context, hostID int64, metric int16, from, t
 	return out, nil
 }
 
+type Interval struct {
+	From time.Time
+	To   time.Time
+}
+
+func (a *Archiver) CoverageIntervals(ctx context.Context, hostID int64, from, to time.Time) ([]Interval, error) {
+	rows, err := a.pool.Query(ctx, `
+		SELECT bucket_from, bucket_to FROM archive_manifests
+		WHERE host_id = $1 AND bucket_from < $3 AND bucket_to >= $2
+		ORDER BY bucket_from ASC
+	`, hostID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Interval
+	for rows.Next() {
+		var iv Interval
+		if err := rows.Scan(&iv.From, &iv.To); err != nil {
+			return nil, err
+		}
+		out = append(out, iv)
+	}
+	return out, rows.Err()
+}
+
 func (a *Archiver) readKey(ctx context.Context, key string, hostID int64, metric int16, from, to time.Time, labelSel map[string]string) ([]Record, error) {
 	resp, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(a.cfg.Bucket),

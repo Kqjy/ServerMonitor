@@ -138,6 +138,7 @@ func main() {
 			Bucket:       cfg.S3Bucket,
 			Region:       cfg.S3Region,
 			Prefix:       cfg.S3Prefix,
+			Cutoff:       config.IntervalToDuration(cfg.RetentionAggregate5m),
 			UsePathStyle: cfg.S3UsePathStyle,
 		}, logger)
 		if err != nil {

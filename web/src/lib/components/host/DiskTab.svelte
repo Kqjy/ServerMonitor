@@ -335,11 +335,11 @@
         </div>
       </section>
     {:else if smartStatus?.state === 'binary_missing'}
-      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
-        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
-        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
-          <p><span class="font-mono text-amber-200">smartctl</span> is not installed on this host.</p>
-          <p class="text-amber-100/70 text-xs">Install <span class="font-mono">smartmontools</span> (Linux: <span class="font-mono">apt install smartmontools</span> or equivalent; Windows: smartmontools.org) and restart the agent.</p>
+      <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+        <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">SMART health</header>
+        <div class="px-5 py-4 text-sm text-zinc-300 space-y-1">
+          <p><span class="font-mono text-zinc-400">smartctl</span> is not installed on this host.</p>
+          <p class="text-zinc-500 text-xs">Install <span class="font-mono text-zinc-400">smartmontools</span> (Linux: <span class="font-mono text-zinc-400">apt install smartmontools</span> or equivalent; Windows: smartmontools.org) and restart the agent.</p>
         </div>
       </section>
     {:else if smartStatus?.state === 'scan_failed'}
