@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -220,4 +221,74 @@ func TestTouchUpgradeStateMachine(t *testing.T) {
 			t.Fatalf("a pending request must keep stall+dispatch armed despite auto-off; got stall=%v dispatched=%v", dbStall, dbDisp)
 		}
 	})
+}
+
+func TestRegisterRotatesNeverSeenHostname(t *testing.T) {
+	db := touchTestDB(t)
+	hosts := NewHosts(db)
+	ctx := context.Background()
+	name := fmt.Sprintf("_smtest_register_orphan_%d_%d", os.Getpid(), atomic.AddInt64(&touchHostSeq, 1))
+
+	id, err := hosts.Register(ctx, name, "first-token", 10)
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Pool.Exec(context.Background(), `DELETE FROM hosts WHERE hostname = $1`, name)
+	})
+
+	id2, err := hosts.Register(ctx, name, "second-token", 30)
+	if err != nil {
+		t.Fatalf("re-register never-seen host: %v", err)
+	}
+	if id2 != id {
+		t.Fatalf("re-register created a new row: got id %d, want %d", id2, id)
+	}
+
+	var interval int
+	var hash []byte
+	if err := db.Pool.QueryRow(ctx, `SELECT sample_interval_s, agent_token_hash FROM hosts WHERE id = $1`, id).Scan(&interval, &hash); err != nil {
+		t.Fatalf("read registered host: %v", err)
+	}
+	if interval != 30 {
+		t.Fatalf("re-register of never-seen host did not update interval: got %d, want 30", interval)
+	}
+	if !bytes.Equal(hash, tokenHash("second-token")) {
+		t.Fatalf("re-register of never-seen host did not rotate token to the new value")
+	}
+}
+
+func TestRegisterRejectsDuplicateCheckedInHostname(t *testing.T) {
+	db := touchTestDB(t)
+	hosts := NewHosts(db)
+	ctx := context.Background()
+	name := fmt.Sprintf("_smtest_register_live_%d_%d", os.Getpid(), atomic.AddInt64(&touchHostSeq, 1))
+
+	id, err := hosts.Register(ctx, name, "first-token", 10)
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Pool.Exec(context.Background(), `DELETE FROM hosts WHERE id = $1`, id)
+	})
+
+	if _, err := db.Pool.Exec(ctx, `UPDATE hosts SET last_seen = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("mark host checked in: %v", err)
+	}
+
+	if _, err := hosts.Register(ctx, name, "second-token", 30); err != ErrHostnameTaken {
+		t.Fatalf("duplicate register of checked-in host error = %v, want %v", err, ErrHostnameTaken)
+	}
+
+	var interval int
+	var hash []byte
+	if err := db.Pool.QueryRow(ctx, `SELECT sample_interval_s, agent_token_hash FROM hosts WHERE id = $1`, id).Scan(&interval, &hash); err != nil {
+		t.Fatalf("read registered host: %v", err)
+	}
+	if interval != 10 {
+		t.Fatalf("rejected register overwrote checked-in host interval: got %d, want 10", interval)
+	}
+	if !bytes.Equal(hash, tokenHash("first-token")) {
+		t.Fatalf("rejected register rotated checked-in host token")
+	}
 }

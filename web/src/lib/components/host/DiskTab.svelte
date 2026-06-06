@@ -42,6 +42,7 @@
   let readOps = $state<SeriesEntry[]>([]);
   let writeOps = $state<SeriesEntry[]>([]);
   let fs = $state<{ mount: string; fstype: string; used: number; total: number; pct: number }[]>([]);
+  let fsUsedPct = $state<SeriesEntry[]>([]);
   let smartTemps = $state<SeriesEntry[]>([]);
   let smartWritten = $state<SeriesEntry[]>([]);
   let smartRead = $state<SeriesEntry[]>([]);
@@ -60,7 +61,7 @@
 
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
-      label: e.labels.device ?? Object.values(e.labels).join(' '),
+      label: e.labels.device ?? e.labels.mount ?? Object.values(e.labels).join(' '),
       points: e.points
     }));
   }
@@ -84,7 +85,7 @@
       toMs = b.toMs;
     }
     try {
-      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe] = await Promise.all([
+      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe, fsUsage] = await Promise.all([
         api.seriesMulti({ host: hostId, metric: 'disk_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_write_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_read_ops', from, to, splitBy: 'device', signal: ac.signal }),
@@ -101,7 +102,8 @@
         api.seriesMulti({ host: hostId, metric: 'smart_data_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal })
+        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from, to, splitBy: 'mount', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
       loadedStep = r.step_sec;
@@ -110,6 +112,7 @@
       write = wr.series;
       readOps = rOps.series;
       writeOps = wOps.series;
+      fsUsedPct = fsUsage.series;
 
       const byMount: Record<string, { mount: string; fstype: string; used: number; total: number; pct: number }> = {};
       for (const e of fsTotal.series) {
@@ -211,6 +214,7 @@
       write = [];
       readOps = [];
       writeOps = [];
+      fsUsedPct = [];
       smartTemps = [];
       smartWritten = [];
       smartRead = [];
@@ -287,6 +291,18 @@
       </div>
     </section>
   </div>
+
+  {#if fsUsedPct.length > 0}
+    <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+      <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Filesystem usage</div>
+        <DownloadCsv host={hostId} metric="fs_used_pct" splitBy="mount" {range} />
+      </header>
+      <div class="px-3 py-3">
+        <MultiChart series={toSeries(fsUsedPct)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="%" format={(v) => pct(v, 1)} />
+      </div>
+    </section>
+  {/if}
 
   {#if fs.length > 0}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">

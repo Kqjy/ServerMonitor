@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,13 +23,13 @@ func (c *fsCollector) Platforms() []string { return []string{"all"} }
 
 func (c *fsCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := time.Now()
-	parts, err := disk.PartitionsWithContext(ctx, false)
+	parts, err := disk.PartitionsWithContext(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]wire.Point, 0, len(parts)*5)
 	for _, p := range parts {
-		if skipFSType(p.Fstype) {
+		if skipFSType(p.Fstype) || isBindMount(p.Opts) {
 			continue
 		}
 		u, err := disk.UsageWithContext(ctx, fsUsagePath(c.hostRoot, p.Mountpoint))
@@ -55,13 +56,17 @@ func (c *fsCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 func skipFSType(t string) bool {
 	t = strings.ToLower(t)
 	switch t {
-	case "tmpfs", "devtmpfs", "devfs", "overlay", "squashfs", "iso9660", "autofs",
+	case "tmpfs", "devtmpfs", "devfs", "devpts", "overlay", "squashfs", "iso9660", "autofs",
 		"proc", "sysfs", "cgroup", "cgroup2", "pstore", "binfmt_misc", "debugfs",
-		"securityfs", "tracefs", "configfs", "fusectl", "hugetlbfs", "mqueue",
-		"nsfs", "ramfs", "rpc_pipefs", "bpf":
+		"securityfs", "selinuxfs", "tracefs", "configfs", "fusectl", "hugetlbfs", "mqueue",
+		"nsfs", "ramfs", "rootfs", "efivarfs", "rpc_pipefs", "bpf":
 		return true
 	}
 	return false
+}
+
+func isBindMount(opts []string) bool {
+	return slices.Contains(opts, "bind")
 }
 
 func fsUsagePath(hostRoot, mountpoint string) string {

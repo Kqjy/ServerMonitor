@@ -84,9 +84,13 @@ func (h *Hosts) Register(ctx context.Context, hostname, token string, intervalS 
 		ON CONFLICT (hostname) WHERE deleted_at IS NULL
 		DO UPDATE SET agent_token_hash = EXCLUDED.agent_token_hash,
 		              sample_interval_s = EXCLUDED.sample_interval_s
+		WHERE hosts.last_seen IS NULL
 		RETURNING id
 	`, hostname, hash, intervalS).Scan(&id)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrHostnameTaken
+		}
 		return 0, err
 	}
 	h.invalidate()

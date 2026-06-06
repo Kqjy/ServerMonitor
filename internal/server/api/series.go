@@ -410,11 +410,7 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 			key := splitKey(labels, splitBy)
 			g, ok := groups[key]
 			if !ok {
-				entryLabels := labels
-				if splitBy != "" {
-					entryLabels = map[string]string{splitBy: labels[splitBy]}
-				}
-				g = &labelGroup{labels: entryLabels, buckets: map[int64]*bucketAcc{}}
+				g = &labelGroup{labels: labels, buckets: map[int64]*bucketAcc{}}
 				groups[key] = g
 				order = append(order, key)
 			}

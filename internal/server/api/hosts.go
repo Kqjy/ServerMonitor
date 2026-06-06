@@ -316,6 +316,10 @@ func registerHostHandler(hosts *storage.Hosts, signer *agentsig.Signer) http.Han
 		}
 		id, err := hosts.Register(r.Context(), req.Hostname, token, interval)
 		if err != nil {
+			if errors.Is(err, storage.ErrHostnameTaken) {
+				writeError(w, http.StatusConflict, "another live host already uses that hostname")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

@@ -53,6 +53,8 @@ type ControlUpdate struct {
 
 var ErrDeregistered = errors.New("host deregistered by server")
 
+var errUnexpectedRedirect = errors.New("server responded with a redirect; set the agent server URL to the redirect's final destination so ingest POSTs are not silently downgraded to GET")
+
 func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger *slog.Logger, sp *spool.Spool) *Client {
 	t := &http.Transport{
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkip},
@@ -61,15 +63,23 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 		ResponseHeaderTimeout: timeout,
 	}
 	return &Client{
-		baseURL:        baseURL,
-		token:          token,
-		http:           &http.Client{Timeout: timeout, Transport: t},
+		baseURL: baseURL,
+		token:   token,
+		http: &http.Client{
+			Timeout:       timeout,
+			Transport:     t,
+			CheckRedirect: refuseRedirect,
+		},
 		logger:         logger,
 		spool:          sp,
 		deregisteredCh: make(chan struct{}),
 		intervalCh:     make(chan int, 1),
 		controlCh:      make(chan ControlUpdate, 1),
 	}
+}
+
+func refuseRedirect(req *http.Request, via []*http.Request) error {
+	return fmt.Errorf("%w (redirect target %s)", errUnexpectedRedirect, req.URL)
 }
 
 func (c *Client) ControlUpdates() <-chan ControlUpdate {
@@ -345,16 +355,21 @@ func isRetryable(err error) bool {
 	}
 	var he *httpError
 	if errors.As(err, &he) {
-		switch he.status {
-		case http.StatusRequestTimeout, http.StatusTooManyRequests:
-			return true
-		}
-		if he.status >= 500 && he.status <= 599 {
-			return true
-		}
-		return false
+		return retryableStatus(he.status)
 	}
 	return true
+}
+
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusNotFound, http.StatusMethodNotAllowed:
+		return true
+	}
+	if status >= 300 && status <= 399 {
+		return true
+	}
+	return status >= 500 && status <= 599
 }
 
 func gzipJSON(v any) ([]byte, error) {
