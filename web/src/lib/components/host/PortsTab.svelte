@@ -18,6 +18,8 @@
   const ownerWarning = $derived(ownersUnresolved || ownersPartial);
 
   let rows = $state<PortRow[]>([]);
+  let loaded = $state(false);
+  let error = $state<string | null>(null);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
   let atOldest = $state(false);
@@ -28,9 +30,16 @@
   async function refresh() {
     const opts: { at?: string } = {};
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
-    const fetched = await api.ports(hostId, opts);
-    rows = fetched;
-    if (fetched.length > 0) atOldest = false;
+    try {
+      const fetched = await api.ports(hostId, opts);
+      rows = fetched;
+      error = null;
+      if (fetched.length > 0) atOldest = false;
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      loaded = true;
+    }
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -42,6 +51,7 @@
         dir,
         at: new Date(boundaryMs).toISOString()
       });
+      error = null;
       if (fetched.length > 0) {
         rows = fetched;
         let max = 0;
@@ -58,6 +68,8 @@
       } else {
         atOldest = true;
       }
+    } catch (e) {
+      error = (e as Error).message;
     } finally {
       stepping = false;
     }
@@ -241,7 +253,17 @@
     </div>
   {/if}
 
-  {#if rows.length === 0}
+  {#if error}
+    <div class="px-4 sm:px-5 py-3 border-b border-rose-900/40 bg-rose-950/30 text-sm text-rose-300">
+      Failed to load ports: {error}
+    </div>
+  {/if}
+
+  {#if !loaded}
+    <div class="p-4">
+      <div class="h-40 rounded-lg shimmer"></div>
+    </div>
+  {:else if rows.length === 0 && !error}
     <div class="p-12 text-center">
       <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
         <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
@@ -255,7 +277,7 @@
           : 'No port data within 2 minutes of the selected moment.'}
       </p>
     </div>
-  {:else}
+  {:else if rows.length > 0}
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
@@ -269,7 +291,7 @@
           </tr>
         </thead>
         <tbody class="divide-y divide-zinc-800/70">
-          {#each filtered as p (p.proto + '|' + p.addr + '|' + p.port)}
+          {#each filtered as p (p.proto + '|' + p.addr + '|' + p.port + '|' + (p.pid ?? 0))}
             {@const reach = reachLabel(p.addr)}
             <tr class="hover:bg-zinc-900/60">
               <td class="px-5 py-2 text-right numeric font-mono text-zinc-100">{p.port}</td>

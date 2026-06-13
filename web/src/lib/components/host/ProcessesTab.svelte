@@ -3,14 +3,18 @@
   import 'uplot';
   import { api, type ProcessRow } from '$lib/api';
   import { bytes, pct, timeAgo } from '$lib/format';
+  import { TableSort, type SortColumn } from '$lib/sort.svelte';
   import ProcessDetail from './ProcessDetail.svelte';
 
   let { hostId, sampleIntervalS = 10 }: { hostId: number; sampleIntervalS?: number } = $props();
 
+  type SortKey = 'cpu_pct' | 'mem_rss' | 'pid' | 'name';
+
   let rows = $state<ProcessRow[]>([]);
+  let loaded = $state(false);
+  let error = $state<string | null>(null);
   let updatedAt = $state<string | null>(null);
-  let sortKey = $state<'cpu_pct' | 'mem_rss' | 'pid' | 'name'>('cpu_pct');
-  let sortDir = $state<'asc' | 'desc'>('desc');
+  const sort = new TableSort<SortKey>('cpu_pct');
   let limit = $state(50);
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
@@ -44,10 +48,17 @@
   async function refresh() {
     const opts: { limit: number; at?: string } = { limit };
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
-    const fetched = await api.processes(hostId, opts);
-    rows = fetched;
-    updatedAt = maxRowTime(fetched);
-    if (fetched.length > 0) atOldest = false;
+    try {
+      const fetched = await api.processes(hostId, opts);
+      rows = fetched;
+      updatedAt = maxRowTime(fetched);
+      error = null;
+      if (fetched.length > 0) atOldest = false;
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      loaded = true;
+    }
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -60,6 +71,7 @@
         dir,
         at: new Date(boundaryMs).toISOString()
       });
+      error = null;
       if (fetched.length > 0) {
         rows = fetched;
         const newest = maxRowTime(fetched);
@@ -73,6 +85,8 @@
       } else {
         atOldest = true;
       }
+    } catch (e) {
+      error = (e as Error).message;
     } finally {
       stepping = false;
     }
@@ -94,14 +108,6 @@
   onDestroy(() => {
     if (timer) clearInterval(timer);
   });
-
-  function toggleSort(k: typeof sortKey) {
-    if (sortKey === k) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-    else {
-      sortKey = k;
-      sortDir = 'desc';
-    }
-  }
 
   function pad(n: number) {
     return String(n).padStart(2, '0');
@@ -142,18 +148,16 @@
   const canStepPrev = $derived(!stepping && !atOldest);
   const canStepNext = $derived(!stepping && !isLive);
 
-  const sorted = $derived.by(() => {
-    const cp = [...rows];
-    cp.sort((a, b) => {
-      const av = a[sortKey] as number | string;
-      const bv = b[sortKey] as number | string;
-      if (typeof av === 'number' && typeof bv === 'number') {
-        return sortDir === 'asc' ? av - bv : bv - av;
-      }
-      return sortDir === 'asc' ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
-    });
-    return cp;
-  });
+  const sorted = $derived(sort.apply(rows, (r) => r[sort.key]));
+
+  const columns: SortColumn<SortKey>[] = [
+    { key: 'pid', label: 'PID', cls: 'text-right px-3' },
+    { key: 'name', label: 'Name', cls: 'text-left px-3' },
+    { label: 'User', cls: 'text-left px-3' },
+    { key: 'cpu_pct', label: 'CPU', cls: 'text-right px-3' },
+    { key: 'mem_rss', label: 'RSS', cls: 'text-right px-3' },
+    { label: 'Cmd', cls: 'text-left px-5' }
+  ];
 </script>
 
 <div class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -209,7 +213,17 @@
     </div>
   </header>
 
-  {#if rows.length === 0}
+  {#if error}
+    <div class="px-4 sm:px-5 py-3 border-b border-rose-900/40 bg-rose-950/30 text-sm text-rose-300">
+      Failed to load processes: {error}
+    </div>
+  {/if}
+
+  {#if !loaded}
+    <div class="p-4">
+      <div class="h-40 rounded-lg shimmer"></div>
+    </div>
+  {:else if rows.length === 0 && !error}
     <div class="p-12 text-center">
       <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
         <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
@@ -223,25 +237,21 @@
           : 'No process data within 2 minutes of the selected moment.'}
       </p>
     </div>
-  {:else}
+  {:else if rows.length > 0}
   <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
         <tr>
-          <th class="text-right font-medium px-3 py-2.5">
-            <button type="button" onclick={() => toggleSort('pid')} class="hover:text-zinc-300">PID{sortKey === 'pid' ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}</button>
-          </th>
-          <th class="text-left font-medium px-3 py-2.5">
-            <button type="button" onclick={() => toggleSort('name')} class="hover:text-zinc-300">Name{sortKey === 'name' ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}</button>
-          </th>
-          <th class="text-left font-medium px-3 py-2.5">User</th>
-          <th class="text-right font-medium px-3 py-2.5">
-            <button type="button" onclick={() => toggleSort('cpu_pct')} class="hover:text-zinc-300">CPU{sortKey === 'cpu_pct' ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}</button>
-          </th>
-          <th class="text-right font-medium px-3 py-2.5">
-            <button type="button" onclick={() => toggleSort('mem_rss')} class="hover:text-zinc-300">RSS{sortKey === 'mem_rss' ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ''}</button>
-          </th>
-          <th class="text-left font-medium px-5 py-2.5">Cmd</th>
+          {#each columns as col}
+            <th class="{col.cls} font-medium py-2.5" aria-sort={sort.ariaSort(col.key)}>
+              {#if col.key}
+                {@const k = col.key}
+                <button type="button" onclick={() => sort.toggle(k)} class="uppercase hover:text-zinc-300">{col.label}{sort.indicator(k)}</button>
+              {:else}
+                {col.label}
+              {/if}
+            </th>
+          {/each}
         </tr>
       </thead>
       <tbody class="divide-y divide-zinc-800/70">

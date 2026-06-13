@@ -27,6 +27,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -85,11 +86,13 @@
       estab = e.points.at(-1)?.v ?? 0;
       listen = l.points.at(-1)?.v ?? 0;
       timeWait = w.points.at(-1)?.v ?? 0;
+      error = null;
       loading = false;
       masking = false;
     } catch (err) {
       if (gen !== refreshGen) return;
       if ((err as { name?: string })?.name === 'AbortError') return;
+      error = (err as Error).message;
       loading = false;
       masking = false;
     }
@@ -148,7 +151,15 @@
   const dropsTotal = $derived(lastSum(rxDrop) + lastSum(txDrop));
   const errorsTone = $derived(errorsTotal > 10 ? 'bad' : errorsTotal > 0 ? 'warn' : 'neutral') as 'good' | 'warn' | 'bad' | 'neutral';
   const dropsTone = $derived(dropsTotal > 10 ? 'bad' : dropsTotal > 0 ? 'warn' : 'neutral') as 'good' | 'warn' | 'bad' | 'neutral';
-  const hasErrorTraffic = $derived(rxErr.length + txErr.length + rxDrop.length + txDrop.length > 0);
+  function anyNonzero(entries: SeriesEntry[]): boolean {
+    for (const e of entries) {
+      for (const p of e.points) if (p.v > 0) return true;
+    }
+    return false;
+  }
+  const hasErrorTraffic = $derived(
+    anyNonzero(rxErr) || anyNonzero(txErr) || anyNonzero(rxDrop) || anyNonzero(txDrop)
+  );
 
   function sumSeries(entries: SeriesEntry[], label: string, color: string): Series | null {
     const acc = new Map<string, number>();
@@ -174,6 +185,11 @@
 </script>
 
 <div class="space-y-6">
+  {#if error}
+    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      Failed to load network data: {error}
+    </div>
+  {/if}
   <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
     <StatCard label="Established" value={estab.toFixed(0)} {loading} />
     <StatCard label="Listening" value={listen.toFixed(0)} {loading} />
@@ -223,7 +239,7 @@
     </section>
   </div>
 
-  {#if hasErrorTraffic && (errorsTotal > 0 || dropsTotal > 0)}
+  {#if hasErrorTraffic}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Errors & drops</header>
       <div class="px-3 py-3">

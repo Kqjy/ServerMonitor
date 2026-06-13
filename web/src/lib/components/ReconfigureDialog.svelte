@@ -10,18 +10,20 @@
     smartState === 'read_failed' || smartState === 'scan_failed' || smartState === 'binary_missing';
   const ownerState = cs.connections?.state ?? cs.ports?.state;
   const ownersMissing = ownerState === 'no_owners' || ownerState === 'partial_owners';
+  const ownersWorking = ownerState === 'ok';
+  const smartWorking = smartState === 'ok';
 
   const osName = untrack(() => (host.os ?? '').toLowerCase());
   const isWindows = osName.includes('windows');
   const isLinux = osName.includes('linux');
 
-  let enablePortOwners = $state(untrack(() => ownersMissing));
+  let enablePortOwners = $state(untrack(() => ownersMissing || ownersWorking));
   let enableDocker = $state(false);
-  let enableSmart = $state(untrack(() => smartFailing));
+  let enableSmart = $state(untrack(() => smartFailing || smartWorking));
   let enableSmartNvme = $state(untrack(() => smartState === 'read_failed'));
   let enableGpu = $state(false);
   let enableNetwork = $state(false);
-  let adminService = $state(untrack(() => smartFailing));
+  let adminService = $state(untrack(() => smartFailing || smartWorking));
 
   let baseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
   let copied = $state(false);
@@ -57,10 +59,19 @@
 
   const command = $derived(isWindows ? pwshOneLiner : shellOneLiner);
 
-  function copy() {
-    void navigator.clipboard?.writeText(command);
-    copied = true;
-    setTimeout(() => (copied = false), 1500);
+  let copyFailed = $state(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(command);
+      copied = true;
+    } catch {
+      copyFailed = true;
+    }
+    setTimeout(() => {
+      copied = false;
+      copyFailed = false;
+    }, 1500);
   }
 </script>
 
@@ -137,10 +148,11 @@
         <div>
           <div class="flex items-center justify-between mb-1.5">
             <div class="text-[11px] uppercase tracking-wider text-zinc-500">{isWindows ? 'Run in elevated PowerShell' : 'Run as root on the host'}</div>
-            <button type="button" onclick={copy} class="text-[11px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200">{copied ? 'copied' : 'copy'}</button>
+            <button type="button" onclick={copy} class="text-[11px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 {copyFailed ? 'text-rose-300' : 'text-zinc-200'}">{copied ? 'copied' : copyFailed ? 'copy failed — select manually' : 'copy'}</button>
           </div>
           <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200">{command}</pre>
-          <p class="mt-1.5 text-[11px] text-zinc-600">Capabilities are set to exactly the boxes ticked above; unchecking one and re-running removes it. Pass <span class="font-mono">SM_REINSTALL=1</span> for a full fresh install instead.</p>
+          <p class="mt-1.5 text-[11px] text-amber-300/80">Capabilities are set to exactly the boxes ticked above — anything unticked is removed if currently granted. {#if isLinux}Docker, GPU and network grants can't be detected from here; tick them if this agent already uses them.{/if}</p>
+          <p class="mt-1 text-[11px] text-zinc-500">Pass <span class="font-mono">SM_REINSTALL=1</span> for a full fresh install instead.</p>
         </div>
       {/if}
     </div>

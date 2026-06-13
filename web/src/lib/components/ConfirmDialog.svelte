@@ -24,17 +24,22 @@
   } = $props();
 
   let busy = $state(false);
+  let error = $state<string | null>(null);
 
   function close() {
     if (busy) return;
+    error = null;
     onclose();
   }
 
   async function confirm() {
     busy = true;
+    error = null;
     try {
       await onconfirm();
       onclose();
+    } catch (e) {
+      error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -61,6 +66,11 @@
           {message}
         {/if}
       </div>
+      {#if error}
+        <div class="mx-5 mb-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">
+          {error}
+        </div>
+      {/if}
       <footer class="px-5 py-3 border-t border-zinc-800 flex items-center justify-end gap-2">
         <button
           type="button"

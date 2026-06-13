@@ -5,6 +5,7 @@
 
   let channels = $state<Channel[]>([]);
   let loading = $state(true);
+  let error = $state<string | null>(null);
 
   let formKind = $state<'smtp' | 'webhook'>('webhook');
   let formName = $state('');
@@ -24,8 +25,14 @@
   let webhookFormat = $state<'generic' | 'discord' | 'slack' | 'ntfy'>('generic');
 
   async function refresh() {
-    channels = await api.channels();
-    loading = false;
+    try {
+      channels = await api.channels();
+      error = null;
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      loading = false;
+    }
   }
 
   function resetForm() {
@@ -100,8 +107,12 @@
   }
 
   async function toggle(c: Channel) {
-    await api.channelUpdate(c.id, { name: c.name, kind: c.kind, config: c.config, enabled: !c.enabled });
-    await refresh();
+    try {
+      await api.channelUpdate(c.id, { name: c.name, kind: c.kind, config: c.config, enabled: !c.enabled });
+      await refresh();
+    } catch (e) {
+      error = (e as Error).message;
+    }
   }
 
   let toRemove = $state<Channel | null>(null);
@@ -122,6 +133,12 @@
   <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Notification channels</h1>
   <p class="text-xs sm:text-sm text-zinc-500 mt-1">SMTP and webhook endpoints used by alert rules</p>
 
+  {#if error && !loading}
+    <div class="mt-6 rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      {error}
+    </div>
+  {/if}
+
   <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
     <header class="px-4 sm:px-5 py-3 border-b border-zinc-800 flex items-center justify-between">
       <h2 class="text-sm font-medium text-zinc-100">Existing</h2>
@@ -130,7 +147,7 @@
     {#if loading}
       <div class="px-5 py-6 text-center text-zinc-500 text-sm">Loading…</div>
     {:else if channels.length === 0}
-      <div class="px-5 py-6 text-center text-zinc-500 text-sm">No channels yet</div>
+      <div class="px-5 py-6 text-center text-zinc-500 text-sm">{error ? 'Channels could not be loaded' : 'No channels yet'}</div>
     {:else}
       <div class="overflow-x-auto">
         <table class="w-full text-sm">

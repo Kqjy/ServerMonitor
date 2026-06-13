@@ -2,7 +2,6 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
-  import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
@@ -19,6 +18,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -63,11 +63,13 @@
       memUsedPct = mp.series;
       temp = t.series;
       power = p.series;
+      error = null;
       loading = false;
       masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
+      error = (e as Error).message;
       loading = false;
       masking = false;
     }
@@ -113,9 +115,13 @@
     toMs = b.toMs;
     if (zoomFetched) { masking = true; refresh(); }
   }
-  void bytes;
 </script>
 
+{#if error && !loading}
+  <div class="mb-4 rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+    Failed to load GPU data: {error}
+  </div>
+{/if}
 {#if loading}
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     {#each Array(4) as _, i (i)}
@@ -125,12 +131,12 @@
       </div>
     {/each}
   </div>
-{:else if !hasData}
+{:else if !hasData && !error}
   <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-12 text-center">
     <h2 class="text-base font-medium text-zinc-100">No GPU detected</h2>
     <p class="mt-1 text-sm text-zinc-500">The agent didn't find <code class="font-mono text-xs text-zinc-300">nvidia-smi</code> on this host.</p>
   </div>
-{:else}
+{:else if hasData}
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">

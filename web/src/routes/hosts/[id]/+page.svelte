@@ -126,10 +126,13 @@
   </div>
 
   {#if error}
-    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">{error}</div>
-  {:else if !host}
-    <div class="h-10 w-full max-w-xs rounded shimmer"></div>
-    <div class="mt-6 h-64 rounded shimmer"></div>
+    <div class="mb-4 rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">{error}</div>
+  {/if}
+  {#if !host}
+    {#if !error}
+      <div class="h-10 w-full max-w-xs rounded shimmer"></div>
+      <div class="mt-6 h-64 rounded shimmer"></div>
+    {/if}
   {:else}
     {@const s = statusFor(host.last_seen, host.sample_interval_s || 10)}
     {#if activeAlerts.length > 0}

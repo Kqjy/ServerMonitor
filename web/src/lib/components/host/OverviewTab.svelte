@@ -37,6 +37,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -109,11 +110,13 @@
       iowaitNow = iw.points.at(-1)?.v ?? 0;
       stealNow = st.points.at(-1)?.v ?? 0;
       freqNow = fq.points.at(-1)?.v ?? 0;
+      error = null;
       loading = false;
       masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
+      error = (e as Error).message;
       loading = false;
       masking = false;
     }
@@ -238,6 +241,11 @@
 </script>
 
 <div class="space-y-6">
+  {#if error}
+    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      Failed to load overview data: {error}
+    </div>
+  {/if}
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
     <StatCard label="CPU" value={pct(cpuNow, 2)} tone={cpuTone} {loading} />
     <StatCard label="Memory" value={memTotal ? pct(memUsedPctNow, 2) : '—'} sub={memTotal ? `${bytes(memUsed)} / ${bytes(memTotal)}` : ''} tone={memTone} {loading} />

@@ -3,11 +3,17 @@
   import 'uplot';
   import { api, type ContainerRow } from '$lib/api';
   import { bytes, pct, timeAgo } from '$lib/format';
+  import { TableSort, type SortColumn } from '$lib/sort.svelte';
   import ContainerDetail from './ContainerDetail.svelte';
 
   let { hostId, sampleIntervalS = 10 }: { hostId: number; sampleIntervalS?: number } = $props();
 
+  type SortKey = 'state' | 'name' | 'cpu_pct' | 'mem_used' | 'netio' | 'time';
+
   let rows = $state<ContainerRow[]>([]);
+  let loaded = $state(false);
+  let error = $state<string | null>(null);
+  const sort = new TableSort<SortKey>('state');
   let atMs = $state<number | null>(null);
   let stepping = $state(false);
   let atOldest = $state(false);
@@ -27,9 +33,16 @@
   async function refresh() {
     const opts: { at?: string } = {};
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
-    const fetched = await api.containers(hostId, opts);
-    rows = fetched;
-    if (fetched.length > 0) atOldest = false;
+    try {
+      const fetched = await api.containers(hostId, opts);
+      rows = fetched;
+      error = null;
+      if (fetched.length > 0) atOldest = false;
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      loaded = true;
+    }
   }
 
   async function step(dir: 'prev' | 'next') {
@@ -41,6 +54,7 @@
         dir,
         at: new Date(boundaryMs).toISOString()
       });
+      error = null;
       if (fetched.length > 0) {
         rows = fetched;
         let max = 0;
@@ -57,6 +71,8 @@
       } else {
         atOldest = true;
       }
+    } catch (e) {
+      error = (e as Error).message;
     } finally {
       stepping = false;
     }
@@ -118,8 +134,38 @@
   const isLive = $derived(atMs === null);
   const canStepPrev = $derived(!stepping && !atOldest);
   const canStepNext = $derived(!stepping && !isLive);
-  const running = $derived(rows.filter((r) => r.state.toLowerCase() === 'running'));
-  const stopped = $derived(rows.filter((r) => r.state.toLowerCase() !== 'running'));
+  const isRunning = (c: ContainerRow) => c.state.toLowerCase() === 'running';
+  const running = $derived(rows.filter(isRunning));
+  const stopped = $derived(rows.filter((r) => !isRunning(r)));
+
+  function sortVal(c: ContainerRow): number | string {
+    switch (sort.key) {
+      case 'state':
+        return c.state.toLowerCase();
+      case 'name':
+        return c.name;
+      case 'cpu_pct':
+        return c.cpu_pct;
+      case 'mem_used':
+        return c.mem_used;
+      case 'netio':
+        return (c.rx_bytes ?? 0) + (c.tx_bytes ?? 0);
+      case 'time':
+        return new Date(c.time).getTime();
+    }
+  }
+
+  const sorted = $derived(sort.apply(rows, sortVal, (a, b) => b.cpu_pct - a.cpu_pct));
+
+  const columns: SortColumn<SortKey>[] = [
+    { key: 'name', label: 'Name', cls: 'text-left px-5' },
+    { label: 'Image', cls: 'text-left px-3' },
+    { key: 'state', label: 'State', cls: 'text-left px-3' },
+    { key: 'cpu_pct', label: 'CPU', cls: 'text-right px-3' },
+    { key: 'mem_used', label: 'Memory', cls: 'text-right px-3' },
+    { key: 'netio', label: 'Net I/O', cls: 'text-right px-3' },
+    { key: 'time', label: 'Updated', cls: 'text-right px-5' }
+  ];
 </script>
 
 <div class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -164,7 +210,17 @@
     </div>
   </header>
 
-  {#if rows.length === 0}
+  {#if error}
+    <div class="px-4 sm:px-5 py-3 border-b border-rose-900/40 bg-rose-950/30 text-sm text-rose-300">
+      Failed to load containers: {error}
+    </div>
+  {/if}
+
+  {#if !loaded}
+    <div class="p-4">
+      <div class="h-40 rounded-lg shimmer"></div>
+    </div>
+  {:else if rows.length === 0 && !error}
     <div class="p-12 text-center">
       <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
         <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
@@ -178,23 +234,26 @@
           : 'No container data within 5 minutes of the selected moment.'}
       </p>
     </div>
-  {:else}
+  {:else if rows.length > 0}
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
           <tr>
-            <th class="text-left font-medium px-5 py-2.5">Name</th>
-            <th class="text-left font-medium px-3 py-2.5">Image</th>
-            <th class="text-left font-medium px-3 py-2.5">State</th>
-            <th class="text-right font-medium px-3 py-2.5">CPU</th>
-            <th class="text-right font-medium px-3 py-2.5">Memory</th>
-            <th class="text-right font-medium px-3 py-2.5">Net I/O</th>
-            <th class="text-right font-medium px-5 py-2.5">Updated</th>
+            {#each columns as col}
+              <th class="{col.cls} font-medium py-2.5" aria-sort={sort.ariaSort(col.key)}>
+                {#if col.key}
+                  {@const k = col.key}
+                  <button type="button" onclick={() => sort.toggle(k)} class="uppercase hover:text-zinc-300">{col.label}{sort.indicator(k)}</button>
+                {:else}
+                  {col.label}
+                {/if}
+              </th>
+            {/each}
           </tr>
         </thead>
         <tbody class="divide-y divide-zinc-800/70">
-          {#each rows as c (c.cid)}
-            {@const isUp = c.state.toLowerCase() === 'running'}
+          {#each sorted as c (c.cid)}
+            {@const isUp = isRunning(c)}
             {@const open = expandedCid === c.cid}
             <tr
               class="hover:bg-zinc-900/60 cursor-pointer {open ? 'bg-zinc-900/60' : ''}"

@@ -26,6 +26,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -73,11 +74,13 @@
       availNow = av.points.at(-1)?.v ?? 0;
       swapTotal = st.points.at(-1)?.v ?? 0;
       swapUsedNow = su.points.at(-1)?.v ?? 0;
+      error = null;
       loading = false;
       masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
+      error = (e as Error).message;
       loading = false;
       masking = false;
     }
@@ -127,6 +130,11 @@
 </script>
 
 <div class="space-y-6">
+  {#if error}
+    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      Failed to load memory data: {error}
+    </div>
+  {/if}
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
     <StatCard label="Used" value={bytes(usedNow)} sub={total ? pct((usedNow / total) * 100, 1) : ''} tone={usedTone} {loading} />
     <StatCard label="Available" value={bytes(availNow)} {loading} />

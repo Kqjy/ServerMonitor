@@ -15,6 +15,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -51,11 +52,13 @@
       loadedStep = t.step_sec;
       zoomFetched = zoomed !== null;
       temps = t.series;
+      error = null;
       loading = false;
       masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
+      error = (e as Error).message;
       loading = false;
       masking = false;
     }
@@ -99,17 +102,22 @@
   }
 </script>
 
+{#if error && !loading}
+  <div class="mb-4 rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+    Failed to load sensor data: {error}
+  </div>
+{/if}
 {#if loading}
   <div class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="px-5 py-3 border-b border-zinc-800"><div class="h-3 w-28 rounded shimmer"></div></header>
     <div class="px-3 py-3"><div class="h-[220px] rounded-md shimmer opacity-60"></div></div>
   </div>
-{:else if temps.length === 0}
+{:else if temps.length === 0 && !error}
   <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-12 text-center">
     <h2 class="text-base font-medium text-zinc-100">No sensor data</h2>
     <p class="mt-1 text-sm text-zinc-500">The agent didn't expose temperature sensors on this host.</p>
   </div>
-{:else}
+{:else if temps.length > 0}
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
       <div class="text-xs uppercase tracking-wider text-zinc-500">Temperatures</div>

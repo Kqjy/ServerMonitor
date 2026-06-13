@@ -18,7 +18,7 @@ class AuthState {
         return this.status;
       }
     } catch {
-      this.status = 'guest';
+      if (this.status === 'unknown') this.status = 'guest';
       return this.status;
     }
     try {
@@ -26,8 +26,10 @@ class AuthState {
       this.user = me;
       this.status = 'authed';
     } catch (e) {
-      this.user = null;
-      this.status = e instanceof ApiError && e.status === 401 ? 'guest' : 'guest';
+      if ((e instanceof ApiError && (e.status === 401 || e.status === 403)) || this.status === 'unknown') {
+        this.user = null;
+        this.status = 'guest';
+      }
     }
     return this.status;
   }

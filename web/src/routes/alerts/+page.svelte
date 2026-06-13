@@ -9,6 +9,7 @@
   let history = $state<AlertHistoryRow[]>([]);
   let channels = $state<Channel[]>([]);
   let loading = $state(true);
+  let error = $state<string | null>(null);
   let editing = $state<AlertRule | null>(null);
   let creating = $state(false);
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -20,16 +21,21 @@
         api.alertHistory(50),
         api.channels()
       ]);
+      error = null;
     } catch (e) {
-      console.error(e);
+      error = (e as Error).message;
     } finally {
       loading = false;
     }
   }
 
   async function toggleRule(r: AlertRule) {
-    await api.alertUpdate(r.id, { ...r, enabled: !r.enabled });
-    await refresh();
+    try {
+      await api.alertUpdate(r.id, { ...r, enabled: !r.enabled });
+      await refresh();
+    } catch (e) {
+      error = (e as Error).message;
+    }
   }
 
   let toDelete = $state<AlertRule | null>(null);
@@ -63,12 +69,18 @@
     </button>
   </div>
 
+  {#if error && !loading}
+    <div class="mb-4 rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      {error}
+    </div>
+  {/if}
+
   {#if loading}
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <div class="h-40 rounded-lg border border-zinc-800 shimmer"></div>
       <div class="h-40 rounded-lg border border-zinc-800 shimmer"></div>
     </div>
-  {:else if rules.length === 0}
+  {:else if rules.length === 0 && !error}
     <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-12 text-center">
       <div class="mx-auto h-10 w-10 rounded-lg bg-zinc-800/70 grid place-items-center mb-4">
         <svg viewBox="0 0 24 24" class="h-5 w-5 text-zinc-400" fill="none" stroke="currentColor" stroke-width="1.6">
@@ -86,7 +98,7 @@
         </p>
       {/if}
     </div>
-  {:else}
+  {:else if rules.length > 0}
     <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
       <div class="overflow-x-auto">
         <table class="w-full text-sm">

@@ -54,6 +54,7 @@
   let zoomFetched = false;
   let loading = $state(true);
   let masking = $state(false);
+  let error = $state<string | null>(null);
   let refreshGen = 0;
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -195,11 +196,13 @@
       smartWritten = sWritten.series;
       smartRead = sRead.series;
 
+      error = null;
       loading = false;
       masking = false;
     } catch (e) {
       if (gen !== refreshGen) return;
       if ((e as { name?: string })?.name === 'AbortError') return;
+      error = (e as Error).message;
       loading = false;
       masking = false;
     }
@@ -251,6 +254,11 @@
 </script>
 
 <div class="space-y-6">
+  {#if error}
+    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
+      Failed to load disk data: {error}
+    </div>
+  {/if}
   <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
     <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
       <div class="text-xs uppercase tracking-wider text-zinc-500">Read throughput</div>
@@ -341,7 +349,7 @@
     </section>
   {/if}
 
-  {#if smart.length === 0 && smartEnabled && !loading}
+  {#if smart.length === 0 && smartEnabled && !loading && !error}
     {#if smartStatus?.state === 'no_devices'}
       <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
         <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">SMART health</header>

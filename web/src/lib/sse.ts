@@ -22,17 +22,34 @@ interface Envelope {
 }
 
 let metricNameCache: Map<number, string> | null = null;
+let metricCacheFetch: Promise<void> | null = null;
 
-async function ensureMetricCache(): Promise<Map<number, string>> {
-  if (metricNameCache) return metricNameCache;
-  const r = await fetch('/api/v1/metrics', { credentials: 'same-origin' });
-  if (!r.ok) {
-    metricNameCache = new Map();
-    return metricNameCache;
-  }
-  const list: { id: number; name: string }[] = await r.json();
-  metricNameCache = new Map(list.map((x) => [x.id, x.name]));
-  return metricNameCache;
+function refreshMetricCache(): Promise<void> {
+  metricCacheFetch ??= (async () => {
+    try {
+      const r = await fetch('/api/v1/metrics', { credentials: 'same-origin' });
+      if (r.ok) {
+        const list: { id: number; name: string }[] = await r.json();
+        metricNameCache = new Map(list.map((x) => [x.id, x.name]));
+      }
+    } catch {
+    } finally {
+      metricCacheFetch = null;
+    }
+  })();
+  return metricCacheFetch;
+}
+
+async function ensureMetricCache(): Promise<void> {
+  if (metricNameCache) return;
+  await refreshMetricCache();
+}
+
+function metricName(id: number): string {
+  const name = metricNameCache?.get(id);
+  if (name) return name;
+  void refreshMetricCache();
+  return '';
 }
 
 function openStream(
@@ -90,7 +107,7 @@ export function subscribeHost(
         const env = JSON.parse(evt.data) as Envelope;
         const out: LivePoint[] = [];
         for (const p of env.points) {
-          const name = metricNameCache!.get(p.m) ?? '';
+          const name = metricName(p.m);
           if (!name) continue;
           if (wanted.size && !wanted.has(name)) continue;
           out.push({ metric: name, labels: p.l, ts: p.t, v: p.v });
@@ -122,7 +139,7 @@ export function subscribeHosts(
         const env = JSON.parse(evt.data) as Envelope;
         const out: LivePoint[] = [];
         for (const p of env.points) {
-          const name = metricNameCache!.get(p.m) ?? '';
+          const name = metricName(p.m);
           if (!name) continue;
           if (wanted.size && !wanted.has(name)) continue;
           out.push({ metric: name, labels: p.l, ts: p.t, v: p.v });
