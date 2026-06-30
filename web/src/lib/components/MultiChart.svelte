@@ -36,7 +36,7 @@
     unit?: string;
     height?: number;
     fill?: boolean;
-    format?: (v: number) => string;
+    format?: (v: number, extraDigits?: number) => string;
     fromMs?: number;
     toMs?: number;
     emptyText?: string;
@@ -97,6 +97,21 @@
   function near(a: number, b: number, durS: number): boolean {
     const tol = Math.max(durS * 0.001, 1);
     return Math.abs(a - b) < tol;
+  }
+
+  function hasAdjacentDuplicate(labels: string[]): boolean {
+    for (let i = 1; i < labels.length; i++) {
+      if (labels[i] === labels[i - 1]) return true;
+    }
+    return false;
+  }
+
+  function dedupeTickLabels(render: (extra: number) => string[]): string[] {
+    let labels = render(0);
+    for (let extra = 1; extra <= 4 && hasAdjacentDuplicate(labels); extra++) {
+      labels = render(extra);
+    }
+    return labels;
   }
 
   function build(data: uPlot.AlignedData) {
@@ -167,10 +182,10 @@
           grid: { stroke: 'oklch(0.27 0 0 / 0.6)', width: 0.5 },
           ticks: { stroke: 'oklch(0.27 0 0)', width: 0.5 },
           values: (_u, ticks) => {
-            if (format) return ticks.map((t) => format(t));
+            if (format) return dedupeTickLabels((extra) => ticks.map((t) => format(t, extra)));
             let d = tickDigits(ticks);
             if (yMaxDigits != null && d > yMaxDigits) d = yMaxDigits;
-            return ticks.map((t) => `${t.toFixed(d)}${unit ? ' ' + unit : ''}`);
+            return dedupeTickLabels((extra) => ticks.map((t) => `${t.toFixed(d + extra)}${unit ? ' ' + unit : ''}`));
           },
           size: 64
         }

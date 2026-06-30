@@ -179,6 +179,7 @@ func seriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, r
 		} else if host.SampleIntervalS > 0 && step < host.SampleIntervalS {
 			step = host.SampleIntervalS
 		}
+		step = clampStepBuckets(to.Sub(from), step)
 
 		coldCutoff := now.Add(-coldRetention)
 		rawAvail := now.Add(-rawRetention)
@@ -397,6 +398,7 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 		} else if host.SampleIntervalS > 0 && step < host.SampleIntervalS {
 			step = host.SampleIntervalS
 		}
+		step = clampStepBuckets(to.Sub(from), step)
 
 		coldCutoff := now.Add(-coldRetention)
 		rawAvail := now.Add(-rawRetention)
@@ -727,6 +729,7 @@ func seriesBatchHandler(db *storage.DB, hosts *storage.Hosts, ret RetentionConfi
 		} else if step < minInterval {
 			step = minInterval
 		}
+		step = clampStepBuckets(to.Sub(from), step)
 
 		aggMax := strings.EqualFold(q.Get("agg"), "max")
 
@@ -975,6 +978,14 @@ func chooseStep(d time.Duration, intervalS int) int {
 
 func intervalString(stepSec int) string {
 	return strconv.Itoa(stepSec) + " seconds"
+}
+
+func clampStepBuckets(span time.Duration, step int) int {
+	spanSec := int(span.Seconds())
+	if step > 0 && spanSec/step > maxDetailBuckets {
+		return (spanSec + maxDetailBuckets - 1) / maxDetailBuckets
+	}
+	return step
 }
 
 func listMetricsHandler() http.HandlerFunc {

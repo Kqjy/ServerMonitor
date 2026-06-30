@@ -1,7 +1,7 @@
 {
   "name": "servermonitor-web",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -11,14 +11,14 @@
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
-    "@sveltejs/kit": "^2.60.1",
-    "@sveltejs/vite-plugin-svelte": "^7.0.5",
-    "@tailwindcss/vite": "^4.3.0",
-    "svelte": "^5.55.8",
-    "svelte-check": "^4.4.8",
-    "tailwindcss": "^4.3.0",
-    "typescript": "^5.9.3",
-    "vite": "^8.0.13"
+    "@sveltejs/kit": "^2.68.0",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tailwindcss/vite": "^4.3.2",
+    "svelte": "^5.56.4",
+    "svelte-check": "^4.7.1",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.1"
   },
   "dependencies": {
     "uplot": "^1.6.32"

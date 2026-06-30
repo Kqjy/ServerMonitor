@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { modalFocus } from '$lib/modal';
 
   let {
     open,
@@ -51,6 +52,7 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
+    use:modalFocus
     class="fixed inset-0 z-40 bg-zinc-950/60 backdrop-blur-sm flex items-center justify-center p-4"
     onclick={(e) => { if (e.target === e.currentTarget) close(); }}
     onkeydown={(e) => { if (e.key === 'Escape') close(); }}

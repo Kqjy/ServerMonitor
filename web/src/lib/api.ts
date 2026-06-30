@@ -232,6 +232,40 @@ export interface RetentionResp {
   requires_restart: boolean;
 }
 
+export interface StorageTable {
+  schema: string;
+  name: string;
+  label: string;
+  kind: string;
+  total_bytes: number;
+  table_bytes: number;
+  index_bytes: number;
+  approx_rows: number;
+  chunks: number;
+  compressed_chunks: number;
+  uncompressed_bytes: number;
+  compression_ratio: number;
+}
+
+export interface StorageArchive {
+  configured: boolean;
+  objects: number;
+  total_bytes: number;
+  row_count: number;
+  oldest: string | null;
+  newest: string | null;
+}
+
+export interface StorageResp {
+  captured_at: string;
+  database_bytes: number;
+  tables_total_bytes: number;
+  other_database_bytes: number;
+  tables: StorageTable[];
+  archive: StorageArchive;
+  warnings?: string[];
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -378,27 +412,27 @@ export const api = {
   },
   processes: (
     hostId: number,
-    opts: { limit?: number; at?: string; dir?: 'prev' | 'next' } = {}
+    opts: { limit?: number; at?: string; dir?: 'prev' | 'next'; signal?: AbortSignal } = {}
   ) => {
     const q = new URLSearchParams();
     q.set('limit', String(opts.limit ?? 50));
     if (opts.at) q.set('at', opts.at);
     if (opts.dir) q.set('dir', opts.dir);
-    return request<ProcessRow[]>(`/api/v1/hosts/${hostId}/processes?${q}`);
+    return request<ProcessRow[]>(`/api/v1/hosts/${hostId}/processes?${q}`, { signal: opts.signal });
   },
-  containers: (hostId: number, opts: { at?: string; dir?: 'prev' | 'next' } = {}) => {
+  containers: (hostId: number, opts: { at?: string; dir?: 'prev' | 'next'; signal?: AbortSignal } = {}) => {
     const q = new URLSearchParams();
     if (opts.at) q.set('at', opts.at);
     if (opts.dir) q.set('dir', opts.dir);
     const qs = q.toString();
-    return request<ContainerRow[]>(`/api/v1/hosts/${hostId}/containers${qs ? `?${qs}` : ''}`);
+    return request<ContainerRow[]>(`/api/v1/hosts/${hostId}/containers${qs ? `?${qs}` : ''}`, { signal: opts.signal });
   },
-  ports: (hostId: number, opts: { at?: string; dir?: 'prev' | 'next' } = {}) => {
+  ports: (hostId: number, opts: { at?: string; dir?: 'prev' | 'next'; signal?: AbortSignal } = {}) => {
     const q = new URLSearchParams();
     if (opts.at) q.set('at', opts.at);
     if (opts.dir) q.set('dir', opts.dir);
     const qs = q.toString();
-    return request<PortRow[]>(`/api/v1/hosts/${hostId}/ports${qs ? `?${qs}` : ''}`);
+    return request<PortRow[]>(`/api/v1/hosts/${hostId}/ports${qs ? `?${qs}` : ''}`, { signal: opts.signal });
   },
   processSeries: (
     hostId: number,
@@ -481,5 +515,6 @@ export const api = {
     request<void>(`/api/v1/admin/hosts/${id}`, { method: 'DELETE' }),
   agentPlatforms: () => request<AgentPlatform[]>('/api/v1/agent/platforms'),
   serverInfo: () => request<ServerInfo>('/api/v1/server/info'),
-  retention: () => request<RetentionResp>('/api/v1/retention')
+  retention: () => request<RetentionResp>('/api/v1/retention'),
+  storage: () => request<StorageResp>('/api/v1/storage')
 };

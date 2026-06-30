@@ -106,6 +106,7 @@ func New(d Deps) *Router {
 				r.Get("/metrics", listMetricsHandler())
 				r.Get("/stats", statsHandler(d.Batcher))
 				r.Get("/retention", retentionHandler(d.Retention))
+				r.Get("/storage", storageUsageHandler(d.DB, d.Archive != nil))
 				r.Get("/agent/platforms", listPlatformsHandler())
 				r.Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies, d.TrustProxyTLS))
 

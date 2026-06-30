@@ -265,7 +265,7 @@
       <DownloadCsv host={hostId} metric="disk_read_bytes" splitBy="device" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(read)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(read)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v, e = 0) => `${bytes(v, e)}/s`} />
     </div>
   </section>
 
@@ -275,7 +275,7 @@
       <DownloadCsv host={hostId} metric="disk_write_bytes" splitBy="device" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(write)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(write)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v, e = 0) => `${bytes(v, e)}/s`} />
     </div>
   </section>
 
@@ -286,7 +286,7 @@
         <DownloadCsv host={hostId} metric="disk_read_ops" splitBy="device" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(readOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(readOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v, e = 0) => `${v.toFixed(e)}/s`} />
       </div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -295,7 +295,7 @@
         <DownloadCsv host={hostId} metric="disk_write_ops" splitBy="device" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(writeOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(writeOps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="ops/s" format={(v, e = 0) => `${v.toFixed(e)}/s`} />
       </div>
     </section>
   </div>
@@ -307,7 +307,7 @@
         <DownloadCsv host={hostId} metric="fs_used_pct" splitBy="mount" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(fsUsedPct)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="%" format={(v) => pct(v, 1)} />
+        <MultiChart series={toSeries(fsUsedPct)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="%" format={(v, e = 0) => pct(v, 1 + e)} />
       </div>
     </section>
   {/if}
@@ -460,7 +460,7 @@
           <DownloadCsv host={hostId} metric="smart_temp_c" splitBy="device" {range} />
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(smartTemps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} />
+          <MultiChart series={toSeries(smartTemps)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v, e = 0) => `${v.toFixed(e)} °C`} />
         </div>
       </section>
     {/if}
@@ -472,7 +472,7 @@
           <DownloadCsv host={hostId} metric="smart_data_written_bytes" splitBy="device" {range} />
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(smartWritten)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v) => bytes(v)} />
+          <MultiChart series={toSeries(smartWritten)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v, e = 0) => bytes(v, 1 + e)} />
         </div>
       </section>
     {/if}
@@ -484,7 +484,7 @@
           <DownloadCsv host={hostId} metric="smart_data_read_bytes" splitBy="device" {range} />
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(smartRead)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v) => bytes(v)} />
+          <MultiChart series={toSeries(smartRead)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v, e = 0) => bytes(v, 1 + e)} />
         </div>
       </section>
     {/if}

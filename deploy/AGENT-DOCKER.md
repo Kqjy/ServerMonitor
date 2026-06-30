@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.2.4 .
-docker push registry.example.com/servermonitor-agent:0.2.4
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.2.5 .
+docker push registry.example.com/servermonitor-agent:0.2.5
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.2.4
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.2.5
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -131,3 +131,7 @@ Do **not** use `apparmor=unconfined`: it strips the whole profile on a container
 ### Container metrics
 
 These come from the Docker socket. On hosts using Podman or containerd without a Docker-compatible socket they're skipped, and every other collector still works.
+
+The `containers` collector reconnects on its own: if the daemon is unreachable when the agent first ticks (a boot race after `apt upgrade` restarts Docker) or the connection drops mid-run, it retries on the next tick and then every 30s while the daemon stays down, resuming as soon as the socket answers again — no agent restart needed.
+
+One edge case the agent can't paper over: if the daemon recreates the socket *inode* while this container keeps running — `systemctl restart docker` (or an `apt upgrade` of `docker-ce`) on a host with `"live-restore": true`, which leaves containers up across the restart — the `:ro` bind-mount of the socket **file** is frozen to the now-dead inode, so re-dialing the same path can't recover. A full host reboot recreates the container with a fresh mount and is unaffected. If your hosts run `live-restore`, resolve the socket through the already-mounted host root instead of bind-mounting the file: drop the `/var/run/docker.sock` volume and add `DOCKER_HOST: unix:///host/run/docker.sock` to `environment` — each reconnect then resolves the current socket through the `/host` directory mount. The collector reads `DOCKER_HOST` via `client.FromEnv`.

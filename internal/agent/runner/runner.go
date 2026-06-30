@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -147,6 +148,11 @@ func (r *Runner) tick(ctx context.Context) {
 		wg.Add(1)
 		go func(col collectors.Collector) {
 			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.logger.Error("collector panic", "name", col.Name(), "panic", rec, "stack", string(debug.Stack()))
+				}
+			}()
 			points, err := col.Collect(tickCtx)
 			if err != nil {
 				r.logger.Warn("collector error", "name", col.Name(), "err", err)

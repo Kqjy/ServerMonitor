@@ -21,6 +21,8 @@
   let atOldest = $state(false);
   let expandedPid = $state<number | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
+  let refreshGen = 0;
+  let inflight: AbortController | null = null;
 
   function toggleExpand(pid: number) {
     expandedPid = expandedPid === pid ? null : pid;
@@ -46,31 +48,43 @@
   }
 
   async function refresh() {
-    const opts: { limit: number; at?: string } = { limit };
+    const gen = ++refreshGen;
+    inflight?.abort();
+    const ac = new AbortController();
+    inflight = ac;
+    const opts: { limit: number; at?: string; signal: AbortSignal } = { limit, signal: ac.signal };
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
     try {
       const fetched = await api.processes(hostId, opts);
+      if (gen !== refreshGen) return;
       rows = fetched;
       updatedAt = maxRowTime(fetched);
       error = null;
       if (fetched.length > 0) atOldest = false;
     } catch (e) {
+      if (gen !== refreshGen || (e as { name?: string })?.name === 'AbortError') return;
       error = (e as Error).message;
     } finally {
-      loaded = true;
+      if (gen === refreshGen) loaded = true;
     }
   }
 
   async function step(dir: 'prev' | 'next') {
     if (stepping) return;
     stepping = true;
+    const gen = ++refreshGen;
+    inflight?.abort();
+    const ac = new AbortController();
+    inflight = ac;
     try {
       const boundaryMs = atMs ?? (updatedAt ? new Date(updatedAt).getTime() : Date.now());
       const fetched = await api.processes(hostId, {
         limit,
         dir,
-        at: new Date(boundaryMs).toISOString()
+        at: new Date(boundaryMs).toISOString(),
+        signal: ac.signal
       });
+      if (gen !== refreshGen) return;
       error = null;
       if (fetched.length > 0) {
         rows = fetched;
@@ -86,6 +100,7 @@
         atOldest = true;
       }
     } catch (e) {
+      if (gen !== refreshGen || (e as { name?: string })?.name === 'AbortError') return;
       error = (e as Error).message;
     } finally {
       stepping = false;
@@ -101,12 +116,13 @@
   onMount(() => {
     refresh();
     timer = setInterval(() => {
-      if (atMs !== null) return;
+      if (atMs !== null || stepping) return;
       refresh();
     }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    inflight?.abort();
   });
 
   function pad(n: number) {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type Host, type RetentionResp } from '$lib/api';
-  import { statusFor, timeAgo } from '$lib/format';
+  import { api, type Host, type RetentionResp, type StorageResp } from '$lib/api';
+  import { statusFor, timeAgo, bytes } from '$lib/format';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import EditHostDialog from '$lib/components/EditHostDialog.svelte';
@@ -15,6 +15,31 @@
 
   let retention = $state<RetentionResp | null>(null);
   let retentionErr = $state<string | null>(null);
+
+  let storage = $state<StorageResp | null>(null);
+  let storageErr = $state<string | null>(null);
+  let storageBusy = $state(false);
+
+  async function loadStorage() {
+    storageBusy = true;
+    try {
+      storage = await api.storage();
+      storageErr = null;
+    } catch (e) {
+      storageErr = (e as Error).message;
+    } finally {
+      storageBusy = false;
+    }
+  }
+
+  function sharePct(b: number): number {
+    if (!storage || storage.tables_total_bytes <= 0) return 0;
+    return Math.max(0, Math.min(100, (b / storage.tables_total_bytes) * 100));
+  }
+
+  function rowsLabel(n: number): string {
+    return n > 0 ? `≈ ${n.toLocaleString()}` : '—';
+  }
 
   function displayValue(v: string): string {
     const t = v.trim();
@@ -41,6 +66,7 @@
     } catch (e) {
       retentionErr = (e as Error).message;
     }
+    await loadStorage();
   }
 
   async function doRemove() {
@@ -282,6 +308,122 @@
           Raw data outside <span class="font-mono text-zinc-400">RETENTION_RAW</span> is summarised into 5-minute buckets, then archived to S3 (if configured) past the 5-minute window.
         </div>
       </div>
+    {/if}
+  </section>
+
+  <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+    <header class="px-4 sm:px-5 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
+      <div class="min-w-0">
+        <h2 class="text-sm font-medium text-zinc-100">Storage usage</h2>
+        <p class="text-[11px] text-zinc-500 mt-0.5">
+          Physical disk used by collected data right now.
+          {#if storage}<span class="text-zinc-600">· measured {timeAgo(storage.captured_at)}</span>{/if}
+        </p>
+      </div>
+      <button
+        type="button"
+        onclick={loadStorage}
+        disabled={storageBusy}
+        class="text-xs px-2.5 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50 shrink-0">
+        {storageBusy ? 'Measuring…' : 'Refresh'}
+      </button>
+    </header>
+
+    {#if storageErr}
+      <div class="px-5 py-3 text-xs text-rose-300">{storageErr}</div>
+    {:else if !storage}
+      <div class="px-5 py-6 text-center text-zinc-500 text-sm">Loading…</div>
+    {:else}
+      <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800 border-b border-zinc-800">
+        <div class="px-4 sm:px-5 py-4">
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Monitored data</div>
+          <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(storage.tables_total_bytes)}</div>
+          <div class="text-[11px] text-zinc-500 mt-0.5">
+            across {storage.tables.length} monitored {storage.tables.length === 1 ? 'table' : 'tables'}
+          </div>
+        </div>
+        <div class="px-4 sm:px-5 py-4">
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Cold archive · S3</div>
+          {#if storage.archive.configured}
+            <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(storage.archive.total_bytes)}</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">
+              {#if storage.archive.objects > 0}
+                {storage.archive.objects.toLocaleString()} {storage.archive.objects === 1 ? 'object' : 'objects'} · ≈ {storage.archive.row_count.toLocaleString()} rows
+              {:else}
+                configured · no archived objects yet
+              {/if}
+            </div>
+          {:else}
+            <div class="text-xl font-medium text-zinc-400 mt-1.5">Not configured</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">set <span class="font-mono">ARCHIVE_S3_BUCKET</span> to archive cold data</div>
+          {/if}
+        </div>
+        <div class="px-4 sm:px-5 py-4">
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Whole database</div>
+          <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(storage.database_bytes)}</div>
+          <div class="text-[11px] text-zinc-500 mt-0.5">+ {bytes(storage.other_database_bytes)} other storage</div>
+        </div>
+      </div>
+
+      {#if storage.warnings && storage.warnings.length > 0}
+        <div class="px-4 sm:px-5 py-2.5 border-b border-zinc-800 bg-amber-500/5 text-[11px] text-amber-300/90 space-y-0.5">
+          {#each storage.warnings as wmsg, i (i)}
+            <div>{wmsg}</div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if storage.tables.length === 0}
+        <div class="px-5 py-8 text-center text-zinc-500 text-sm">No Timescale data tables found.</div>
+      {:else}
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
+              <tr>
+                <th class="text-left font-medium px-4 sm:px-5 py-2.5 whitespace-nowrap">Data</th>
+                <th class="text-right font-medium px-3 py-2.5 whitespace-nowrap">On disk</th>
+                <th class="text-left font-medium px-3 py-2.5 w-44">Share</th>
+                <th class="text-right font-medium px-3 py-2.5 whitespace-nowrap">Rows</th>
+                <th class="text-right font-medium px-4 sm:px-5 py-2.5 whitespace-nowrap">Compression</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-zinc-800/70">
+              {#each storage.tables as t (t.schema + '.' + t.name)}
+                <tr class="hover:bg-zinc-900/60">
+                  <td class="px-4 sm:px-5 py-2.5 align-top">
+                    <div class="text-zinc-100 whitespace-nowrap">{t.label}</div>
+                    <div class="text-[10px] text-zinc-600 font-mono mt-0.5 whitespace-nowrap">{t.name} · {t.kind}</div>
+                  </td>
+                  <td class="px-3 py-2.5 align-top text-right font-mono text-xs numeric text-zinc-200 whitespace-nowrap">{bytes(t.total_bytes)}</td>
+                  <td class="px-3 py-2.5 align-middle">
+                    <div class="flex items-center gap-2">
+                      <div class="h-1.5 flex-1 rounded-full bg-zinc-800 overflow-hidden">
+                        <div class="h-full rounded-full bg-sky-500/70" style="width: {sharePct(t.total_bytes)}%"></div>
+                      </div>
+                      <span class="text-[10px] text-zinc-500 numeric w-9 text-right">{sharePct(t.total_bytes).toFixed(0)}%</span>
+                    </div>
+                  </td>
+                  <td class="px-3 py-2.5 align-top text-right font-mono text-xs numeric text-zinc-400 whitespace-nowrap">{rowsLabel(t.approx_rows)}</td>
+                  <td class="px-4 sm:px-5 py-2.5 align-top text-right whitespace-nowrap">
+                    {#if t.compression_ratio > 1}
+                      <span class="font-mono text-xs numeric text-emerald-300" title="compressed chunks: {bytes(t.uncompressed_bytes)} uncompressed → {bytes(t.uncompressed_bytes / t.compression_ratio)} on disk">{t.compression_ratio.toFixed(1)}×</span>
+                    {:else}
+                      <span class="font-mono text-xs text-zinc-600">uncompressed</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        <div class="px-4 sm:px-5 py-3 border-t border-zinc-800 text-[11px] text-zinc-500 space-y-1">
+          <div>Sizes are physical on-disk bytes (compressed where applicable). Share is each table's portion of monitored data.</div>
+          <div>
+            <span class="text-zinc-400">Other storage</span> ({bytes(storage.other_database_bytes)}) is application tables, PostgreSQL catalogs, the audit log, and database overhead outside the monitored tables.
+          </div>
+          <div>Lowering a table's window in Data retention above shrinks it. Open-port snapshots have no retention policy yet, so they are the main unbounded grower.</div>
+        </div>
+      {/if}
     {/if}
   </section>
 

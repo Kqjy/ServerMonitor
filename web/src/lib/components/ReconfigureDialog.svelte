@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { api, type Host } from '$lib/api';
+  import { modalFocus } from '$lib/modal';
 
   let { host, onclose }: { host: Host; onclose: () => void } = $props();
 
@@ -79,6 +80,7 @@
   role="dialog"
   aria-modal="true"
   tabindex="-1"
+  use:modalFocus
   class="fixed inset-0 z-40 bg-zinc-950/60 backdrop-blur-sm flex items-center justify-center p-4"
   onclick={(e) => {
     if (e.target === e.currentTarget) onclose();

@@ -1,6 +1,6 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.2.4}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.2.5}
     build:
       context: ..
       dockerfile: deploy/agent.Dockerfile

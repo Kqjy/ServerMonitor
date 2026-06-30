@@ -195,7 +195,7 @@
         series={memSeries}
         height={140}
         fill
-        format={(v) => bytes(v)}
+        format={(v, e = 0) => bytes(v, 1 + e)}
         {fromMs}
         {toMs}
         yClampMin={0}
@@ -211,7 +211,7 @@
       <MultiChart
         series={netSeries}
         height={140}
-        format={(v) => `${bytes(v)}/s`}
+        format={(v, e = 0) => `${bytes(v, 1 + e)}/s`}
         {fromMs}
         {toMs}
         yClampMin={0}

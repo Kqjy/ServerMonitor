@@ -201,11 +201,18 @@ CAPS=""
 [ "$ENABLE_SMART_NVME" = "1" ]  && CAPS="${CAPS:+$CAPS }CAP_SYS_ADMIN"
 [ "$ENABLE_NETWORK" = "1" ]     && CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN CAP_NET_RAW"
 
+DOCKER_ORDER=""
+if [ "$ENABLE_DOCKER" = "1" ]; then
+  DOCKER_ORDER="After=docker.service docker.socket
+Wants=docker.socket"
+fi
+
 cat >/etc/systemd/system/sm-agent.service <<UNIT
 [Unit]
 Description=ServerMonitor Agent
 After=network-online.target
 Wants=network-online.target
+$DOCKER_ORDER
 
 [Service]
 Type=simple

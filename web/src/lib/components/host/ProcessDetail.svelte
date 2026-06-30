@@ -175,7 +175,7 @@
         series={memSeries}
         height={140}
         fill
-        format={(v) => bytes(v)}
+        format={(v, e = 0) => bytes(v, 1 + e)}
         {fromMs}
         {toMs}
         zoomed={isZoomed}

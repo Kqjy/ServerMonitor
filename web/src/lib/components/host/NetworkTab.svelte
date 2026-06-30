@@ -204,7 +204,7 @@
       <DownloadCsv host={hostId} metric="net_rx_bytes" splitBy="iface" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(rx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(rx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v, e = 0) => `${bytes(v, e)}/s`} />
     </div>
   </section>
 
@@ -214,7 +214,7 @@
       <DownloadCsv host={hostId} metric="net_tx_bytes" splitBy="iface" {range} />
     </header>
     <div class="px-3 py-3">
-      <MultiChart series={toSeries(tx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v) => `${bytes(v, 0)}/s`} />
+      <MultiChart series={toSeries(tx)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="B/s" format={(v, e = 0) => `${bytes(v, e)}/s`} />
     </div>
   </section>
 
@@ -225,7 +225,7 @@
         <DownloadCsv host={hostId} metric="net_rx_packets" splitBy="iface" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(rxPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(rxPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v, e = 0) => `${v.toFixed(e)}/s`} />
       </div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -234,7 +234,7 @@
         <DownloadCsv host={hostId} metric="net_tx_packets" splitBy="iface" {range} />
       </header>
       <div class="px-3 py-3">
-        <MultiChart series={toSeries(txPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v) => `${v.toFixed(0)}/s`} />
+        <MultiChart series={toSeries(txPkts)} {fromMs} {toMs} zoomed={isZoomed} {masking} {loading} onZoom={handleZoom} onResetZoom={handleReset} unit="pps" format={(v, e = 0) => `${v.toFixed(e)}/s`} />
       </div>
     </section>
   </div>
@@ -252,7 +252,7 @@
           onZoom={handleZoom}
           onResetZoom={handleReset}
           unit="/s"
-          format={(v) => `${v.toFixed(2)}/s`} />
+          format={(v, e = 0) => `${v.toFixed(2 + e)}/s`} />
       </div>
     </section>
   {/if}

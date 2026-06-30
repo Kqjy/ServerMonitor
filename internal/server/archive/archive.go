@@ -229,7 +229,7 @@ func (a *Archiver) upload(ctx context.Context, key string, body *os.File, size i
 		Bucket:        aws.String(a.cfg.Bucket),
 		Key:           aws.String(key),
 		Body:          body,
-		ContentLength: size,
+		ContentLength: aws.Int64(size),
 		ContentType:   aws.String("application/x-parquet"),
 	})
 	return err

@@ -157,14 +157,14 @@
         <div class="text-xs uppercase tracking-wider text-zinc-500">Temperature</div>
         <DownloadCsv host={hostId} metric="gpu_temp_c" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(temp)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v) => `${v.toFixed(0)} °C`} /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(temp)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="°C" format={(v, e = 0) => `${v.toFixed(e)} °C`} /></div>
     </section>
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
         <div class="text-xs uppercase tracking-wider text-zinc-500">Power draw</div>
         <DownloadCsv host={hostId} metric="gpu_power_w" splitBy="gpu" {range} />
       </header>
-      <div class="px-3 py-3"><MultiChart series={toSeries(power)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="W" format={(v) => `${v.toFixed(0)} W`} /></div>
+      <div class="px-3 py-3"><MultiChart series={toSeries(power)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="W" format={(v, e = 0) => `${v.toFixed(e)} W`} /></div>
     </section>
   </div>
 {/if}

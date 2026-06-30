@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, type AlertRule, type AlertRuleInput, type Channel, type Host, type MetricMeta } from '$lib/api';
+  import { modalFocus } from '$lib/modal';
 
   let {
     rule,
@@ -153,7 +154,7 @@
   }
 </script>
 
-<div role="dialog" aria-modal="true" tabindex="-1" class="fixed inset-0 z-30 bg-zinc-950/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={(e) => { if (e.key === 'Escape') onClose(); }}>
+<div role="dialog" aria-modal="true" tabindex="-1" use:modalFocus class="fixed inset-0 z-30 bg-zinc-950/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={(e) => { if (e.key === 'Escape') onClose(); }}>
   <div class="w-full max-w-2xl rounded-t-xl sm:rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl overflow-hidden flex flex-col max-h-[90vh] sm:max-h-[calc(100vh-2rem)]">
     <header class="px-4 sm:px-5 py-3 border-b border-zinc-800 flex items-center justify-between shrink-0">
       <h2 class="text-base font-medium text-zinc-100">{rule ? 'Edit alert rule' : 'New alert rule'}</h2>

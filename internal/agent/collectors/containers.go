@@ -3,7 +3,6 @@ package collectors
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"math"
 	"strings"
 	"sync"
@@ -16,11 +15,19 @@ import (
 	"servermonitor/pkg/wire"
 )
 
+const dockerProbeBackoff = 30 * time.Second
+
+type cpuSample struct {
+	total  uint64
+	system uint64
+}
+
 type containerCollector struct {
-	mu         sync.Mutex
-	cli        *client.Client
-	probedOnce bool
-	available  bool
+	mu        sync.Mutex
+	cli       *client.Client
+	nextProbe time.Time
+	prevMu    sync.Mutex
+	prev      map[string]cpuSample
 }
 
 func init() { Register(&containerCollector{}) }
@@ -28,35 +35,49 @@ func init() { Register(&containerCollector{}) }
 func (c *containerCollector) Name() string        { return "containers" }
 func (c *containerCollector) Platforms() []string { return []string{"all"} }
 
-func (c *containerCollector) probe() {
+func (c *containerCollector) connect(ctx context.Context) *client.Client {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.probedOnce {
-		return
+	if c.cli != nil {
+		return c.cli
 	}
-	c.probedOnce = true
+	if time.Now().Before(c.nextProbe) {
+		return nil
+	}
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return
+		c.nextProbe = time.Now().Add(dockerProbeBackoff)
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if _, err := cli.Ping(ctx); err != nil {
+	if _, err := cli.Ping(pctx); err != nil {
 		_ = cli.Close()
-		return
+		c.nextProbe = time.Now().Add(dockerProbeBackoff)
+		return nil
 	}
 	c.cli = cli
-	c.available = true
+	return cli
+}
+
+func (c *containerCollector) drop(cli *client.Client) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cli == cli {
+		_ = c.cli.Close()
+		c.cli = nil
+	}
 }
 
 func (c *containerCollector) Collect(ctx context.Context) ([]wire.Point, error) {
-	c.probe()
-	if !c.available {
+	cli := c.connect(ctx)
+	if cli == nil {
 		return nil, nil
 	}
 	now := time.Now()
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{All: true})
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
+		c.drop(cli)
 		return nil, err
 	}
 	var running, stopped int
@@ -75,16 +96,18 @@ func (c *containerCollector) Collect(ctx context.Context) ([]wire.Point, error) 
 }
 
 func (c *containerCollector) CollectContainers(ctx context.Context) ([]wire.Container, error) {
-	c.probe()
-	if !c.available {
+	cli := c.connect(ctx)
+	if cli == nil {
 		return nil, nil
 	}
 	now := time.Now()
-	list, err := c.cli.ContainerList(ctx, container.ListOptions{All: true})
+	list, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
+		c.drop(cli)
 		return nil, err
 	}
 
+	seen := make(map[string]cpuSample, len(list))
 	out := make([]wire.Container, 0, len(list))
 	for _, cnt := range list {
 		entry := wire.Container{
@@ -95,8 +118,15 @@ func (c *containerCollector) CollectContainers(ctx context.Context) ([]wire.Cont
 			State: cnt.State,
 		}
 		if strings.EqualFold(cnt.State, "running") {
-			if s, err := readStats(ctx, c.cli, cnt.ID); err == nil {
-				entry.CPUPct = float32(s.cpuPct)
+			if s, err := readStats(ctx, cli, cnt.ID); err == nil {
+				cur := cpuSample{total: s.cpuTotal, system: s.cpuSystem}
+				seen[cnt.ID] = cur
+				c.prevMu.Lock()
+				prev, ok := c.prev[cnt.ID]
+				c.prevMu.Unlock()
+				if ok {
+					entry.CPUPct = float32(cpuPercent(prev, cur, s.onlineCPUs))
+				}
 				entry.MemUsed = s.memUsed
 				entry.MemLimit = s.memLimit
 				entry.RxBytes = s.rx
@@ -105,14 +135,19 @@ func (c *containerCollector) CollectContainers(ctx context.Context) ([]wire.Cont
 		}
 		out = append(out, entry)
 	}
+	c.prevMu.Lock()
+	c.prev = seen
+	c.prevMu.Unlock()
 	return out, nil
 }
 
 type contStats struct {
-	cpuPct   float64
-	memUsed  int64
-	memLimit int64
-	rx, tx   int64
+	cpuTotal   uint64
+	cpuSystem  uint64
+	onlineCPUs int
+	memUsed    int64
+	memLimit   int64
+	rx, tx     int64
 }
 
 func readStats(ctx context.Context, cli *client.Client, id string) (contStats, error) {
@@ -127,41 +162,49 @@ func readStats(ctx context.Context, cli *client.Client, id string) (contStats, e
 		return contStats{}, err
 	}
 
-	cpuDelta := float64(v.CPU.Usage.Total - v.PreCPU.Usage.Total)
-	systemDelta := float64(v.CPU.SystemUsage - v.PreCPU.SystemUsage)
-	cpuPct := 0.0
-	if systemDelta > 0 && cpuDelta > 0 {
-		cpuPct = (cpuDelta / systemDelta) * float64(max(v.CPU.OnlineCPUs, 1)) * 100.0
-	}
-
 	var rx, tx int64
 	for _, n := range v.Networks {
 		rx += n.RxBytes
 		tx += n.TxBytes
 	}
 
-	if cpuPct < 0 {
-		cpuPct = 0
-	}
-	if !isFinite(cpuPct) {
-		cpuPct = 0
-	}
-	if cpuPct > 10000 {
-		return contStats{}, errors.New("implausible cpu pct")
+	online := v.CPU.OnlineCPUs
+	if online < 1 {
+		online = 1
 	}
 
 	return contStats{
-		cpuPct:   cpuPct,
-		memUsed:  int64(v.Memory.Usage),
-		memLimit: int64(v.Memory.Limit),
-		rx:       rx,
-		tx:       tx,
+		cpuTotal:   v.CPU.Usage.Total,
+		cpuSystem:  v.CPU.SystemUsage,
+		onlineCPUs: online,
+		memUsed:    int64(v.Memory.Usage),
+		memLimit:   int64(v.Memory.Limit),
+		rx:         rx,
+		tx:         tx,
 	}, nil
+}
+
+func cpuPercent(prev, cur cpuSample, onlineCPUs int) float64 {
+	if cur.total < prev.total || cur.system < prev.system {
+		return 0
+	}
+	cpuDelta := float64(cur.total - prev.total)
+	systemDelta := float64(cur.system - prev.system)
+	if cpuDelta <= 0 || systemDelta <= 0 {
+		return 0
+	}
+	if onlineCPUs < 1 {
+		onlineCPUs = 1
+	}
+	pct := cpuDelta / systemDelta * float64(onlineCPUs) * 100.0
+	if !isFinite(pct) || pct < 0 {
+		return 0
+	}
+	return pct
 }
 
 type statsView struct {
 	CPU    cpuStats `json:"cpu_stats"`
-	PreCPU cpuStats `json:"precpu_stats"`
 	Memory struct {
 		Usage uint64 `json:"usage"`
 		Limit uint64 `json:"limit"`

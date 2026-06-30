@@ -162,7 +162,7 @@
         onZoom={handleZoom}
         onResetZoom={handleReset}
         unit="B"
-        format={(v) => bytes(v, 0)} />
+        format={(v, e = 0) => bytes(v, e)} />
     </div>
   </section>
 
@@ -182,7 +182,7 @@
           onZoom={handleZoom}
           onResetZoom={handleReset}
           unit="B"
-          format={(v) => bytes(v, 0)}
+          format={(v, e = 0) => bytes(v, e)}
           fill />
       </div>
     </section>

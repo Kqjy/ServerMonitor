@@ -19,6 +19,8 @@
   let atOldest = $state(false);
   let expandedCid = $state<string | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
+  let refreshGen = 0;
+  let inflight: AbortController | null = null;
 
   function toggleExpand(cid: string) {
     expandedCid = expandedCid === cid ? null : cid;
@@ -31,29 +33,41 @@
   }
 
   async function refresh() {
-    const opts: { at?: string } = {};
+    const gen = ++refreshGen;
+    inflight?.abort();
+    const ac = new AbortController();
+    inflight = ac;
+    const opts: { at?: string; signal: AbortSignal } = { signal: ac.signal };
     if (atMs !== null) opts.at = new Date(atMs).toISOString();
     try {
       const fetched = await api.containers(hostId, opts);
+      if (gen !== refreshGen) return;
       rows = fetched;
       error = null;
       if (fetched.length > 0) atOldest = false;
     } catch (e) {
+      if (gen !== refreshGen || (e as { name?: string })?.name === 'AbortError') return;
       error = (e as Error).message;
     } finally {
-      loaded = true;
+      if (gen === refreshGen) loaded = true;
     }
   }
 
   async function step(dir: 'prev' | 'next') {
     if (stepping) return;
     stepping = true;
+    const gen = ++refreshGen;
+    inflight?.abort();
+    const ac = new AbortController();
+    inflight = ac;
     try {
       const boundaryMs = atMs ?? lastDataMs ?? Date.now();
       const fetched = await api.containers(hostId, {
         dir,
-        at: new Date(boundaryMs).toISOString()
+        at: new Date(boundaryMs).toISOString(),
+        signal: ac.signal
       });
+      if (gen !== refreshGen) return;
       error = null;
       if (fetched.length > 0) {
         rows = fetched;
@@ -72,6 +86,7 @@
         atOldest = true;
       }
     } catch (e) {
+      if (gen !== refreshGen || (e as { name?: string })?.name === 'AbortError') return;
       error = (e as Error).message;
     } finally {
       stepping = false;
@@ -81,12 +96,13 @@
   onMount(() => {
     refresh();
     timer = setInterval(() => {
-      if (atMs !== null) return;
+      if (atMs !== null || stepping) return;
       refresh();
     }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    inflight?.abort();
   });
 
   function pad(n: number) {

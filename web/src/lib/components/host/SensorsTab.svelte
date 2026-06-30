@@ -132,7 +132,7 @@
         onZoom={handleZoom}
         onResetZoom={handleReset}
         unit="°C"
-        format={(v) => `${v.toFixed(0)} °C`} />
+        format={(v, e = 0) => `${v.toFixed(e)} °C`} />
     </div>
   </section>
 {/if}
