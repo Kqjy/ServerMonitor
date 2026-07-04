@@ -19,7 +19,7 @@ func clearIdentityEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"SM_SERVER_URL", "SM_TOKEN", "SM_SERVER_PUBKEY",
-		"SM_INTERVAL_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE",
+		"SM_INTERVAL_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE", "SM_BACKUP_STATUS_PATH",
 	} {
 		t.Setenv(k, "")
 	}
@@ -121,5 +121,29 @@ func TestLoadInvalidIntervalEnvIgnored(t *testing.T) {
 	}
 	if c.IntervalS != 10 {
 		t.Fatalf("invalid SM_INTERVAL_S should keep default 10, got %d", c.IntervalS)
+	}
+}
+
+func TestLoadBackupStatusPath(t *testing.T) {
+	clearIdentityEnv(t)
+	p := writeTempConfig(t, `server_url = "https://file.example.com"
+token = "filetok"
+backup_status_path = "/tmp/custom-backup-status.json"
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.BackupStatusPath != "/tmp/custom-backup-status.json" {
+		t.Fatalf("backup status path = %q", c.BackupStatusPath)
+	}
+
+	t.Setenv("SM_BACKUP_STATUS_PATH", "/tmp/env-backup-status.json")
+	c, err = Load(p)
+	if err != nil {
+		t.Fatalf("Load env override: %v", err)
+	}
+	if c.BackupStatusPath != "/tmp/env-backup-status.json" {
+		t.Fatalf("env backup status path = %q", c.BackupStatusPath)
 	}
 }

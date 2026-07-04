@@ -47,6 +47,29 @@ type Port struct {
 	Process string    `json:"process,omitempty"`
 }
 
+type BackupSnapshot struct {
+	ID    string    `json:"id"`
+	Time  time.Time `json:"time,omitempty"`
+	Paths []string  `json:"paths,omitempty"`
+}
+
+type BackupRepoStatus struct {
+	Name          string           `json:"name"`
+	Engine        string           `json:"engine,omitempty"`
+	LastStarted   *time.Time       `json:"last_started,omitempty"`
+	LastFinished  *time.Time       `json:"last_finished,omitempty"`
+	LastSuccess   *time.Time       `json:"last_success,omitempty"`
+	Success       bool             `json:"success"`
+	Error         string           `json:"error,omitempty"`
+	DurationS     int64            `json:"duration_s,omitempty"`
+	AddedBytes    int64            `json:"added_bytes,omitempty"`
+	TotalBytes    int64            `json:"total_bytes,omitempty"`
+	SnapshotCount int64            `json:"snapshot_count,omitempty"`
+	CheckLast     *time.Time       `json:"check_last,omitempty"`
+	CheckSuccess  *bool            `json:"check_success,omitempty"`
+	Snapshots     []BackupSnapshot `json:"snapshots,omitempty"`
+}
+
 type CollectorStatus struct {
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
@@ -66,12 +89,13 @@ type HostInfo struct {
 }
 
 type Batch struct {
-	Host       HostInfo    `json:"host"`
-	Points     []Point     `json:"points"`
-	Processes  []Process   `json:"processes,omitempty"`
-	Containers []Container `json:"containers,omitempty"`
-	Ports      []Port      `json:"ports,omitempty"`
-	Sent       time.Time   `json:"sent"`
+	Host       HostInfo           `json:"host"`
+	Points     []Point            `json:"points"`
+	Processes  []Process          `json:"processes,omitempty"`
+	Containers []Container        `json:"containers,omitempty"`
+	Ports      []Port             `json:"ports,omitempty"`
+	Backups    []BackupRepoStatus `json:"backups,omitempty"`
+	Sent       time.Time          `json:"sent"`
 }
 
 type IngestAck struct {

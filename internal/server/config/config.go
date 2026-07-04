@@ -18,7 +18,18 @@ type Config struct {
 	S3Bucket             string
 	S3Region             string
 	S3Prefix             string
+	S3Endpoint           string
 	S3UsePathStyle       bool
+	BackupDir            string
+	BackupS3Bucket       string
+	BackupS3Region       string
+	BackupS3Prefix       string
+	BackupS3Endpoint     string
+	BackupS3UsePathStyle bool
+	BackupMaxBlobBytes   int64
+	BackupACMEDomain     string
+	ACMEEmail            string
+	ACMECacheDir         string
 	IngestRateLimit      int
 	IngestBurst          int
 	BatcherMaxRows       int
@@ -37,9 +48,32 @@ type Config struct {
 	AgentSigningKeyFile  string
 }
 
-func (c *Config) ServesTLS() bool         { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
-func (c *Config) BehindTLSProxy() bool    { return c.TrustProxyTLS }
-func (c *Config) SecureBrowserSide() bool { return c.ServesTLS() || c.BehindTLSProxy() }
+func (c *Config) ServesTLS() bool      { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
+func (c *Config) BehindTLSProxy() bool { return c.TrustProxyTLS }
+func (c *Config) SecureBrowserSide() bool {
+	return c.ServesTLS() || c.BehindTLSProxy() || c.ACMEEnabled()
+}
+
+func (c *Config) BackupEnabled() bool { return c.BackupDir != "" || c.BackupS3Bucket != "" }
+
+func (c *Config) ACMEEnabled() bool {
+	return c.BackupACMEDomain != "" && !c.ServesTLS() && !c.TrustProxyTLS
+}
+
+func (c *Config) BackupTLSMode() string {
+	switch {
+	case c.ServesTLS():
+		return "tls"
+	case c.TrustProxyTLS:
+		return "proxy"
+	case c.ACMEEnabled():
+		return "acme"
+	default:
+		return "insecure"
+	}
+}
+
+func (c *Config) BackupTLSSecure() bool { return c.BackupTLSMode() != "insecure" }
 
 func Load() (*Config, error) {
 	c := &Config{
@@ -49,7 +83,18 @@ func Load() (*Config, error) {
 		S3Bucket:             getenv("S3_BUCKET", ""),
 		S3Region:             getenv("S3_REGION", ""),
 		S3Prefix:             getenv("S3_PREFIX", "metrics"),
+		S3Endpoint:           getenv("S3_ENDPOINT", ""),
 		S3UsePathStyle:       getenvBool("S3_USE_PATH_STYLE", false),
+		BackupDir:            getenv("BACKUP_DIR", ""),
+		BackupS3Bucket:       getenv("BACKUP_S3_BUCKET", ""),
+		BackupS3Region:       getenv("BACKUP_S3_REGION", ""),
+		BackupS3Prefix:       getenv("BACKUP_S3_PREFIX", "backups"),
+		BackupS3Endpoint:     getenv("BACKUP_S3_ENDPOINT", ""),
+		BackupS3UsePathStyle: getenvBool("BACKUP_S3_USE_PATH_STYLE", false),
+		BackupMaxBlobBytes:   getenvInt64("BACKUP_MAX_BLOB_BYTES", 1<<30),
+		BackupACMEDomain:     getenv("BACKUP_ACME_DOMAIN", ""),
+		ACMEEmail:            getenv("ACME_EMAIL", ""),
+		ACMECacheDir:         getenv("ACME_CACHE_DIR", ""),
 		IngestRateLimit:      getenvInt("INGEST_RATE_LIMIT", 10),
 		IngestBurst:          getenvInt("INGEST_BURST", 30),
 		BatcherMaxRows:       getenvInt("BATCHER_MAX_ROWS", 50000),
@@ -82,8 +127,14 @@ func Load() (*Config, error) {
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return nil, fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must be set together")
 	}
-	if !c.ServesTLS() && !c.TrustProxyTLS && !c.InsecureAllowHTTP {
-		return nil, fmt.Errorf("refusing to start over plaintext HTTP: set TLS_CERT_FILE+TLS_KEY_FILE for native TLS, TRUST_PROXY_TLS=1 if a reverse proxy terminates TLS, or INSECURE_ALLOW_HTTP=1 to acknowledge plaintext (loopback/dev only)")
+	if !c.SecureBrowserSide() && !c.InsecureAllowHTTP {
+		return nil, fmt.Errorf("refusing to start over plaintext HTTP: set TLS_CERT_FILE+TLS_KEY_FILE for native TLS, TRUST_PROXY_TLS=1 if a reverse proxy terminates TLS, BACKUP_ACME_DOMAIN for automatic Let's Encrypt, or INSECURE_ALLOW_HTTP=1 to acknowledge plaintext (loopback/dev only)")
+	}
+	if c.BackupDir != "" && c.BackupS3Bucket != "" {
+		return nil, fmt.Errorf("set BACKUP_DIR or BACKUP_S3_BUCKET, not both")
+	}
+	if c.BackupMaxBlobBytes <= 0 {
+		c.BackupMaxBlobBytes = 1 << 30
 	}
 	for _, p := range []struct {
 		name, value string
@@ -222,6 +273,15 @@ func getenv(key, def string) string {
 func getenvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getenvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

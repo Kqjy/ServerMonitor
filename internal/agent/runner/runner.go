@@ -33,6 +33,7 @@ type Runner struct {
 }
 
 func New(cfg *config.Config, client *transport.Client, logger *slog.Logger) *Runner {
+	collectors.SetBackupStatusPath(cfg.BackupStatusPath)
 	return &Runner{
 		cfg:        cfg,
 		client:     client,
@@ -142,6 +143,7 @@ func (r *Runner) tick(ctx context.Context) {
 		procs []wire.Process
 		conts []wire.Container
 		ports []wire.Port
+		baks  []wire.BackupRepoStatus
 	)
 
 	for _, c := range r.collectors {
@@ -186,6 +188,13 @@ func (r *Runner) tick(ctx context.Context) {
 					mu.Unlock()
 				}
 			}
+			if bc, ok := col.(collectors.BackupCollector); ok {
+				if bs, err := bc.CollectBackups(tickCtx); err == nil {
+					mu.Lock()
+					baks = append(baks, bs...)
+					mu.Unlock()
+				}
+			}
 		}(c)
 	}
 	wg.Wait()
@@ -194,8 +203,9 @@ func (r *Runner) tick(ctx context.Context) {
 	batch.Processes = procs
 	batch.Containers = conts
 	batch.Ports = ports
+	batch.Backups = baks
 
-	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 {
+	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(baks) == 0 {
 		return
 	}
 
@@ -205,5 +215,5 @@ func (r *Runner) tick(ctx context.Context) {
 		r.logger.Error("send failed", "err", err, "points", len(batch.Points))
 		return
 	}
-	r.logger.Debug("send ok", "points", len(batch.Points), "procs", len(procs), "containers", len(conts), "ports", len(ports))
+	r.logger.Debug("send ok", "points", len(batch.Points), "procs", len(procs), "containers", len(conts), "ports", len(ports), "backups", len(baks))
 }

@@ -38,6 +38,11 @@ func TestLoadTLSGate(t *testing.T) {
 			wantSec: true,
 		},
 		{
+			name:    "BACKUP_ACME_DOMAIN alone starts and is secure",
+			env:     map[string]string{"BACKUP_ACME_DOMAIN": "backup.example.com"},
+			wantSec: true,
+		},
+		{
 			name:    "TLS cert without key is rejected",
 			env:     map[string]string{"TLS_CERT_FILE": "cert.pem"},
 			wantErr: "TLS_CERT_FILE and TLS_KEY_FILE must be set together",
@@ -85,6 +90,7 @@ var allEnvKeys = map[string]struct{}{
 	"INSECURE_ALLOW_HTTP": {},
 	"TRUSTED_PROXIES":     {},
 	"HTTP_ADDR":           {},
+	"BACKUP_ACME_DOMAIN":  {},
 }
 
 func TestLoadRejectsPlaceholderSecrets(t *testing.T) {

@@ -61,7 +61,7 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			return
 		}
 
-		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 {
+		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 {
 			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
 			if signer != nil {
 				emptyAck.ServerPubkey = signer.PublicKeyHex()
@@ -119,6 +119,11 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 		}
 
 		points, procs, conts, ports := ingest.ConvertBatch(hostID, &batch)
+		backups, backupRepos, err := ingest.ConvertBackups(hostID, batch.Backups, now)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid backups: "+err.Error())
+			return
+		}
 		if err := b.Reserve(len(points)); err != nil {
 			if errors.Is(err, ingest.ErrBackpressure) {
 				w.Header().Set("Retry-After", "2")
@@ -128,9 +133,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			writeError(w, http.StatusInternalServerError, "reserve failed")
 			return
 		}
-		if err := ingest.InsertSnapshots(r.Context(), b.Pool(), procs, conts, ports); err != nil {
+		if err := ingest.InsertSnapshots(r.Context(), b.Pool(), procs, conts, ports, backups, backupRepos); err != nil {
 			b.ReleaseReserved(len(points))
-			logger.Warn("insert snapshots", "err", err, "host", hostID, "procs", len(procs), "conts", len(conts), "ports", len(ports))
+			logger.Warn("insert snapshots", "err", err, "host", hostID, "procs", len(procs), "conts", len(conts), "ports", len(ports), "backups", len(backups))
 			w.Header().Set("Retry-After", "2")
 			writeError(w, http.StatusBadGateway, "snapshot insert failed")
 			return

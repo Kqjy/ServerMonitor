@@ -14,11 +14,25 @@ ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
 ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
+ENABLE_BACKUP="${SM_ENABLE_BACKUP:-0}"
+BACKUP_REPOS="${SM_BACKUP_REPOS:-}"
+BACKUP_REPO_NAMES="${SM_BACKUP_REPO_NAMES:-}"
+BACKUP_PATHS="${SM_BACKUP_PATHS:-}"
+BACKUP_TIME="${SM_BACKUP_TIME:-02:30}"
+BACKUP_PRUNE_MODE="${SM_BACKUP_PRUNE_MODE:-host}"
+BACKUP_S3_REGION="${SM_BACKUP_S3_REGION:-}"
+BACKUP_S3_PATH_STYLE="${SM_BACKUP_S3_PATH_STYLE:-0}"
+BACKUP_S3_ACCESS_KEY_ID="${SM_BACKUP_S3_ACCESS_KEY_ID:-}"
+BACKUP_S3_SECRET_ACCESS_KEY="${SM_BACKUP_S3_SECRET_ACCESS_KEY:-}"
+BACKUP_S3_SESSION_TOKEN="${SM_BACKUP_S3_SESSION_TOKEN:-}"
+BACKUP_REST_USERNAME="${SM_BACKUP_REST_USERNAME:-}"
+BACKUP_REST_PASSWORD="${SM_BACKUP_REST_PASSWORD:-}"
 REINSTALL="${SM_REINSTALL:-0}"
+RESTIC_VERSION="0.19.0"
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--reinstall]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-time HH:MM] [--reinstall]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
@@ -42,7 +56,22 @@ extra collector's grant:
   --enable-docker       adds 'docker' group membership (containers collector)
   --enable-gpu          adds 'video' group membership (some nvidia-smi setups)
   --enable-network      adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
-  --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme; CAP_SYS_ADMIN must be opted into explicitly
+  --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme and --enable-backup; CAP_SYS_ADMIN and whole-host backup read access must be opted into explicitly
+  --enable-backup       provisions scheduled encrypted restic backups: installs a pinned restic to /usr/local/bin/sm-restic, writes /etc/servermonitor-backup/backup.toml, generates a repo key, runs 'sm-agent backup init', and adds an sm-backup systemd timer whose oneshot unit runs with CAP_DAC_READ_SEARCH so it can read every file on the host to back it up. That grant is confined to the backup unit, not the resident agent. NOT included in --enable-all. Requires --backup-repos (or SM_BACKUP_REPOS) on a fresh setup
+
+Backup inputs (used with --enable-backup; each also settable via the matching SM_BACKUP_* env var):
+  --backup-repos URLS         comma-separated restic repository URLs (e.g. rest:https://user:pass@host/repo). Required on a fresh backup setup
+  --backup-repo-names NAMES   comma-separated logical names matching --backup-repos (default repo1..repoN)
+  --backup-paths PATHS        comma-separated paths to back up (default /etc,/home,/root,/var/lib)
+  --backup-time HH:MM         local time for the nightly backup (default 02:30, with a randomized delay)
+  --backup-prune-mode MODE    "host" (prune after each run; default) or "external" (host never prunes; a trusted box holding the key prunes). Use "external" against append-only endpoints
+  --backup-s3-region REGION   region for s3: repositories (also SM_BACKUP_S3_REGION)
+  --backup-s3-path-style      path-style S3 addressing, required by MinIO/Ceph/Garage and most self-hosted S3 (also SM_BACKUP_S3_PATH_STYLE=1)
+
+S3/REST transport credentials are env-only (never flags: argv is world-readable) and are written to a
+root-owned /etc/servermonitor-backup/repo-credentials.env (0440 root:sm-agent), applied to every s3:/b2:/rest: repo:
+  SM_BACKUP_S3_ACCESS_KEY_ID / SM_BACKUP_S3_SECRET_ACCESS_KEY / SM_BACKUP_S3_SESSION_TOKEN   S3 or B2 object storage
+  SM_BACKUP_REST_USERNAME / SM_BACKUP_REST_PASSWORD                                          a rest-server or ServerMonitor backup endpoint
 
 Examples:
   SM_ADMIN_TOKEN=xxx $0 --server https://monitor.example.com --binary ./sm-agent
@@ -65,6 +94,14 @@ while [[ $# -gt 0 ]]; do
     --enable-gpu)        ENABLE_GPU=1; shift ;;
     --enable-network)    ENABLE_NETWORK=1; shift ;;
     --enable-all)        ENABLE_ALL=1; shift ;;
+    --enable-backup)     ENABLE_BACKUP=1; shift ;;
+    --backup-repos)      BACKUP_REPOS="$2"; shift 2 ;;
+    --backup-repo-names) BACKUP_REPO_NAMES="$2"; shift 2 ;;
+    --backup-paths)      BACKUP_PATHS="$2"; shift 2 ;;
+    --backup-time)       BACKUP_TIME="$2"; shift 2 ;;
+    --backup-prune-mode) BACKUP_PRUNE_MODE="$2"; shift 2 ;;
+    --backup-s3-region)  BACKUP_S3_REGION="$2"; shift 2 ;;
+    --backup-s3-path-style) BACKUP_S3_PATH_STYLE=1; shift ;;
     --reinstall)         REINSTALL=1; shift ;;
     -h|--help)           usage ;;
     *) echo "unknown arg $1" >&2; usage ;;
@@ -141,6 +178,432 @@ install_smartmontools() {
     echo "smartmontools installed: $(command -v smartctl)"
   else
     echo "warning: smartmontools install attempt finished but smartctl is not on PATH; install manually for SMART support" >&2
+  fi
+}
+
+warn_backup_capability() {
+  cat >&2 <<'WARN'
+
+WARNING: --enable-backup grants the sm-backup unit CAP_DAC_READ_SEARCH, letting
+         it read every file on the host to back it up. The grant is confined to
+         the oneshot sm-backup.service and its timer, NOT the resident sm-agent
+         daemon, and it is excluded from --enable-all. Enable it only where
+         whole-host read access for backups is worth that exposure.
+
+WARN
+}
+
+backup_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+backup_toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+provision_restic() {
+  local arch_raw arch sha url tmp bz2
+  arch_raw="$(uname -m)"
+  case "$arch_raw" in
+    x86_64|amd64)              arch=amd64; sha="13176fe6d89d4357947a2cd107218ab2873a5f9d8e1ac2d4cd1c8e07e6839c21" ;;
+    aarch64|arm64)             arch=arm64; sha="e522ce6bf748d753fee8093e8ec59359972cf5b6bc65fc7c7cf38ae952351d91" ;;
+    armv7l|armv6l|armv7|armv6) arch=arm;   sha="2997e6ebd953a551abe33172876ce1a88aa1bb29a93425b167747ece7a38c850" ;;
+    i686|i386)                 arch=386;   sha="0b58b04a7d2fffe290ed00ea841e97662af33296a2ba6abb52d4c62612b2e1e6" ;;
+    *) echo "unsupported arch for restic: $arch_raw" >&2; exit 1 ;;
+  esac
+  if [ -x /usr/local/bin/sm-restic ] && /usr/local/bin/sm-restic version 2>/dev/null | grep -q "restic ${RESTIC_VERSION} "; then
+    echo "restic ${RESTIC_VERSION} already present at /usr/local/bin/sm-restic"
+    rm -f /opt/servermonitor/restic
+    return 0
+  fi
+  command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum required to verify the restic download" >&2; exit 1; }
+  command -v bunzip2 >/dev/null 2>&1 || { echo "bunzip2 (bzip2) required to unpack restic" >&2; exit 1; }
+  url="https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${arch}.bz2"
+  tmp="$(mktemp -d)"
+  bz2="$tmp/restic.bz2"
+  echo "downloading restic ${RESTIC_VERSION} for linux_${arch} ..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$bz2" "$url" || { rm -rf "$tmp"; echo "restic download failed" >&2; exit 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$bz2" "$url" || { rm -rf "$tmp"; echo "restic download failed" >&2; exit 1; }
+  else
+    rm -rf "$tmp"; echo "curl or wget required to download restic" >&2; exit 1
+  fi
+  if ! printf '%s  %s\n' "$sha" "$bz2" | sha256sum -c - >/dev/null 2>&1; then
+    rm -rf "$tmp"; echo "restic checksum mismatch for linux_${arch}; refusing to install" >&2; exit 1
+  fi
+  bunzip2 -c "$bz2" > "$tmp/restic"
+  install -o root -g root -m 0755 "$tmp/restic" /usr/local/bin/sm-restic
+  rm -rf "$tmp"
+  rm -f /opt/servermonitor/restic
+  echo "restic ${RESTIC_VERSION} installed at /usr/local/bin/sm-restic"
+}
+
+backup_migrate_legacy() {
+  [ -f /etc/servermonitor/backup.toml ] || [ -f /etc/servermonitor/backup.key ] || return 0
+  install -o root -g sm-agent -m 0750 -d /etc/servermonitor-backup
+  if [ -f /etc/servermonitor/backup.toml ] && [ ! -f /etc/servermonitor-backup/backup.toml ]; then
+    mv /etc/servermonitor/backup.toml /etc/servermonitor-backup/backup.toml
+    chown root:sm-agent /etc/servermonitor-backup/backup.toml
+    chmod 0640 /etc/servermonitor-backup/backup.toml
+    sed -i 's|"/etc/servermonitor/backup.key"|"/etc/servermonitor-backup/backup.key"|; s|"/opt/servermonitor/restic"|"/usr/local/bin/sm-restic"|' /etc/servermonitor-backup/backup.toml
+  fi
+  if [ -f /etc/servermonitor/backup.key ] && [ ! -f /etc/servermonitor-backup/backup.key ]; then
+    mv /etc/servermonitor/backup.key /etc/servermonitor-backup/backup.key
+    chown root:sm-agent /etc/servermonitor-backup/backup.key
+    chmod 0440 /etc/servermonitor-backup/backup.key
+  fi
+  if [ -f /etc/servermonitor/recovery-kit.txt ] && [ ! -f /etc/servermonitor-backup/recovery-kit.txt ]; then
+    mv /etc/servermonitor/recovery-kit.txt /etc/servermonitor-backup/recovery-kit.txt
+    chown root:root /etc/servermonitor-backup/recovery-kit.txt
+    chmod 0400 /etc/servermonitor-backup/recovery-kit.txt
+  fi
+  echo "note: relocated backup config from /etc/servermonitor to /etc/servermonitor-backup"
+}
+
+backup_generate_key() {
+  if [ -f /etc/servermonitor-backup/backup.key ]; then
+    echo "note: existing /etc/servermonitor-backup/backup.key kept (guards existing snapshots; never regenerated)"
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp /etc/servermonitor-backup/backup.key.XXXXXX)"
+  head -c 32 /dev/urandom | base64 > "$tmp"
+  chmod 0440 "$tmp"
+  chown root:sm-agent "$tmp"
+  mv -f "$tmp" /etc/servermonitor-backup/backup.key
+  return 0
+}
+
+backup_have_transport_creds() {
+  [ -n "$BACKUP_S3_ACCESS_KEY_ID" ] || [ -n "$BACKUP_S3_SECRET_ACCESS_KEY" ] || \
+    [ -n "$BACKUP_REST_USERNAME" ] || [ -n "$BACKUP_REST_PASSWORD" ]
+}
+
+backup_write_env_file() {
+  local tmp
+  tmp="$(mktemp /etc/servermonitor-backup/repo-credentials.env.XXXXXX)"
+  {
+    [ -n "$BACKUP_S3_ACCESS_KEY_ID" ]     && printf 'AWS_ACCESS_KEY_ID=%s\n' "$BACKUP_S3_ACCESS_KEY_ID"
+    [ -n "$BACKUP_S3_SECRET_ACCESS_KEY" ] && printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$BACKUP_S3_SECRET_ACCESS_KEY"
+    [ -n "$BACKUP_S3_SESSION_TOKEN" ]     && printf 'AWS_SESSION_TOKEN=%s\n' "$BACKUP_S3_SESSION_TOKEN"
+    [ -n "$BACKUP_REST_USERNAME" ]        && printf 'RESTIC_REST_USERNAME=%s\n' "$BACKUP_REST_USERNAME"
+    [ -n "$BACKUP_REST_PASSWORD" ]        && printf 'RESTIC_REST_PASSWORD=%s\n' "$BACKUP_REST_PASSWORD"
+  } > "$tmp"
+  chmod 0440 "$tmp"
+  chown root:sm-agent "$tmp"
+  mv -f "$tmp" /etc/servermonitor-backup/repo-credentials.env
+}
+
+backup_write_toml() {
+  local tmp i name url first item
+  local -a repo_arr name_arr path_arr
+  IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
+  IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
+  IFS=',' read -ra path_arr <<< "${BACKUP_PATHS:-/etc,/home,/root,/var/lib}"
+  tmp="$(mktemp /etc/servermonitor-backup/backup.toml.XXXXXX)"
+  {
+    echo "status_path = \"/var/lib/servermonitor/backup-status.json\""
+    echo "restic_path = \"/usr/local/bin/sm-restic\""
+    first=1
+    printf 'paths = ['
+    for item in "${path_arr[@]}"; do
+      item="$(backup_trim "$item")"
+      [ -z "$item" ] && continue
+      if [ "$first" = 1 ]; then first=0; else printf ', '; fi
+      printf '"%s"' "$(backup_toml_escape "$item")"
+    done
+    printf ']\n'
+    echo "excludes = [\"**/.cache\", \"/var/lib/docker\", \"/var/lib/servermonitor\"]"
+    echo "one_file_system = true"
+    printf 'prune_mode = "%s"\n' "$BACKUP_PRUNE_MODE"
+    echo ""
+    echo "[retention]"
+    echo "daily = 7"
+    echo "weekly = 4"
+    echo "monthly = 6"
+    i=0
+    for url in "${repo_arr[@]}"; do
+      url="$(backup_trim "$url")"
+      [ -z "$url" ] && continue
+      name="$(backup_trim "${name_arr[$i]:-}")"
+      [ -z "$name" ] && name="repo$((i+1))"
+      echo ""
+      echo "[[repo]]"
+      printf 'name = "%s"\n' "$(backup_toml_escape "$name")"
+      printf 'url = "%s"\n' "$(backup_toml_escape "$url")"
+      echo "password_file = \"/etc/servermonitor-backup/backup.key\""
+      case "$url" in
+        s3:*|b2:*|rest:*)
+          if [ -f /etc/servermonitor-backup/repo-credentials.env ]; then
+            echo "env_file = \"/etc/servermonitor-backup/repo-credentials.env\""
+          else
+            printf 'note: repo "%s" targets %s but no S3/REST credentials were provided (set SM_BACKUP_S3_* or SM_BACKUP_REST_*); authentication will fail\n' "$name" "${url%%:*}:" >&2
+          fi
+          ;;
+      esac
+      case "$url" in
+        s3:*)
+          [ -n "$BACKUP_S3_REGION" ] && printf 's3_region = "%s"\n' "$(backup_toml_escape "$BACKUP_S3_REGION")"
+          [ "$BACKUP_S3_PATH_STYLE" = "1" ] && echo "s3_path_style = true"
+          ;;
+      esac
+      i=$((i+1))
+    done
+  } > "$tmp"
+  chmod 0640 "$tmp"
+  chown root:sm-agent "$tmp"
+  mv -f "$tmp" /etc/servermonitor-backup/backup.toml
+}
+
+backup_write_units() {
+  case "$BACKUP_TIME" in
+    [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+    *) echo "backup time must be HH:MM (got: $BACKUP_TIME)" >&2; exit 1 ;;
+  esac
+  cat > /etc/systemd/system/sm-backup.service <<'UNIT'
+[Unit]
+Description=ServerMonitor Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sm-agent
+Group=sm-agent
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/sm-agent backup run --config /etc/servermonitor-backup/backup.toml
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/servermonitor
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UNIT
+  chmod 0644 /etc/systemd/system/sm-backup.service
+  cat > /etc/systemd/system/sm-backup.timer <<UNIT
+[Unit]
+Description=ServerMonitor Backup schedule
+
+[Timer]
+OnCalendar=*-*-* ${BACKUP_TIME}:00
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  chmod 0644 /etc/systemd/system/sm-backup.timer
+  cat > /etc/systemd/system/sm-backup-check.service <<'UNIT'
+[Unit]
+Description=ServerMonitor Backup Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sm-agent
+Group=sm-agent
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/sm-agent backup check --config /etc/servermonitor-backup/backup.toml --read-data-subset 5%%
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/servermonitor
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UNIT
+  chmod 0644 /etc/systemd/system/sm-backup-check.service
+  cat > /etc/systemd/system/sm-backup-check.timer <<'UNIT'
+[Unit]
+Description=ServerMonitor Backup Check schedule
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=21600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  chmod 0644 /etc/systemd/system/sm-backup-check.timer
+  cat > /etc/systemd/system/sm-backup-restore@.service <<'UNIT'
+[Unit]
+Description=ServerMonitor Backup In-Place Restore %I
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/sm-agent backup restore --config /etc/servermonitor-backup/backup.toml --in-place --instance %I
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UNIT
+  chmod 0644 /etc/systemd/system/sm-backup-restore@.service
+  systemctl daemon-reload
+  systemctl enable --now sm-backup.timer >/dev/null 2>&1 || systemctl enable sm-backup.timer
+  systemctl enable --now sm-backup-check.timer >/dev/null 2>&1 || systemctl enable sm-backup-check.timer
+}
+
+backup_remove_units() {
+  systemctl disable --now sm-backup.timer >/dev/null 2>&1 || true
+  systemctl disable --now sm-backup-check.timer >/dev/null 2>&1 || true
+  systemctl stop sm-backup.service >/dev/null 2>&1 || true
+  systemctl stop sm-backup-check.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/sm-backup.timer /etc/systemd/system/sm-backup.service
+  rm -f /etc/systemd/system/sm-backup-check.timer /etc/systemd/system/sm-backup-check.service /etc/systemd/system/sm-backup-restore@.service
+  systemctl daemon-reload
+  cat >&2 <<'NOTE'
+
+note: removed the sm-backup timer and unit. backup.toml, backup.key and the
+recovery kit were KEPT (they guard existing snapshots). To remove them:
+  rm -rf /etc/servermonitor-backup
+
+NOTE
+}
+
+backup_write_recovery_kit() {
+  local tmp host now i name url
+  local -a repo_arr name_arr
+  IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
+  IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
+  host="$(hostname -f 2>/dev/null || hostname)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tmp="$(mktemp /etc/servermonitor-backup/recovery-kit.txt.XXXXXX)"
+  {
+    echo "ServerMonitor backup recovery kit"
+    echo "host: $host"
+    echo "date: $now"
+    echo ""
+    echo "repositories:"
+    i=0
+    for url in "${repo_arr[@]}"; do
+      url="$(backup_trim "$url")"
+      [ -z "$url" ] && continue
+      name="$(backup_trim "${name_arr[$i]:-}")"
+      [ -z "$name" ] && name="repo$((i+1))"
+      echo "  [$name] $url"
+      i=$((i+1))
+    done
+    echo ""
+    echo "repository password:"
+    echo "  $(cat /etc/servermonitor-backup/backup.key)"
+    echo ""
+    echo "restore any repo on a bare machine (needs restic + this password):"
+    echo "  restic -r <url> restore latest --target /mnt/recover"
+    echo ""
+    echo "STORE THIS IN A PASSWORD MANAGER NOW. No other copy of this password exists"
+    echo "anywhere -- the monitoring server never sees it. Lose this kit and the host,"
+    echo "and the backups are unrecoverable."
+  } > "$tmp"
+  chmod 0400 "$tmp"
+  chown root:root "$tmp"
+  mv -f "$tmp" /etc/servermonitor-backup/recovery-kit.txt
+}
+
+backup_print_recovery_kit() {
+  echo ""
+  echo "================ BACKUP RECOVERY KIT (store offline NOW) ================"
+  cat /etc/servermonitor-backup/recovery-kit.txt
+  echo "========================================================================"
+  echo "(also saved to /etc/servermonitor-backup/recovery-kit.txt, root-only 0400)"
+  echo ""
+}
+
+backup_init_as_agent() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u sm-agent -- /usr/local/bin/sm-agent backup init --config /etc/servermonitor-backup/backup.toml
+  else
+    su -s /bin/sh -c '/usr/local/bin/sm-agent backup init --config /etc/servermonitor-backup/backup.toml' sm-agent
+  fi
+}
+
+provision_backup() {
+  backup_migrate_legacy
+  if [ ! -f /etc/servermonitor-backup/backup.toml ] && [ -z "$BACKUP_REPOS" ]; then
+    echo "--enable-backup requires --backup-repos (or SM_BACKUP_REPOS) on a fresh setup" >&2
+    exit 1
+  fi
+  case "$BACKUP_PRUNE_MODE" in
+    host|external) ;;
+    *) echo "SM_BACKUP_PRUNE_MODE / --backup-prune-mode must be \"host\" or \"external\"" >&2; exit 1 ;;
+  esac
+  if { [ -n "$BACKUP_S3_ACCESS_KEY_ID" ] && [ -z "$BACKUP_S3_SECRET_ACCESS_KEY" ]; } || \
+     { [ -z "$BACKUP_S3_ACCESS_KEY_ID" ] && [ -n "$BACKUP_S3_SECRET_ACCESS_KEY" ]; }; then
+    echo "SM_BACKUP_S3_ACCESS_KEY_ID and SM_BACKUP_S3_SECRET_ACCESS_KEY must be set together" >&2
+    exit 1
+  fi
+  [ -x /usr/local/bin/sm-agent ] || { echo "/usr/local/bin/sm-agent not found; the backup unit runs the root-owned agent copy, not the sm-agent-writable one. Re-run with --reinstall to restore it" >&2; exit 1; }
+  warn_backup_capability
+  provision_restic
+  install -o root -g sm-agent -m 0750 -d /etc/servermonitor-backup
+  local key_fresh=0
+  if backup_generate_key; then key_fresh=1; fi
+  if backup_have_transport_creds; then
+    backup_write_env_file
+  fi
+  local repos_written=0
+  if [ -n "$BACKUP_REPOS" ]; then
+    backup_write_toml
+    repos_written=1
+  elif [ -f /etc/servermonitor-backup/backup.toml ]; then
+    echo "note: --backup-repos not provided; keeping existing /etc/servermonitor-backup/backup.toml"
+    chmod 0640 /etc/servermonitor-backup/backup.toml
+    chown root:sm-agent /etc/servermonitor-backup/backup.toml
+  fi
+  if ! backup_init_as_agent; then
+    echo "sm-agent backup init failed; backup not scheduled" >&2
+    exit 1
+  fi
+  backup_write_units
+  if [ "$key_fresh" = "1" ]; then
+    backup_write_recovery_kit
+    backup_print_recovery_kit
+  elif [ "$repos_written" = "1" ]; then
+    backup_write_recovery_kit
+    echo "note: recovery kit updated at /etc/servermonitor-backup/recovery-kit.txt (password unchanged, not reprinted)"
+  else
+    echo "note: backup recovery kit at /etc/servermonitor-backup/recovery-kit.txt (password not reprinted)"
   fi
 }
 
@@ -290,6 +753,13 @@ systemctl daemon-reload
 systemctl enable sm-agent.service >/dev/null 2>&1 || true
 systemctl restart sm-agent.service
 systemctl status --no-pager sm-agent.service || true
+
+if [ "$ENABLE_BACKUP" = "1" ]; then
+  provision_backup
+elif [ -f /etc/systemd/system/sm-backup.timer ] || [ -f /etc/systemd/system/sm-backup.service ]; then
+  backup_migrate_legacy
+  backup_remove_units
+fi
 
 echo
 if [ "$RECONFIGURE" = "1" ]; then

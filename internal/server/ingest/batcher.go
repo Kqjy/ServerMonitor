@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,8 @@ import (
 
 	"servermonitor/pkg/wire"
 )
+
+const backupSnapshotLimit = 50
 
 type Row struct {
 	Time   time.Time
@@ -213,6 +217,13 @@ type ProcessRow struct {
 	NThreads int32
 }
 
+type BackupRow struct {
+	HostID    int64
+	Repo      string
+	Payload   []byte
+	UpdatedAt time.Time
+}
+
 func InsertProcesses(ctx context.Context, pool *pgxpool.Pool, rows []ProcessRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -226,8 +237,8 @@ func InsertProcesses(ctx context.Context, pool *pgxpool.Pool, rows []ProcessRow)
 	return err
 }
 
-func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow, conts []ContainerRow, ports []PortRow) error {
-	if len(procs) == 0 && len(conts) == 0 && len(ports) == 0 {
+func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow, conts []ContainerRow, ports []PortRow, backups []BackupRow, backupRepos []string) error {
+	if len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(backups) == 0 {
 		return nil
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
@@ -262,6 +273,26 @@ func InsertSnapshots(ctx context.Context, pool *pgxpool.Pool, procs []ProcessRow
 		})
 		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"ports"},
 			[]string{"time", "host_id", "proto", "addr", "port", "pid", "process"}, src); err != nil {
+			return err
+		}
+	}
+	if len(backups) > 0 {
+		for _, r := range backups {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO backup_status (host_id, repo, payload, updated_at)
+				VALUES ($1, $2, $3, $4)
+				ON CONFLICT (host_id, repo) DO UPDATE
+				SET payload = EXCLUDED.payload,
+				    updated_at = EXCLUDED.updated_at
+			`, r.HostID, r.Repo, r.Payload, r.UpdatedAt); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM backup_status
+			WHERE host_id = $1
+			  AND NOT (repo = ANY($2::text[]))
+		`, backups[0].HostID, backupRepos); err != nil {
 			return err
 		}
 	}
@@ -303,6 +334,42 @@ func InsertContainers(ctx context.Context, pool *pgxpool.Pool, rows []ContainerR
 	_, err := pool.CopyFrom(ctx, pgx.Identifier{"containers"},
 		[]string{"time", "host_id", "cid", "name", "image", "state", "cpu_pct", "mem_used", "mem_limit", "rx_bytes", "tx_bytes"}, src)
 	return err
+}
+
+func ConvertBackups(hostID int64, backups []wire.BackupRepoStatus, updatedAt time.Time) ([]BackupRow, []string, error) {
+	if len(backups) == 0 {
+		return nil, nil, nil
+	}
+	byRepo := make(map[string]wire.BackupRepoStatus, len(backups))
+	for _, backup := range backups {
+		backup.Name = strings.TrimSpace(backup.Name)
+		if backup.Name == "" {
+			continue
+		}
+		if len(backup.Snapshots) > backupSnapshotLimit {
+			backup.Snapshots = backup.Snapshots[:backupSnapshotLimit]
+		}
+		byRepo[backup.Name] = backup
+	}
+	repos := make([]string, 0, len(byRepo))
+	for repo := range byRepo {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	rows := make([]BackupRow, 0, len(repos))
+	for _, repo := range repos {
+		payload, err := json.Marshal(byRepo[repo])
+		if err != nil {
+			return nil, nil, err
+		}
+		rows = append(rows, BackupRow{
+			HostID:    hostID,
+			Repo:      repo,
+			Payload:   payload,
+			UpdatedAt: updatedAt,
+		})
+	}
+	return rows, repos, nil
 }
 
 func ConvertBatch(hostID int64, batch *wire.Batch) ([]Row, []ProcessRow, []ContainerRow, []PortRow) {

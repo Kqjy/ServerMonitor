@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -12,32 +14,34 @@ import (
 )
 
 type Config struct {
-	ServerURL      string            `toml:"server_url"`
-	Token          string            `toml:"token"`
-	ServerPubkey   string            `toml:"server_pubkey"`
-	IntervalS      int               `toml:"interval_s"`
-	Enabled        []string          `toml:"enabled"`
-	Disabled       []string          `toml:"disabled"`
-	ProcessTopN    int               `toml:"process_top_n"`
-	BatchMaxAgeS   int               `toml:"batch_max_age_s"`
-	BatchMaxPoints int               `toml:"batch_max_points"`
-	SpoolPath      string            `toml:"spool_path"`
-	SpoolMaxBytes  int64             `toml:"spool_max_bytes"`
-	HealthPath     string            `toml:"health_path"`
-	HTTPTimeout    time.Duration     `toml:"http_timeout"`
-	InsecureSkip   bool              `toml:"insecure_skip_verify"`
-	AutoUpgrade    *bool             `toml:"auto_upgrade"`
-	Tags           map[string]string `toml:"tags"`
+	ServerURL        string            `toml:"server_url"`
+	Token            string            `toml:"token"`
+	ServerPubkey     string            `toml:"server_pubkey"`
+	IntervalS        int               `toml:"interval_s"`
+	Enabled          []string          `toml:"enabled"`
+	Disabled         []string          `toml:"disabled"`
+	ProcessTopN      int               `toml:"process_top_n"`
+	BatchMaxAgeS     int               `toml:"batch_max_age_s"`
+	BatchMaxPoints   int               `toml:"batch_max_points"`
+	SpoolPath        string            `toml:"spool_path"`
+	SpoolMaxBytes    int64             `toml:"spool_max_bytes"`
+	HealthPath       string            `toml:"health_path"`
+	BackupStatusPath string            `toml:"backup_status_path"`
+	HTTPTimeout      time.Duration     `toml:"http_timeout"`
+	InsecureSkip     bool              `toml:"insecure_skip_verify"`
+	AutoUpgrade      *bool             `toml:"auto_upgrade"`
+	Tags             map[string]string `toml:"tags"`
 }
 
 func Load(path string) (*Config, error) {
 	c := &Config{
-		IntervalS:      10,
-		ProcessTopN:    50,
-		BatchMaxAgeS:   5,
-		BatchMaxPoints: 10000,
-		SpoolMaxBytes:  256 * 1024 * 1024,
-		HTTPTimeout:    20 * time.Second,
+		IntervalS:        10,
+		ProcessTopN:      50,
+		BatchMaxAgeS:     5,
+		BatchMaxPoints:   10000,
+		SpoolMaxBytes:    256 * 1024 * 1024,
+		BackupStatusPath: defaultBackupStatusPath(),
+		HTTPTimeout:      20 * time.Second,
 	}
 
 	data, err := os.ReadFile(path)
@@ -77,6 +81,9 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("SM_SPOOL_PATH"); v != "" {
 		c.SpoolPath = v
 	}
+	if v := os.Getenv("SM_BACKUP_STATUS_PATH"); v != "" {
+		c.BackupStatusPath = v
+	}
 	if v := os.Getenv("SM_INTERVAL_S"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.IntervalS = n
@@ -87,6 +94,16 @@ func applyEnvOverrides(c *Config) {
 			c.AutoUpgrade = &b
 		}
 	}
+}
+
+func defaultBackupStatusPath() string {
+	if runtime.GOOS == "windows" {
+		if pd := os.Getenv("ProgramData"); pd != "" {
+			return filepath.Join(pd, "ServerMonitor", "backup-status.json")
+		}
+		return `C:\ProgramData\ServerMonitor\backup-status.json`
+	}
+	return "/var/lib/servermonitor/backup-status.json"
 }
 
 func (c *Config) Interval() time.Duration {

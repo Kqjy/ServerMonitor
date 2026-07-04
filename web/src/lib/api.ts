@@ -106,6 +106,75 @@ export interface PortRow {
   time: string;
 }
 
+export interface BackupSnapshot {
+  id: string;
+  time?: string;
+  paths?: string[];
+}
+
+export interface BackupRepoStatus {
+  name: string;
+  engine?: string;
+  last_started?: string;
+  last_finished?: string;
+  last_success?: string;
+  success: boolean;
+  error?: string;
+  duration_s?: number;
+  added_bytes?: number;
+  total_bytes?: number;
+  snapshot_count?: number;
+  check_last?: string;
+  check_success?: boolean;
+  snapshots?: BackupSnapshot[];
+}
+
+export interface BackupRepoRow {
+  repo: string;
+  updated_at: string;
+  status: BackupRepoStatus;
+}
+
+export interface BackupsResp {
+  repos: BackupRepoRow[];
+}
+
+export interface BackupTargetStorage {
+  kind: string;
+  location: string;
+}
+
+export interface BackupTargetTLS {
+  mode: string;
+  domain?: string;
+  secure: boolean;
+}
+
+export interface BackupTarget {
+  id: number;
+  name: string;
+  host_id?: number;
+  hostname?: string;
+  quota_bytes?: number;
+  used_bytes: number;
+  usage_measured_at?: string;
+  created_at: string;
+  revoked_at?: string;
+}
+
+export interface BackupTargetsResp {
+  configured: boolean;
+  storage?: BackupTargetStorage;
+  tls: BackupTargetTLS;
+  targets: BackupTarget[];
+}
+
+export interface BackupCredential {
+  id: number;
+  name: string;
+  password: string;
+}
+
 export interface ProcessSeriesPoint {
   ts: string;
   cpu_pct: number;
@@ -434,6 +503,8 @@ export const api = {
     const qs = q.toString();
     return request<PortRow[]>(`/api/v1/hosts/${hostId}/ports${qs ? `?${qs}` : ''}`, { signal: opts.signal });
   },
+  backups: (hostId: number, opts: { signal?: AbortSignal } = {}) =>
+    request<BackupsResp>(`/api/v1/hosts/${hostId}/backups`, { signal: opts.signal }),
   processSeries: (
     hostId: number,
     pid: number,
@@ -516,5 +587,18 @@ export const api = {
   agentPlatforms: () => request<AgentPlatform[]>('/api/v1/agent/platforms'),
   serverInfo: () => request<ServerInfo>('/api/v1/server/info'),
   retention: () => request<RetentionResp>('/api/v1/retention'),
-  storage: () => request<StorageResp>('/api/v1/storage')
+  storage: () => request<StorageResp>('/api/v1/storage'),
+  backupTargets: () => request<BackupTargetsResp>('/api/v1/backup-targets'),
+  backupTargetCreate: (body: { name: string; host_id?: number; quota_bytes?: number }) =>
+    request<BackupCredential>('/api/v1/backup-targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }),
+  backupTargetRotate: (id: number) =>
+    request<BackupCredential>(`/api/v1/backup-targets/${id}/rotate`, { method: 'POST' }),
+  backupTargetMeasure: (id: number) =>
+    request<BackupTarget>(`/api/v1/backup-targets/${id}/measure`, { method: 'POST' }),
+  backupTargetRevoke: (id: number) => request<void>(`/api/v1/backup-targets/${id}/revoke`, { method: 'POST' }),
+  backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-targets/${id}`, { method: 'DELETE' })
 };

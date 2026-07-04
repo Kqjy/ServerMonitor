@@ -36,6 +36,22 @@
   let scopeTagsText = $state('');
   let labelText = $state('');
 
+  type RulePreset = {
+    label: string;
+    name: string;
+    metric: string;
+    comparator: string;
+    threshold: number;
+    severity: string;
+  };
+
+  const suggestedRules: RulePreset[] = [
+    { label: 'Backup stale', name: 'Backup stale', metric: 'backup_last_success_age_s', comparator: '>', threshold: 93600, severity: 'warning' },
+    { label: 'Backup failed', name: 'Backup failed', metric: 'backup_last_run_ok', comparator: '<', threshold: 1, severity: 'critical' },
+    { label: 'Check failing', name: 'Backup check failing', metric: 'backup_check_ok', comparator: '<', threshold: 1, severity: 'warning' },
+    { label: 'Check overdue', name: 'Backup check overdue', metric: 'backup_check_age_s', comparator: '>', threshold: 3456000, severity: 'warning' }
+  ];
+
   function pairsToText(pairs: Record<string, string> | undefined | null): string {
     if (!pairs) return '';
     return Object.entries(pairs)
@@ -152,6 +168,19 @@
   function toggleHost(id: number) {
     scopeIds = scopeIds.includes(id) ? scopeIds.filter((x) => x !== id) : [...scopeIds, id];
   }
+
+  function applyPreset(preset: RulePreset) {
+    name = preset.name;
+    metric = preset.metric;
+    comparator = preset.comparator;
+    threshold = preset.threshold;
+    severity = preset.severity;
+    agg = 'last';
+    windowS = 60;
+    forS = 60;
+    cooldownS = 600;
+    labelText = '';
+  }
 </script>
 
 <div role="dialog" aria-modal="true" tabindex="-1" use:modalFocus class="fixed inset-0 z-30 bg-zinc-950/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={(e) => { if (e.key === 'Escape') onClose(); }}>
@@ -162,6 +191,20 @@
     </header>
 
     <form onsubmit={save} class="p-4 sm:p-5 space-y-4 overflow-y-auto">
+      <div>
+        <div class="text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Suggested rules</div>
+        <div class="flex flex-wrap gap-2">
+          {#each suggestedRules as preset (preset.metric)}
+            <button
+              type="button"
+              onclick={() => applyPreset(preset)}
+              class="rounded-md border border-zinc-800 bg-zinc-950 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-700 hover:text-zinc-100">
+              {preset.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+
       <div>
         <label class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5" for="rname">Name</label>
         <input id="rname" bind:value={name} required class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm" />

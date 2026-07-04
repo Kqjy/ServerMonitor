@@ -1,8 +1,10 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestExternallyManagedPresenceTracking(t *testing.T) {
@@ -39,5 +41,60 @@ func TestExternallyManagedPresenceTracking(t *testing.T) {
 	}
 	if legacy.ExternallyManaged != nil {
 		t.Fatalf("a payload predating the field must decode as nil so Touch leaves the DB value untouched, got %v", *legacy.ExternallyManaged)
+	}
+}
+
+func TestBatchBackupRoundTrip(t *testing.T) {
+	ok := true
+	started := time.Date(2026, 7, 3, 2, 30, 0, 0, time.UTC)
+	finished := time.Date(2026, 7, 3, 2, 41, 12, 0, time.UTC)
+	b := Batch{
+		Host: HostInfo{Hostname: "host", OS: "linux", AgentVersion: "0.2.6"},
+		Backups: []BackupRepoStatus{{
+			Name:          "vps-a",
+			Engine:        "borg",
+			LastStarted:   &started,
+			LastFinished:  &finished,
+			LastSuccess:   &finished,
+			Success:       true,
+			DurationS:     672,
+			AddedBytes:    104857600,
+			TotalBytes:    42949672960,
+			SnapshotCount: 87,
+			CheckLast:     &finished,
+			CheckSuccess:  &ok,
+			Snapshots: []BackupSnapshot{{
+				ID:    "1a2b3c4d",
+				Time:  started,
+				Paths: []string{"/etc"},
+			}},
+		}},
+		Sent: finished,
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Batch
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("decode with DisallowUnknownFields: %v", err)
+	}
+	if len(got.Backups) != 1 || got.Backups[0].Name != "vps-a" || got.Backups[0].Snapshots[0].ID != "1a2b3c4d" {
+		t.Fatalf("backup round-trip mismatch: %+v", got.Backups)
+	}
+}
+
+func TestBatchWithoutBackupsDisallowUnknownFields(t *testing.T) {
+	raw := []byte(`{"host":{"hostname":"host","os":"linux","agent_version":"0.2.6"},"points":[],"sent":"2026-07-03T02:41:12Z"}`)
+	var got Batch
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("decode legacy batch: %v", err)
+	}
+	if len(got.Backups) != 0 {
+		t.Fatalf("legacy batch decoded backups: %+v", got.Backups)
 	}
 }

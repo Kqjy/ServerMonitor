@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -88,6 +89,16 @@ type portSnapshot struct {
 	Time    time.Time `json:"time"`
 }
 
+type backupRepoSnapshot struct {
+	Repo      string          `json:"repo"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	Status    json.RawMessage `json:"status"`
+}
+
+type hostBackupsResponse struct {
+	Repos []backupRepoSnapshot `json:"repos"`
+}
+
 func hostProcessesHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
@@ -168,6 +179,51 @@ func hostProcessesHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+func hostBackupsHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if _, err := hosts.Get(r.Context(), hostID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		rows, err := db.Pool.Query(r.Context(), `
+			SELECT repo, updated_at, payload
+			FROM backup_status
+			WHERE host_id = $1
+			ORDER BY repo ASC
+		`, hostID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer rows.Close()
+		out := make([]backupRepoSnapshot, 0)
+		for rows.Next() {
+			var repo backupRepoSnapshot
+			var payload []byte
+			if err := rows.Scan(&repo.Repo, &repo.UpdatedAt, &payload); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			repo.Status = json.RawMessage(payload)
+			out = append(out, repo)
+		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, hostBackupsResponse{Repos: out})
 	}
 }
 

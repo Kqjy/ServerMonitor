@@ -72,6 +72,8 @@ Both scripts wrap `sm-agent register` (which calls `POST /api/v1/admin/hosts`), 
 
 **Reconfiguring an installed agent.** Re-running an installer on a host that already has `agent.toml` reconfigures the service in place rather than registering again: it re-derives capabilities and group memberships (Linux) or the service account and privileges (Windows) from the `--enable-*` / `SM_ENABLE_*` flags and restarts — no token, no re-registration, identity and binary untouched. So to flip a capability (e.g. add NVMe SMART with `--enable-smart-nvme`), just re-run with the flag added. Pass `--reinstall` / `-Reinstall` (or `SM_REINSTALL=1`) to force a full fresh install instead.
 
+**Managed backups.** `--enable-backup` (`-EnableBackup` on Windows) additionally provisions scheduled, encrypted restic backups of the host to one or more endpoints you supply, with monitoring, per-repo alerts, and a printed recovery kit. It reads every file on the host at backup time, so it is a separate opt-in and — like `--enable-smart-nvme` — not part of `--enable-all`. Full guide, including the bare-machine restore runbook: **[deploy/BACKUPS.md](deploy/BACKUPS.md)**.
+
 **Docker (containerized agent)**
 
 For hosts that run everything in containers, deploy the agent as a container instead of installing it on the host — register the host, drop its token into an env file, and `docker compose up`. Full steps in **[deploy/AGENT-DOCKER.md](deploy/AGENT-DOCKER.md)**. The container reads its identity from `SM_SERVER_URL` / `SM_TOKEN` / `SM_SERVER_PUBKEY`, so no on-disk `agent.toml` is required.

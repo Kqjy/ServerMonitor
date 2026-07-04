@@ -36,7 +36,7 @@
           <span class="font-semibold tracking-tight text-zinc-100 hidden sm:inline">ServerMonitor</span>
         </a>
         <nav class="flex items-center gap-0.5 sm:gap-1 text-sm min-w-0">
-          {#each [{ href: '/', label: 'Hosts' }, { href: '/alerts', label: 'Alerts' }, { href: '/settings', label: 'Settings' }] as item (item.href)}
+          {#each [{ href: '/', label: 'Hosts' }, { href: '/alerts', label: 'Alerts' }, { href: '/backups', label: 'Backups' }, { href: '/settings', label: 'Settings' }] as item (item.href)}
             <a
               href={item.href}
               class="px-2 sm:px-3 py-1.5 rounded-md transition-colors {$page.url.pathname === item.href || (item.href !== '/' && $page.url.pathname.startsWith(item.href)) ? 'text-zinc-100 bg-zinc-800/60' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40'}">

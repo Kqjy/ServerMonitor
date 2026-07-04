@@ -13,6 +13,7 @@ import (
 
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/auth"
+	"servermonitor/internal/server/backupserver"
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
@@ -41,6 +42,9 @@ type Deps struct {
 	SecureCookies  bool
 	TrustProxyTLS  bool
 	AgentSigner    *agentsig.Signer
+	BackupServer   *backupserver.Server
+	BackupTargets  *storage.BackupTargets
+	BackupTLS      BackupTLSInfo
 }
 
 func New(d Deps) *Router {
@@ -98,6 +102,7 @@ func New(d Deps) *Router {
 				r.Get("/hosts/{id}/containers", hostContainersHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/containers/{cid}/series", hostContainerSeriesHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/ports", hostPortsHandler(d.DB, d.Hosts))
+				r.Get("/hosts/{id}/backups", hostBackupsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/labels", hostLabelsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/alerts/active", hostActiveAlertsHandler(d.DB, d.Hosts))
 				r.Get("/series", seriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))
@@ -120,9 +125,22 @@ func New(d Deps) *Router {
 				r.Post("/channels", createChannelHandler(d.DB.Pool))
 				r.Put("/channels/{id}", updateChannelHandler(d.DB.Pool))
 				r.Delete("/channels/{id}", deleteChannelHandler(d.DB.Pool))
+
+				if d.BackupTargets != nil {
+					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
+					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
+					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
+					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer))
+				}
 			})
 		})
 	})
+
+	if d.BackupServer != nil {
+		r.Mount("/backup", d.BackupServer.Routes())
+	}
 
 	if d.WebHandler != nil {
 		r.Mount("/", d.WebHandler)

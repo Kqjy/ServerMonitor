@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	agentbackup "servermonitor/internal/agent/backup"
 	"servermonitor/internal/agent/collectors"
 	"servermonitor/internal/agent/config"
 	"servermonitor/internal/agent/runner"
@@ -35,6 +36,9 @@ func main() {
 		switch os.Args[1] {
 		case "register":
 			registerCmd(os.Args[2:])
+			return
+		case "backup":
+			backupCmd(os.Args[2:])
 			return
 		case "healthz":
 			if err := healthzCmd(os.Args[2:]); err != nil {
@@ -277,6 +281,138 @@ func main() {
 
 const exitCodeDeregistered = 78
 const exitCodeUpgrade = 75
+
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
+func backupCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore} [options]")
+		os.Exit(2)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	switch args[0] {
+	case "run":
+		fs := flag.NewFlagSet("backup run", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.RunFromConfigPath(ctx, *configPath, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup run failed", "err", err)
+			os.Exit(1)
+		}
+		if !result.AnySucceeded() {
+			os.Exit(1)
+		}
+	case "init":
+		fs := flag.NewFlagSet("backup init", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.InitFromConfigPath(ctx, *configPath, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup init failed", "err", err)
+			os.Exit(1)
+		}
+		if result.Failed() {
+			os.Exit(1)
+		}
+	case "snapshots":
+		fs := flag.NewFlagSet("backup snapshots", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		repoName := fs.String("repo", "", "repo name")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.SnapshotsFromConfigPath(ctx, *configPath, *repoName, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup snapshots failed", "err", err)
+			os.Exit(1)
+		}
+		for _, repo := range result.Repos {
+			if repo.Error != "" {
+				logger.Error("backup snapshots failed", "repo", repo.Name, "err", repo.Error)
+			}
+		}
+		if *jsonOut {
+			err = result.WriteJSON(os.Stdout, *repoName != "")
+		} else {
+			err = result.WriteTable(os.Stdout)
+		}
+		if err != nil {
+			logger.Error("write snapshots output failed", "err", err)
+			os.Exit(1)
+		}
+		if result.Failed() {
+			os.Exit(1)
+		}
+	case "check":
+		fs := flag.NewFlagSet("backup check", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		repoName := fs.String("repo", "", "restrict the check to one repo by name")
+		readDataSubset := fs.String("read-data-subset", "", "verify a subset of pack data (e.g. 5%, 250M, 1/5)")
+		drill := fs.Bool("drill", false, "after a successful check, restore a small file sample and byte-compare it against the live files")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.CheckFromConfigPath(ctx, *configPath, agentbackup.CheckOptions{
+			Repo:           *repoName,
+			ReadDataSubset: *readDataSubset,
+			Drill:          *drill,
+		}, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup check failed", "err", err)
+			os.Exit(1)
+		}
+		if !result.AllSucceeded() {
+			os.Exit(1)
+		}
+	case "restore":
+		fs := flag.NewFlagSet("backup restore", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		repoName := fs.String("repo", "", "repo name to restore from")
+		snapshot := fs.String("snapshot", "", "snapshot id to restore")
+		target := fs.String("target", "", "restore into this directory (must be inside the restore root)")
+		inPlace := fs.Bool("in-place", false, "restore over the live files at their original locations")
+		instance := fs.String("instance", "", "repo:snapshot[:include,include] identity for the sanctioned in-place restore unit")
+		var includes stringList
+		fs.Var(&includes, "include", "restore only this path (repeatable)")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.RestoreFromConfigPath(ctx, *configPath, agentbackup.RestoreOptions{
+			Repo:     *repoName,
+			Snapshot: *snapshot,
+			Includes: includes,
+			Target:   *target,
+			InPlace:  *inPlace,
+			Instance: *instance,
+		}, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup restore failed", "err", err)
+			os.Exit(1)
+		}
+		if result.LockSkipped {
+			break
+		}
+		if result.InPlace {
+			fmt.Printf("restored in place over live files\n")
+		} else {
+			fmt.Printf("restored to %s\n", result.Target)
+		}
+		if result.Summary != nil {
+			fmt.Printf("files restored: %d/%d  bytes restored: %d/%d  skipped: %d\n",
+				result.Summary.FilesRestored, result.Summary.TotalFiles,
+				result.Summary.BytesRestored, result.Summary.TotalBytes, result.Summary.FilesSkipped)
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore} [options]")
+		os.Exit(2)
+	}
+}
 
 func upgradeBackoff(attempt int) time.Duration {
 	const base = time.Minute

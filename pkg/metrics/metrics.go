@@ -102,6 +102,15 @@ const (
 
 	RaidDegraded ID = 950
 	RaidSyncPct  ID = 951
+
+	BackupLastSuccessAgeS ID = 1000
+	BackupLastRunOK       ID = 1001
+	BackupDurationS       ID = 1002
+	BackupAddedBytes      ID = 1003
+	BackupTotalBytes      ID = 1004
+	BackupSnapshotCount   ID = 1005
+	BackupCheckAgeS       ID = 1006
+	BackupCheckOK         ID = 1007
 )
 
 type Meta struct {
@@ -197,6 +206,14 @@ var meta = map[ID]Meta{
 	SmartCRCErrors:        {"smart_crc_errors", ""},
 	RaidDegraded:          {"raid_degraded", ""},
 	RaidSyncPct:           {"raid_sync_pct", "%"},
+	BackupLastSuccessAgeS: {"backup_last_success_age_s", "s"},
+	BackupLastRunOK:       {"backup_last_run_ok", "bool"},
+	BackupDurationS:       {"backup_duration_s", "s"},
+	BackupAddedBytes:      {"backup_added_bytes", "B"},
+	BackupTotalBytes:      {"backup_total_bytes", "B"},
+	BackupSnapshotCount:   {"backup_snapshot_count", "count"},
+	BackupCheckAgeS:       {"backup_check_age_s", "s"},
+	BackupCheckOK:         {"backup_check_ok", "bool"},
 }
 
 func (id ID) Meta() Meta {

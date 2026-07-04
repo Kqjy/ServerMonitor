@@ -24,6 +24,7 @@ type Config struct {
 	Bucket       string
 	Region       string
 	Prefix       string
+	Endpoint     string
 	Cutoff       time.Duration
 	UsePathStyle bool
 }
@@ -65,6 +66,10 @@ func New(pool *pgxpool.Pool, cfg Config, logger *slog.Logger) (*Archiver, error)
 	s3Opts := []func(*s3.Options){}
 	if cfg.UsePathStyle {
 		s3Opts = append(s3Opts, func(o *s3.Options) { o.UsePathStyle = true })
+	}
+	if cfg.Endpoint != "" {
+		endpoint := cfg.Endpoint
+		s3Opts = append(s3Opts, func(o *s3.Options) { o.BaseEndpoint = aws.String(endpoint) })
 	}
 	return &Archiver{
 		pool:   pool,

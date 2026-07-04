@@ -45,6 +45,10 @@ type PortCollector interface {
 	CollectPorts(ctx context.Context) ([]wire.Port, error)
 }
 
+type BackupCollector interface {
+	CollectBackups(ctx context.Context) ([]wire.BackupRepoStatus, error)
+}
+
 type StatusReporter interface {
 	Status() wire.CollectorStatus
 }

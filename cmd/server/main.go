@@ -15,11 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
+
 	"servermonitor/internal/server/agentdist"
 	"servermonitor/internal/server/alerting"
 	"servermonitor/internal/server/api"
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/auth"
+	"servermonitor/internal/server/backupserver"
 	"servermonitor/internal/server/config"
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/notify"
@@ -138,6 +141,7 @@ func main() {
 			Bucket:       cfg.S3Bucket,
 			Region:       cfg.S3Region,
 			Prefix:       cfg.S3Prefix,
+			Endpoint:     cfg.S3Endpoint,
 			Cutoff:       config.IntervalToDuration(cfg.RetentionAggregate5m),
 			UsePathStyle: cfg.S3UsePathStyle,
 		}, logger)
@@ -151,6 +155,27 @@ func main() {
 				logger.Warn("archive scheduler start", "err", err)
 			}
 		}
+	}
+
+	backupTargets := storage.NewBackupTargets(db)
+	var backupServer *backupserver.Server
+	if cfg.BackupEnabled() {
+		store, storeErr := backupserver.NewStore(ctx, backupserver.StoreConfig{
+			Dir: cfg.BackupDir,
+			S3: backupserver.S3Config{
+				Bucket:       cfg.BackupS3Bucket,
+				Region:       cfg.BackupS3Region,
+				Prefix:       cfg.BackupS3Prefix,
+				Endpoint:     cfg.BackupS3Endpoint,
+				UsePathStyle: cfg.BackupS3UsePathStyle,
+			},
+		})
+		if storeErr != nil {
+			logger.Error("backup server disabled", "err", storeErr)
+			os.Exit(1)
+		}
+		backupServer = backupserver.New(store, backupTargets, cfg.BackupMaxBlobBytes, logger)
+		logger.Info("backup server enabled", "backend", store.Backend().Kind, "location", store.Backend().Location, "tls", cfg.BackupTLSMode())
 	}
 
 	go sessionSweeper(ctx, authSvc, logger)
@@ -178,6 +203,13 @@ func main() {
 		SecureCookies:  cfg.SecureBrowserSide(),
 		TrustProxyTLS:  cfg.TrustProxyTLS,
 		AgentSigner:    signer,
+		BackupServer:   backupServer,
+		BackupTargets:  backupTargets,
+		BackupTLS: api.BackupTLSInfo{
+			Mode:   cfg.BackupTLSMode(),
+			Domain: cfg.BackupACMEDomain,
+			Secure: cfg.BackupTLSSecure(),
+		},
 		Retention: api.RetentionConfig{
 			Raw:               cfg.RetentionRaw,
 			Aggregate5m:       cfg.RetentionAggregate5m,
@@ -201,6 +233,29 @@ func main() {
 		case cfg.ServesTLS():
 			logger.Info("server listening (TLS)", "addr", cfg.HTTPAddr, "cert", cfg.TLSCertFile)
 			if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("listen", "err", err)
+				cancel()
+			}
+		case cfg.ACMEEnabled():
+			cacheDir := cfg.ACMECacheDir
+			if cacheDir == "" {
+				cacheDir = "acme-certs"
+			}
+			mgr := &autocert.Manager{
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(cfg.BackupACMEDomain),
+				Cache:      autocert.DirCache(cacheDir),
+				Email:      cfg.ACMEEmail,
+			}
+			challenge := &http.Server{Addr: ":80", Handler: mgr.HTTPHandler(nil), ReadHeaderTimeout: 10 * time.Second}
+			go func() {
+				if err := challenge.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					logger.Warn("acme http-01 challenge listener", "err", err)
+				}
+			}()
+			srv.TLSConfig = mgr.TLSConfig()
+			logger.Info("server listening (TLS via ACME)", "addr", cfg.HTTPAddr, "domain", cfg.BackupACMEDomain)
+			if err := srv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("listen", "err", err)
 				cancel()
 			}
