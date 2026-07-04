@@ -38,7 +38,7 @@ deregistered
 *.pfx
 *.tokens
 *.secret
-backups/
+/backups/
 
 *.test
 coverage.out
