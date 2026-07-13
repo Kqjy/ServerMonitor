@@ -11,8 +11,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"servermonitor/internal/server/backupserver"
 	"servermonitor/internal/server/storage"
+	"servermonitor/pkg/restserver"
 )
 
 type BackupTLSInfo struct {
@@ -26,6 +26,8 @@ type backupTargetView struct {
 	Name            string     `json:"name"`
 	HostID          *int64     `json:"host_id,omitempty"`
 	Hostname        string     `json:"hostname,omitempty"`
+	NodeHostID      *int64     `json:"node_host_id,omitempty"`
+	NodeHostname    string     `json:"node_hostname,omitempty"`
 	QuotaBytes      *int64     `json:"quota_bytes,omitempty"`
 	UsedBytes       int64      `json:"used_bytes"`
 	UsageMeasuredAt *time.Time `json:"usage_measured_at,omitempty"`
@@ -34,10 +36,10 @@ type backupTargetView struct {
 }
 
 type backupTargetsResponse struct {
-	Configured bool                      `json:"configured"`
-	Storage    *backupserver.BackendInfo `json:"storage,omitempty"`
-	TLS        BackupTLSInfo             `json:"tls"`
-	Targets    []backupTargetView        `json:"targets"`
+	Configured bool                    `json:"configured"`
+	Storage    *restserver.BackendInfo `json:"storage,omitempty"`
+	TLS        BackupTLSInfo           `json:"tls"`
+	Targets    []backupTargetView      `json:"targets"`
 }
 
 var backupTargetNameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
@@ -52,6 +54,8 @@ func toBackupTargetView(t storage.BackupTarget) backupTargetView {
 		Name:            t.Name,
 		HostID:          t.HostID,
 		Hostname:        t.Hostname,
+		NodeHostID:      t.NodeHostID,
+		NodeHostname:    t.NodeHostname,
 		QuotaBytes:      t.QuotaBytes,
 		UsedBytes:       t.UsedBytes,
 		UsageMeasuredAt: t.UsageMeasuredAt,
@@ -60,7 +64,7 @@ func toBackupTargetView(t storage.BackupTarget) backupTargetView {
 	}
 }
 
-func listBackupTargetsHandler(targets *storage.BackupTargets, server *backupserver.Server, tlsInfo BackupTLSInfo) http.HandlerFunc {
+func listBackupTargetsHandler(targets *storage.BackupTargets, server *restserver.Server, tlsInfo BackupTLSInfo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resp := backupTargetsResponse{Configured: server != nil, TLS: tlsInfo, Targets: []backupTargetView{}}
 		if server != nil {
@@ -83,6 +87,7 @@ type createBackupTargetRequest struct {
 	Name       string `json:"name"`
 	HostID     *int64 `json:"host_id,omitempty"`
 	QuotaBytes *int64 `json:"quota_bytes,omitempty"`
+	NodeHostID *int64 `json:"node_host_id,omitempty"`
 }
 
 type backupCredentialResponse struct {
@@ -91,7 +96,7 @@ type backupCredentialResponse struct {
 	Password string `json:"password"`
 }
 
-func createBackupTargetHandler(targets *storage.BackupTargets, server *backupserver.Server) http.HandlerFunc {
+func createBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server, nodes *storage.BackupNodes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createBackupTargetRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -107,7 +112,24 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *backupser
 			writeError(w, http.StatusBadRequest, "quota_bytes must be >= 0")
 			return
 		}
-		if server != nil {
+		if req.NodeHostID != nil {
+			if nodes == nil {
+				writeError(w, http.StatusBadRequest, "backup nodes are not available")
+				return
+			}
+			if _, err := nodes.Get(r.Context(), *req.NodeHostID); err != nil {
+				writeError(w, http.StatusBadRequest, "node_host_id does not refer to a promoted backup node")
+				return
+			}
+			if req.HostID == nil {
+				writeError(w, http.StatusBadRequest, "node-hosted repositories require host_id (the host that backs up to it) so the node can admit its tunnel peer")
+				return
+			}
+		} else if server == nil {
+			writeError(w, http.StatusBadRequest, "this server has no storage backend (set BACKUP_DIR or BACKUP_S3_BUCKET) - pick a backup node destination instead")
+			return
+		}
+		if server != nil && req.NodeHostID == nil {
 			has, err := server.RepoHasObjects(r.Context(), name)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
@@ -123,7 +145,7 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *backupser
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		id, err := targets.Create(r.Context(), name, req.HostID, req.QuotaBytes, secret)
+		id, err := targets.Create(r.Context(), name, req.HostID, req.QuotaBytes, secret, req.NodeHostID)
 		if err != nil {
 			if errors.Is(err, storage.ErrBackupTargetNameTaken) {
 				writeError(w, http.StatusConflict, "a backup target with that name already exists")
@@ -184,7 +206,7 @@ func backupTargetDeletable(storedUsedBytes int64, repoHasObjects, repoChecked bo
 	return true
 }
 
-func deleteBackupTargetHandler(targets *storage.BackupTargets, server *backupserver.Server) http.HandlerFunc {
+func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseBackupTargetID(w, r)
 		if !ok {
@@ -196,7 +218,7 @@ func deleteBackupTargetHandler(targets *storage.BackupTargets, server *backupser
 			return
 		}
 		var repoHasObjects bool
-		repoChecked := server != nil
+		repoChecked := server != nil && t.NodeHostID == nil
 		if repoChecked {
 			repoHasObjects, err = server.RepoHasObjects(r.Context(), t.Name)
 			if err != nil {
@@ -216,12 +238,8 @@ func deleteBackupTargetHandler(targets *storage.BackupTargets, server *backupser
 	}
 }
 
-func measureBackupTargetHandler(targets *storage.BackupTargets, server *backupserver.Server) http.HandlerFunc {
+func measureBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if server == nil {
-			writeError(w, http.StatusServiceUnavailable, "backup server not configured")
-			return
-		}
 		id, ok := parseBackupTargetID(w, r)
 		if !ok {
 			return
@@ -229,6 +247,14 @@ func measureBackupTargetHandler(targets *storage.BackupTargets, server *backupse
 		t, err := targets.Get(r.Context(), id)
 		if err != nil {
 			backupTargetLookupError(w, err)
+			return
+		}
+		if t.NodeHostID != nil {
+			writeError(w, http.StatusBadRequest, "node-hosted repositories report usage from the node agent; nothing to measure here")
+			return
+		}
+		if server == nil {
+			writeError(w, http.StatusServiceUnavailable, "backup server not configured")
 			return
 		}
 		used, err := server.RepoUsage(r.Context(), t.Name)

@@ -177,6 +177,12 @@ func resticCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, 
 }
 
 func resticCommandAction(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options) (CommandResult, error) {
+	if repo.tunnelErr != nil {
+		return CommandResult{}, fmt.Errorf("%s failed: %w", action, repo.tunnelErr)
+	}
+	if repo.UsesTunnel() && repo.URL == "" {
+		return CommandResult{}, fmt.Errorf("%s failed: tunnel repo %q was not resolved through an active tunnel session", action, repo.Name)
+	}
 	repoEnv, err := loadRepoEnv(repo)
 	if err != nil {
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, err)

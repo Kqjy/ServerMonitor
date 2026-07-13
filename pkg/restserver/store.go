@@ -1,4 +1,4 @@
-package backupserver
+package restserver
 
 import (
 	"context"
@@ -15,7 +15,7 @@ func NewStore(ctx context.Context, cfg StoreConfig) (Store, error) {
 		return nil, errors.New("backup store: set BACKUP_DIR or BACKUP_S3_BUCKET, not both")
 	}
 	if cfg.Dir != "" {
-		return newDiskStore(cfg.Dir)
+		return NewDiskStore(cfg.Dir)
 	}
 	if cfg.S3.Bucket != "" {
 		return newS3Store(ctx, cfg.S3)

@@ -13,11 +13,11 @@ import (
 
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/auth"
-	"servermonitor/internal/server/backupserver"
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/agentsig"
+	"servermonitor/pkg/restserver"
 )
 
 type Router struct {
@@ -42,9 +42,14 @@ type Deps struct {
 	SecureCookies  bool
 	TrustProxyTLS  bool
 	AgentSigner    *agentsig.Signer
-	BackupServer   *backupserver.Server
+	BackupServer   *restserver.Server
 	BackupTargets  *storage.BackupTargets
 	BackupTLS      BackupTLSInfo
+	BackupTunnel   *restserver.Tunnel
+	TunnelPeers    *storage.BackupTunnelStore
+	TunnelInfo     BackupTunnelInfo
+	BackupPublic   bool
+	BackupNodes    *storage.BackupNodes
 }
 
 func New(d Deps) *Router {
@@ -79,6 +84,10 @@ func New(d Deps) *Router {
 			r.Use(ingestLimiter(d.IngestRate, d.IngestBurst))
 			r.Use(requireAgentToken(d.Hosts))
 			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger))
+			r.Post("/agent/tunnel", tunnelEnrollHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
+			r.Get("/agent/tunnel/nodes", agentTunnelNodesHandler(d.BackupNodes))
+			r.Get("/agent/backup-node", agentBackupNodeConfigHandler(d.BackupNodes))
+			r.Post("/agent/backup-node/usage", agentBackupNodeUsageHandler(d.BackupNodes))
 		})
 
 		r.Group(func(r chi.Router) {
@@ -94,7 +103,7 @@ func New(d Deps) *Router {
 				r.Post("/admin/hosts", registerHostHandler(d.Hosts, d.AgentSigner))
 				r.Patch("/admin/hosts/{id}", updateHostHandler(d.DB, d.Hosts))
 				r.Post("/admin/hosts/{id}/upgrade", requestHostUpgradeHandler(d.DB, d.Hosts))
-				r.Delete("/admin/hosts/{id}", deleteHostHandler(d.Hosts))
+				r.Delete("/admin/hosts/{id}", deleteHostHandler(d.Hosts, d.BackupTunnel, d.TunnelPeers))
 				r.Get("/hosts", listHostsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}", getHostHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/processes", hostProcessesHandler(d.DB, d.Hosts))
@@ -128,17 +137,22 @@ func New(d Deps) *Router {
 
 				if d.BackupTargets != nil {
 					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
-					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
 					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
 					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Get("/backup-tunnel", backupTunnelStatusHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
+					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers))
+					r.Get("/backup-nodes", listBackupNodesHandler(d.BackupNodes))
+					r.Post("/backup-nodes", promoteBackupNodeHandler(d.BackupNodes, d.Hosts))
+					r.Delete("/backup-nodes/{hostID}", demoteBackupNodeHandler(d.BackupNodes))
 				}
 			})
 		})
 	})
 
-	if d.BackupServer != nil {
+	if d.BackupServer != nil && d.BackupPublic {
 		r.Mount("/backup", d.BackupServer.Routes())
 	}
 

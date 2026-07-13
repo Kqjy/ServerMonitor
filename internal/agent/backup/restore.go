@@ -94,6 +94,15 @@ func Restore(ctx context.Context, cfg Config, ro RestoreOptions, opts Options) (
 	}
 	defer release()
 
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
+	repo, err = findRepo(cfg.Repos, ro.Repo)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+
 	if !ro.InPlace {
 		if err := ensureEmptyTarget(target); err != nil {
 			return RestoreResult{}, err

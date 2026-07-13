@@ -278,7 +278,7 @@ password_file = "/key"
 name = "repo1"
 password_file = "/key"
 `,
-			want: "url is required",
+			want: "exactly one of url or tunnel_name is required",
 		},
 		{
 			name: "repo password",

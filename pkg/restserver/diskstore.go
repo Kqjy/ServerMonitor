@@ -1,4 +1,4 @@
-package backupserver
+package restserver
 
 import (
 	"context"
@@ -13,7 +13,7 @@ type diskStore struct {
 	root string
 }
 
-func newDiskStore(root string) (*diskStore, error) {
+func NewDiskStore(root string) (*diskStore, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}

@@ -25,6 +25,7 @@
 
   type SmartRow = {
     device: string;
+    model: string | null;
     healthy: number | null;
     powerOnHours: number | null;
     realloc: number | null;
@@ -134,64 +135,28 @@
       fs = Object.values(byMount).sort((a, b) => b.pct - a.pct);
 
       const byDev: Record<string, SmartRow> = {};
-      const ensureDev = (d: string): SmartRow => {
-        if (!byDev[d]) byDev[d] = { device: d, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null, written: null, read: null, percentUsed: null, mediaErrors: null, unsafeShutdowns: null };
-        return byDev[d];
+      const fill = (entries: SeriesEntry[], assign: (row: SmartRow, v: number) => void) => {
+        for (const e of entries) {
+          const d = e.labels.device;
+          if (!d) continue;
+          if (!byDev[d]) byDev[d] = { device: d, model: null, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null, written: null, read: null, percentUsed: null, mediaErrors: null, unsafeShutdowns: null };
+          const row = byDev[d];
+          if (e.labels.model && !row.model) row.model = e.labels.model;
+          const v = e.points.at(-1)?.v;
+          if (v !== undefined) assign(row, v);
+        }
       };
-      for (const e of sHealthy.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).healthy = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sHours.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).powerOnHours = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sRealloc.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).realloc = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sPending.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).pending = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sTemp.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        const v = e.points.at(-1)?.v;
-        if (v !== undefined) ensureDev(d).tempC = v;
-      }
-      for (const e of sWritten.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        const v = e.points.at(-1)?.v;
-        if (v !== undefined) ensureDev(d).written = v;
-      }
-      for (const e of sRead.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        const v = e.points.at(-1)?.v;
-        if (v !== undefined) ensureDev(d).read = v;
-      }
-      for (const e of sUsed.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).percentUsed = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sMedia.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).mediaErrors = e.points.at(-1)?.v ?? null;
-      }
-      for (const e of sUnsafe.series) {
-        const d = e.labels.device;
-        if (!d) continue;
-        ensureDev(d).unsafeShutdowns = e.points.at(-1)?.v ?? null;
-      }
-      smart = Object.values(byDev).sort((a, b) => a.device.localeCompare(b.device));
+      fill(sHealthy.series, (r, v) => (r.healthy = v));
+      fill(sHours.series, (r, v) => (r.powerOnHours = v));
+      fill(sRealloc.series, (r, v) => (r.realloc = v));
+      fill(sPending.series, (r, v) => (r.pending = v));
+      fill(sTemp.series, (r, v) => (r.tempC = v));
+      fill(sWritten.series, (r, v) => (r.written = v));
+      fill(sRead.series, (r, v) => (r.read = v));
+      fill(sUsed.series, (r, v) => (r.percentUsed = v));
+      fill(sMedia.series, (r, v) => (r.mediaErrors = v));
+      fill(sUnsafe.series, (r, v) => (r.unsafeShutdowns = v));
+      smart = Object.values(byDev).sort((a, b) => a.device.localeCompare(b.device, undefined, { numeric: true }));
       smartTemps = sTemp.series;
       smartWritten = sWritten.series;
       smartRead = sRead.series;
@@ -356,6 +321,7 @@
         <div class="px-5 py-4 text-sm text-zinc-300 space-y-1">
           <p>No SMART-capable devices on this host.</p>
           <p class="text-zinc-500 text-xs">The agent ran <span class="font-mono text-zinc-400">smartctl --scan</span> successfully, but the system reported zero devices. This is normal for VPS instances, VMs, and storage behind hypervisors or USB enclosures that don't expose SMART.</p>
+          <p class="text-zinc-500 text-xs">Drives behind a hardware RAID controller (MegaRAID/PERC, HP Smart Array, Adaptec, 3ware, Areca) are probed automatically; when a controller is detected but its drives stay hidden, a notice appears here instead.</p>
         </div>
       </section>
     {:else if smartStatus?.state === 'binary_missing'}
@@ -372,6 +338,17 @@
         <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
           <p><span class="font-mono text-amber-200">smartctl --scan</span> failed on this host.</p>
           <p class="text-amber-100/70 text-xs">The most common cause is the agent not running with admin/root privileges. Re-install or run the service as a privileged user.</p>
+          {#if smartStatus.message}
+            <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
+          {/if}
+        </div>
+      </section>
+    {:else if smartStatus?.state === 'raid_unreadable'}
+      <section class="rounded-xl border border-amber-900/50 bg-amber-950/20">
+        <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
+        <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
+          <p>A hardware RAID controller is hiding this host's drives.</p>
+          <p class="text-amber-100/70 text-xs">The agent detected a RAID virtual disk and probed the controller for member drives (<span class="font-mono">smartctl -d megaraid/cciss/aacraid/3ware/areca</span>), but none answered. Drive health is only visible to the controller itself — check it with the vendor CLI (<span class="font-mono">storcli</span>, <span class="font-mono">perccli</span>, <span class="font-mono">ssacli</span>, <span class="font-mono">arcconf</span>), or verify the passthrough type manually with <span class="font-mono">smartctl -d megaraid,N /dev/sdX</span>. Kernels older than the controller driver's passthrough support can also cause this.</p>
           {#if smartStatus.message}
             <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
           {/if}
@@ -402,7 +379,11 @@
   {#if smart.length > 0}
     {#if smartStatus?.state === 'read_failed'}
       <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-2.5 text-xs text-amber-100/80">
-        Some devices were detected but could not be read{smartStatus.message ? ` — ${smartStatus.message}` : ''}. On Linux this usually means an NVMe drive that needs <span class="font-mono">CAP_SYS_ADMIN</span> (re-run the installer with <span class="font-mono">--enable-smart-nvme</span>).
+        Some devices were detected but could not be read{smartStatus.message ? ` — ${smartStatus.message}` : ''}. On Linux this usually means an NVMe drive that needs <span class="font-mono">CAP_SYS_ADMIN</span> (re-run the installer with <span class="font-mono">--enable-smart-nvme</span>), or drives behind a hardware RAID controller that refuses passthrough.
+      </div>
+    {:else if smartStatus?.state === 'raid_unreadable'}
+      <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-2.5 text-xs text-amber-100/80">
+        A hardware RAID controller on this host is hiding some drives{smartStatus.message ? ` — ${smartStatus.message}` : ''}. The devices below are the ones the agent can still reach.
       </div>
     {/if}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -412,6 +393,7 @@
           <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
             <tr>
               <th class="text-left font-medium px-5 py-2.5">Device</th>
+              <th class="text-left font-medium px-3 py-2.5">Model</th>
               <th class="text-left font-medium px-3 py-2.5">Status</th>
               <th class="text-right font-medium px-3 py-2.5">Temp</th>
               <th class="text-right font-medium px-3 py-2.5">Power on</th>
@@ -428,6 +410,7 @@
             {#each smart as row (row.device)}
               <tr class="hover:bg-zinc-900/60">
                 <td class="px-5 py-2 text-zinc-100 font-mono text-xs">{row.device}</td>
+                <td class="px-3 py-2 text-zinc-400 font-mono text-xs max-w-40 truncate" title={row.model ?? undefined}>{row.model ?? '—'}</td>
                 <td class="px-3 py-2">
                   {#if row.healthy === 1}
                     <span class="inline-flex items-center rounded-md border border-emerald-900/60 bg-emerald-950/40 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">Passed</span>

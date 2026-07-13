@@ -40,6 +40,15 @@ func Init(ctx context.Context, cfg Config, opts Options) (InitResult, error) {
 	if cfg.ResticPath == "" {
 		return InitResult{}, fmt.Errorf("restic path is not resolved")
 	}
+	release, err := tunnelLockGuard(cfg, opts)
+	if err != nil {
+		return InitResult{}, err
+	}
+	defer release()
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
 	cacheDir := filepath.Join(filepath.Dir(cfg.StatusPath), "restic-cache")
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return InitResult{}, fmt.Errorf("create restic cache dir: %w", err)

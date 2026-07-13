@@ -85,6 +85,15 @@ func Check(ctx context.Context, cfg Config, co CheckOptions, opts Options) (Chec
 	}
 	defer release()
 
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
+	targets, err = snapshotTargets(cfg.Repos, co.Repo)
+	if err != nil {
+		return CheckResult{}, err
+	}
+
 	statusDir := filepath.Dir(cfg.StatusPath)
 	cacheDir := filepath.Join(statusDir, "restic-cache")
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
@@ -104,7 +113,7 @@ func Check(ctx context.Context, cfg Config, co CheckOptions, opts Options) (Chec
 		}
 		entry := checkRepo(ctx, cfg, repo, cacheDir, co, opts)
 		out.Repos = append(out.Repos, entry)
-		status = applyCheckResult(status, repo.Name, utcSecond(opts.now()), entry.Success)
+		status = applyCheckResult(status, repo.Name, utcSecond(opts.now()), entry.Success, repo.UsesTunnel())
 		if err := writeStatusAtomic(cfg.StatusPath, status); err != nil {
 			return out, fmt.Errorf("write backup status: %w", err)
 		}
@@ -187,7 +196,7 @@ func parsePositiveInt(value string) (int, bool) {
 	return n, true
 }
 
-func applyCheckResult(status StatusFile, name string, checkTime time.Time, success bool) StatusFile {
+func applyCheckResult(status StatusFile, name string, checkTime time.Time, success bool, tunnel bool) StatusFile {
 	out := StatusFile{Version: statusVersion, Repos: make([]RepoStatus, 0, len(status.Repos)+1)}
 	found := false
 	for _, repo := range status.Repos {
@@ -196,6 +205,7 @@ func applyCheckResult(status StatusFile, name string, checkTime time.Time, succe
 			ok := success
 			repo.CheckLast = &last
 			repo.CheckSuccess = &ok
+			repo.Tunnel = tunnel
 			found = true
 		}
 		out.Repos = append(out.Repos, repo)
@@ -203,7 +213,7 @@ func applyCheckResult(status StatusFile, name string, checkTime time.Time, succe
 	if !found {
 		last := checkTime
 		ok := success
-		out.Repos = append(out.Repos, RepoStatus{Name: name, Engine: "restic", CheckLast: &last, CheckSuccess: &ok})
+		out.Repos = append(out.Repos, RepoStatus{Name: name, Engine: "restic", CheckLast: &last, CheckSuccess: &ok, Tunnel: tunnel})
 	}
 	return out
 }

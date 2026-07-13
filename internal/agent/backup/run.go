@@ -59,6 +59,11 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 	}
 	defer release()
 
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
+
 	statusDir := filepath.Dir(cfg.StatusPath)
 	cacheDir := filepath.Join(statusDir, "restic-cache")
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
@@ -105,6 +110,7 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 		Name:        repo.Name,
 		Engine:      "restic",
 		LastStarted: &start,
+		Tunnel:      repo.UsesTunnel(),
 	}
 	logger.Info("backup repo started", "repo", repo.Name)
 

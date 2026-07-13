@@ -19,6 +19,7 @@ import (
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/agentsig"
 	"servermonitor/pkg/metrics"
+	"servermonitor/pkg/restserver"
 	"servermonitor/pkg/version"
 )
 
@@ -439,7 +440,7 @@ func requestHostUpgradeHandler(db *storage.DB, hosts *storage.Hosts) http.Handle
 	}
 }
 
-func deleteHostHandler(hosts *storage.Hosts) http.HandlerFunc {
+func deleteHostHandler(hosts *storage.Hosts, tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idStr := chi.URLParam(r, "id")
 		id, err := strconv.ParseInt(idStr, 10, 64)
@@ -454,6 +455,12 @@ func deleteHostHandler(hosts *storage.Hosts) http.HandlerFunc {
 			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if tunnel != nil && peers != nil {
+			if peer, peerErr := peers.GetPeer(r.Context(), id); peerErr == nil {
+				_ = peers.DeletePeer(r.Context(), id)
+				_ = tunnel.RemovePeer(peer.PublicKey)
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}

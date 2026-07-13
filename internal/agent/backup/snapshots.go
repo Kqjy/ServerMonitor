@@ -52,6 +52,15 @@ func ListSnapshots(ctx context.Context, cfg Config, repoName string, opts Option
 	if cfg.ResticPath == "" {
 		return SnapshotListResult{}, fmt.Errorf("restic path is not resolved")
 	}
+	release, err := tunnelLockGuard(cfg, opts)
+	if err != nil {
+		return SnapshotListResult{}, err
+	}
+	defer release()
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
 	targets, err := snapshotTargets(cfg.Repos, repoName)
 	if err != nil {
 		return SnapshotListResult{}, err

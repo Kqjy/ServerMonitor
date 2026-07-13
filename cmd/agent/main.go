@@ -22,6 +22,7 @@ import (
 	"time"
 
 	agentbackup "servermonitor/internal/agent/backup"
+	"servermonitor/internal/agent/backupnode"
 	"servermonitor/internal/agent/collectors"
 	"servermonitor/internal/agent/config"
 	"servermonitor/internal/agent/runner"
@@ -132,6 +133,9 @@ func main() {
 	defer cancel()
 
 	client.StartDrainer(ctx)
+
+	nodeManager := backupnode.New(cfg.ServerURL, cfg.Token, cfg.InsecureSkip, filepath.Dir(cfg.BackupStatusPath), logger)
+	go nodeManager.Run(ctx)
 
 	go func() {
 		for {
@@ -293,7 +297,7 @@ func (s *stringList) Set(value string) error {
 
 func backupCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy} [options]")
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -372,6 +376,68 @@ func backupCmd(args []string) {
 		if !result.AllSucceeded() {
 			os.Exit(1)
 		}
+	case "tunnel-enroll":
+		fs := flag.NewFlagSet("backup tunnel-enroll", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		agentConfigPath := fs.String("agent-config", defaultConfigPath(), "path to agent.toml (server url + token)")
+		keyPath := fs.String("key", "", "path to the wireguard private key file (default: tunnel.key next to backup.toml)")
+		_ = fs.Parse(args[1:])
+		agentCfg, err := config.Load(*agentConfigPath)
+		if err != nil {
+			logger.Error("tunnel enroll failed", "err", err)
+			os.Exit(1)
+		}
+		result, err := agentbackup.TunnelEnroll(ctx, agentbackup.EnrollOptions{
+			ConfigPath:   *configPath,
+			ServerURL:    agentCfg.ServerURL,
+			Token:        agentCfg.Token,
+			InsecureSkip: agentCfg.InsecureSkip,
+			KeyPath:      *keyPath,
+		})
+		if err != nil {
+			logger.Error("tunnel enroll failed", "err", err)
+			os.Exit(1)
+		}
+		if result.KeyGenerated {
+			fmt.Printf("generated wireguard key: %s\n", result.KeyPath)
+		} else {
+			fmt.Printf("kept existing wireguard key: %s\n", result.KeyPath)
+		}
+		fmt.Printf("enrolled: tunnel ip %s -> server %s (endpoint %s)\n", result.TunnelIP, result.ServerTunnelIP, result.Endpoint)
+		fmt.Printf("server public key: %s\n", result.ServerPublicKey)
+		for _, node := range result.Nodes {
+			fmt.Printf("backup node %s: %s (endpoint %s)\n", node.Host, node.IP, node.Endpoint)
+		}
+		if result.Warning != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", result.Warning)
+		}
+	case "proxy":
+		fs := flag.NewFlagSet("backup proxy", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		listen := fs.String("listen", "127.0.0.1:0", "loopback address for the local restic proxy")
+		_ = fs.Parse(args[1:])
+		cfg, err := agentbackup.Load(*configPath)
+		if err != nil {
+			logger.Error("backup proxy failed", "err", err)
+			os.Exit(1)
+		}
+		info, err := agentbackup.StartProxy(cfg, *listen, agentbackup.Options{Logger: logger})
+		if err != nil {
+			logger.Error("backup proxy failed", "err", err)
+			os.Exit(1)
+		}
+		defer info.Release()
+		defer info.Session.Close()
+		if err := info.Session.Handshaken(15 * time.Second); err != nil {
+			logger.Error("backup proxy failed", "err", err)
+			os.Exit(1)
+		}
+		fmt.Println("tunnel up; local restic proxies:")
+		for _, endpoint := range info.Endpoints {
+			fmt.Printf("  repo %s (via %s):\n    export RESTIC_REPOSITORY=%s\n", endpoint.RepoName, endpoint.Destination, endpoint.RepoURL)
+		}
+		fmt.Println("press Ctrl+C to stop")
+		<-ctx.Done()
 	case "restore":
 		fs := flag.NewFlagSet("backup restore", flag.ExitOnError)
 		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
@@ -409,7 +475,7 @@ func backupCmd(args []string) {
 				result.Summary.BytesRestored, result.Summary.TotalBytes, result.Summary.FilesSkipped)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy} [options]")
 		os.Exit(2)
 	}
 }

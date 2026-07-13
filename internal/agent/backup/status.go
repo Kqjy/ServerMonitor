@@ -30,6 +30,7 @@ type RepoStatus struct {
 	SnapshotCount int64      `json:"snapshot_count,omitempty"`
 	CheckLast     *time.Time `json:"check_last,omitempty"`
 	CheckSuccess  *bool      `json:"check_success,omitempty"`
+	Tunnel        bool       `json:"tunnel,omitempty"`
 	Snapshots     []Snapshot `json:"snapshots,omitempty"`
 }
 

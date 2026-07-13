@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,7 +23,6 @@ import (
 	"servermonitor/internal/server/api"
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/auth"
-	"servermonitor/internal/server/backupserver"
 	"servermonitor/internal/server/config"
 	"servermonitor/internal/server/ingest"
 	"servermonitor/internal/server/notify"
@@ -31,7 +31,9 @@ import (
 	"servermonitor/internal/server/tasks"
 	"servermonitor/internal/server/web"
 	"servermonitor/pkg/agentsig"
+	"servermonitor/pkg/restserver"
 	"servermonitor/pkg/version"
+	"servermonitor/pkg/wgtunnel"
 )
 
 const Version = version.Version
@@ -158,11 +160,11 @@ func main() {
 	}
 
 	backupTargets := storage.NewBackupTargets(db)
-	var backupServer *backupserver.Server
+	var backupServer *restserver.Server
 	if cfg.BackupEnabled() {
-		store, storeErr := backupserver.NewStore(ctx, backupserver.StoreConfig{
+		store, storeErr := restserver.NewStore(ctx, restserver.StoreConfig{
 			Dir: cfg.BackupDir,
-			S3: backupserver.S3Config{
+			S3: restserver.S3Config{
 				Bucket:       cfg.BackupS3Bucket,
 				Region:       cfg.BackupS3Region,
 				Prefix:       cfg.BackupS3Prefix,
@@ -174,9 +176,77 @@ func main() {
 			logger.Error("backup server disabled", "err", storeErr)
 			os.Exit(1)
 		}
-		backupServer = backupserver.New(store, backupTargets, cfg.BackupMaxBlobBytes, logger)
+		backupServer = restserver.New(store, backupTargets, cfg.BackupMaxBlobBytes, logger)
 		logger.Info("backup server enabled", "backend", store.Backend().Kind, "location", store.Backend().Location, "tls", cfg.BackupTLSMode())
 	}
+
+	tunnelPeers := storage.NewBackupTunnel(db)
+	var backupTunnel *restserver.Tunnel
+	if cfg.BackupTunnelEnabled() {
+		subnet, subnetErr := netip.ParsePrefix(cfg.BackupWGSubnet)
+		if subnetErr != nil {
+			logger.Error("backup tunnel subnet", "err", subnetErr)
+			os.Exit(1)
+		}
+		privBytes, keyErr := tunnelPeers.EnsureIdentity(ctx, subnet.Masked().String(), func() ([]byte, error) {
+			key, genErr := wgtunnel.GenerateKey()
+			if genErr != nil {
+				return nil, genErr
+			}
+			return key[:], nil
+		})
+		if keyErr != nil {
+			logger.Error("backup tunnel identity", "err", keyErr)
+			os.Exit(1)
+		}
+		priv, keyErr := wgtunnel.KeyFromBytes(privBytes)
+		if keyErr != nil {
+			logger.Error("backup tunnel identity", "err", keyErr)
+			os.Exit(1)
+		}
+		rows, peerErr := tunnelPeers.ListPeers(ctx)
+		if peerErr != nil {
+			logger.Error("backup tunnel peers", "err", peerErr)
+			os.Exit(1)
+		}
+		peers := make([]wgtunnel.Peer, 0, len(rows))
+		for _, row := range rows {
+			peer, convErr := restserver.PeerFromParts(row.PublicKey, row.TunnelIP)
+			if convErr != nil {
+				logger.Warn("backup tunnel peer skipped", "host_id", row.HostID, "err", convErr)
+				continue
+			}
+			peers = append(peers, peer)
+		}
+		var tunnelHandler http.Handler
+		if backupServer != nil {
+			tunnelHandler = backupServer.Routes()
+		}
+		tunnel, startErr := restserver.StartTunnel(restserver.TunnelConfig{
+			PrivateKey: priv,
+			Subnet:     subnet,
+			ListenPort: uint16(cfg.BackupWGPort),
+			MTU:        cfg.BackupWGMTU,
+			Logger:     logger,
+		}, peers, tunnelHandler)
+		if startErr != nil {
+			logger.Error("backup tunnel start", "err", startErr)
+			os.Exit(1)
+		}
+		backupTunnel = tunnel
+		defer backupTunnel.Close()
+		logger.Info("backup tunnel enabled",
+			"udp_port", cfg.BackupWGPort,
+			"subnet", subnet.Masked().String(),
+			"server_ip", tunnel.ServerIP().String(),
+			"public_key", tunnel.PublicKey().String(),
+			"peers", len(peers),
+			"mtu", cfg.BackupWGMTU)
+		if backupServer != nil && !cfg.BackupServesPublicHTTP() {
+			logger.Info("public /backup endpoint disabled (tunnel mode); set BACKUP_PUBLIC_HTTP=1 to serve both")
+		}
+	}
+	backupNodes := storage.NewBackupNodes(db)
 
 	go sessionSweeper(ctx, authSvc, logger)
 
@@ -210,6 +280,18 @@ func main() {
 			Domain: cfg.BackupACMEDomain,
 			Secure: cfg.BackupTLSSecure(),
 		},
+		BackupTunnel: backupTunnel,
+		TunnelPeers:  tunnelPeers,
+		TunnelInfo: api.BackupTunnelInfo{
+			Enabled:       cfg.BackupTunnelEnabled(),
+			ListenPort:    cfg.BackupWGPort,
+			Endpoint:      cfg.BackupWGEndpoint,
+			Subnet:        cfg.BackupWGSubnet,
+			PublicHTTP:    cfg.BackupServesPublicHTTP(),
+			ServerStorage: cfg.BackupEnabled(),
+		},
+		BackupPublic: cfg.BackupServesPublicHTTP(),
+		BackupNodes:  backupNodes,
 		Retention: api.RetentionConfig{
 			Raw:               cfg.RetentionRaw,
 			Aggregate5m:       cfg.RetentionAggregate5m,

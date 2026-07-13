@@ -19,6 +19,8 @@ type BackupTarget struct {
 	Name            string
 	HostID          *int64
 	Hostname        string
+	NodeHostID      *int64
+	NodeHostname    string
 	QuotaBytes      *int64
 	UsedBytes       int64
 	UsageMeasuredAt *time.Time
@@ -51,13 +53,13 @@ func NewBackupTargets(db *DB) *BackupTargets {
 	}
 }
 
-func (b *BackupTargets) Create(ctx context.Context, name string, hostID *int64, quota *int64, secret string) (int64, error) {
+func (b *BackupTargets) Create(ctx context.Context, name string, hostID *int64, quota *int64, secret string, nodeHostID *int64) (int64, error) {
 	var id int64
 	err := b.db.Pool.QueryRow(ctx, `
-		INSERT INTO backup_targets (name, secret_hash, host_id, quota_bytes)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO backup_targets (name, secret_hash, host_id, quota_bytes, node_host_id)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id
-	`, name, tokenHash(secret), hostID, quota).Scan(&id)
+	`, name, tokenHash(secret), hostID, quota, nodeHostID).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -200,6 +202,7 @@ func (b *BackupTargets) refresh(ctx context.Context) error {
 	rows, err := b.db.Pool.Query(ctx, `
 		SELECT id, name, secret_hash, COALESCE(quota_bytes, 0), used_bytes, revoked_at IS NOT NULL
 		FROM backup_targets
+		WHERE node_host_id IS NULL
 	`)
 	if err != nil {
 		return err
@@ -236,10 +239,11 @@ func (b *BackupTargets) invalidate() {
 
 func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 	rows, err := b.db.Pool.Query(ctx, `
-		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.quota_bytes,
+		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''), t.quota_bytes,
 		       t.used_bytes, t.usage_measured_at, t.created_at, t.revoked_at
 		FROM backup_targets t
 		LEFT JOIN hosts h ON h.id = t.host_id AND h.deleted_at IS NULL
+		LEFT JOIN hosts nh ON nh.id = t.node_host_id AND nh.deleted_at IS NULL
 		ORDER BY t.name
 	`)
 	if err != nil {
@@ -249,7 +253,7 @@ func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 	out := []BackupTarget{}
 	for rows.Next() {
 		var t BackupTarget
-		if err := rows.Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.QuotaBytes,
+		if err := rows.Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname, &t.QuotaBytes,
 			&t.UsedBytes, &t.UsageMeasuredAt, &t.CreatedAt, &t.RevokedAt); err != nil {
 			return nil, err
 		}
@@ -264,12 +268,13 @@ func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 func (b *BackupTargets) Get(ctx context.Context, id int64) (BackupTarget, error) {
 	var t BackupTarget
 	err := b.db.Pool.QueryRow(ctx, `
-		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.quota_bytes,
+		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''), t.quota_bytes,
 		       t.used_bytes, t.usage_measured_at, t.created_at, t.revoked_at
 		FROM backup_targets t
 		LEFT JOIN hosts h ON h.id = t.host_id AND h.deleted_at IS NULL
+		LEFT JOIN hosts nh ON nh.id = t.node_host_id AND nh.deleted_at IS NULL
 		WHERE t.id = $1
-	`, id).Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.QuotaBytes,
+	`, id).Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname, &t.QuotaBytes,
 		&t.UsedBytes, &t.UsageMeasuredAt, &t.CreatedAt, &t.RevokedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

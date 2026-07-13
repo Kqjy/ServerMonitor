@@ -1,8 +1,11 @@
 package collectors
 
 import (
+	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +188,319 @@ func TestSmartPointsNVMe(t *testing.T) {
 	}
 	if m[metrics.SmartHealthy] != 1 {
 		t.Errorf("healthy = %v, want 1", m[metrics.SmartHealthy])
+	}
+}
+
+type fakeSmartctl struct {
+	mu        sync.Mutex
+	responses map[string]string
+	fallback  string
+	calls     []string
+}
+
+func (f *fakeSmartctl) exec(_ context.Context, _ string, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	f.mu.Lock()
+	f.calls = append(f.calls, key)
+	f.mu.Unlock()
+	if r, ok := f.responses[key]; ok {
+		return []byte(r), nil
+	}
+	if f.fallback != "" {
+		return []byte(f.fallback), nil
+	}
+	return []byte(`{"smartctl":{"exit_status":2}}`), nil
+}
+
+func (f *fakeSmartctl) called(key string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == key {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	fakeVDIdentity = `{"smartctl":{"exit_status":0},"vendor":"AVAGO","product":"SMC3108","smart_support":{"available":false},"device_type":{"scsi_value":0,"name":"disk"}}`
+	fakeSASDisk8   = `{"smartctl":{"exit_status":0},"model_name":"ST4000NM0023","serial_number":"Z1Z0AAAA","smart_support":{"available":true},"device_type":{"scsi_value":0,"name":"disk"}}`
+	fakeSASDisk9   = `{"smartctl":{"exit_status":0},"model_name":"ST4000NM0023","serial_number":"Z1Z0BBBB","smart_support":{"available":true},"device_type":{"scsi_value":0,"name":"disk"}}`
+	fakeEnclosure  = `{"smartctl":{"exit_status":0},"vendor":"LSI","product":"SAS2X28","device_type":{"scsi_value":13,"name":"enclosure"}}`
+)
+
+func newRAIDTestCollector(f *fakeSmartctl) *smartCollector {
+	return &smartCollector{
+		probed:     true,
+		smartctl:   "/fake/smartctl",
+		goos:       "linux",
+		devicesTTL: time.Hour,
+		execFn:     f.exec,
+		fileExists: func(string) bool { return false },
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestRAIDFamiliesFor(t *testing.T) {
+	unavail := &smartView{SmartSupport: &struct {
+		Available bool `json:"available"`
+	}{false}}
+	avail := &smartView{SmartSupport: &struct {
+		Available bool `json:"available"`
+	}{true}}
+	vd := &smartView{Vendor: "AVAGO", Product: "SMC3108", SmartSupport: unavail.SmartSupport}
+	hp := &smartView{Vendor: "HP", Product: "LOGICAL VOLUME", SmartSupport: unavail.SmartSupport}
+	adaptec := &smartView{Vendor: "Adaptec", Product: "ASR8805", SmartSupport: unavail.SmartSupport}
+
+	cases := []struct {
+		name         string
+		identity     *smartView
+		opened       bool
+		goos         string
+		want         []string
+		wantExplicit bool
+	}{
+		{"healthy sas disk", avail, true, "linux", nil, false},
+		{"unopened device", nil, false, "linux", nil, false},
+		{"megaraid vd", vd, true, "linux", []string{"megaraid", "cciss"}, true},
+		{"hp logical volume", hp, true, "linux", []string{"cciss"}, true},
+		{"adaptec", adaptec, true, "linux", []string{"aacraid"}, true},
+		{"unknown no-smart", unavail, true, "linux", []string{"megaraid", "cciss"}, false},
+		{"unknown no-smart windows", unavail, true, "windows", []string{"megaraid"}, false},
+		{"hp on windows", hp, true, "windows", nil, true},
+	}
+	for _, tc := range cases {
+		got, explicit := raidFamiliesFor(tc.identity, tc.opened, tc.goos)
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") || explicit != tc.wantExplicit {
+			t.Errorf("%s: raidFamiliesFor = (%v, %v), want (%v, %v)", tc.name, got, explicit, tc.want, tc.wantExplicit)
+		}
+	}
+}
+
+func TestRAIDCandidates(t *testing.T) {
+	scanned := []smartDevice{
+		{name: "/dev/nvme0", devType: "nvme", isNVMe: true},
+		{name: "/dev/sda", devType: "scsi"},
+		{name: "/dev/sdb", devType: "sat"},
+		{name: "/dev/sdc", devType: ""},
+	}
+	got := raidCandidates(scanned)
+	if len(got) != 2 || got[0].name != "/dev/sda" || got[1].name != "/dev/sdc" {
+		t.Fatalf("raidCandidates = %+v, want sda and sdc only", got)
+	}
+}
+
+func TestPassthroughFamilies(t *testing.T) {
+	fams := passthroughFamilies([]smartDevice{
+		{name: "/dev/bus/0", devType: "megaraid,4"},
+		{name: "/dev/sda", devType: "scsi"},
+	})
+	if !fams["megaraid"] || len(fams) != 1 {
+		t.Fatalf("passthroughFamilies = %v, want megaraid only", fams)
+	}
+}
+
+func TestWalkIDsMissStreakAndDedupe(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"-i --json=c -d megaraid,8 /dev/sda":  fakeSASDisk8,
+		"-i --json=c -d megaraid,9 /dev/sda":  fakeSASDisk9,
+		"-i --json=c -d megaraid,11 /dev/sda": fakeEnclosure,
+	}}
+	c := newRAIDTestCollector(f)
+	serials := map[string]bool{}
+	devs := map[string]bool{}
+	got := c.walkIDs(context.Background(), c.smartctl, "/dev/sda", 0, 63, 16, serials, devs, func(i int) string {
+		return "megaraid," + strconv.Itoa(i)
+	})
+	if len(got) != 2 {
+		t.Fatalf("walkIDs found %d devices, want 2 (enclosure filtered): %+v", len(got), got)
+	}
+	if got[0].devType != "megaraid,8" || got[1].devType != "megaraid,9" {
+		t.Fatalf("walkIDs devices = %+v", got)
+	}
+	if f.called("-i --json=c -d megaraid,40 /dev/sda") {
+		t.Fatalf("walkIDs should stop after 16 consecutive misses, probed id 40")
+	}
+
+	f2 := &fakeSmartctl{responses: map[string]string{
+		"-i --json=c -d megaraid,8 /dev/sdb": fakeSASDisk8,
+	}}
+	c2 := newRAIDTestCollector(f2)
+	got2 := c2.walkIDs(context.Background(), c2.smartctl, "/dev/sdb", 0, 63, 16, serials, devs, func(i int) string {
+		return "megaraid," + strconv.Itoa(i)
+	})
+	if len(got2) != 0 {
+		t.Fatalf("walkIDs must skip serials already claimed by another node, got %+v", got2)
+	}
+}
+
+func TestProbeRAIDPassthroughNoDrivesSetsNote(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"-i --json=c /dev/sda": fakeVDIdentity,
+	}}
+	c := newRAIDTestCollector(f)
+	found, hide, note := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
+		[]smartDevice{{name: "/dev/sda", devType: "scsi"}}, false,
+		[]smartDevice{{name: "/dev/sda", devType: "scsi"}})
+	if len(found) != 0 || len(hide) != 0 {
+		t.Fatalf("expected nothing found, got %+v hide %v", found, hide)
+	}
+	if !strings.Contains(note, "SMC3108") || !strings.Contains(note, "sda") {
+		t.Fatalf("note should name the controller and device, got %q", note)
+	}
+}
+
+func TestProbeRAIDPassthroughSkipsScannedFamily(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"-i --json=c /dev/sda": fakeVDIdentity,
+	}}
+	c := newRAIDTestCollector(f)
+	scanned := []smartDevice{
+		{name: "/dev/sda", devType: "scsi"},
+		{name: "/dev/bus/0", devType: "megaraid,8"},
+	}
+	found, _, note := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
+		[]smartDevice{{name: "/dev/sda", devType: "scsi"}}, false, scanned)
+	if len(found) != 0 {
+		t.Fatalf("expected no probed drives when scan already enumerated megaraid, got %+v", found)
+	}
+	for _, call := range f.calls {
+		if strings.Contains(call, "-d megaraid,") {
+			t.Fatalf("must not probe megaraid ids when scan already lists them, probed %q", call)
+		}
+	}
+	if note != "" {
+		t.Fatalf("note should stay empty when only skipped families remain unprobed, got %q", note)
+	}
+}
+
+func TestCollectMegaRAIDEndToEnd(t *testing.T) {
+	fullRead8 := `{"smartctl":{"exit_status":0},"model_name":"ST4000NM0023","serial_number":"Z1Z0AAAA",
+		"temperature":{"current":34},"power_on_time":{"hours":41000},"smart_status":{"passed":true},
+		"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":0}}]}}`
+	fullRead9 := `{"smartctl":{"exit_status":0},"model_name":"ST4000NM0023","serial_number":"Z1Z0BBBB",
+		"temperature":{"current":36},"power_on_time":{"hours":41002},"smart_status":{"passed":true},
+		"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":3}}]}}`
+	f := &fakeSmartctl{responses: map[string]string{
+		"--scan --json=c":                    `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
+		"-i --json=c /dev/sda":               fakeVDIdentity,
+		"-i --json=c -d megaraid,8 /dev/sda": fakeSASDisk8,
+		"-i --json=c -d megaraid,9 /dev/sda": fakeSASDisk9,
+		"-a --json=c /dev/sda":               `{"smartctl":{"exit_status":4}}`,
+		"-a --json=c -d megaraid,8 /dev/sda": fullRead8,
+		"-a --json=c -d megaraid,9 /dev/sda": fullRead9,
+	}}
+	c := newRAIDTestCollector(f)
+	if !c.ensure(context.Background()) {
+		t.Fatalf("ensure should succeed with the scanned virtual disk")
+	}
+	waitFor(t, "raid discovery", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.raidBusy && len(c.raidExtra) == 2
+	})
+	c.mu.Lock()
+	devs := c.devicesLocked()
+	c.mu.Unlock()
+	if len(devs) != 2 {
+		t.Fatalf("virtual disk must be hidden once members are found, devices = %+v", devs)
+	}
+	pts, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	byDev := map[string]map[metrics.ID]float64{}
+	models := map[string]string{}
+	for _, p := range pts {
+		d := p.Labels["device"]
+		if byDev[d] == nil {
+			byDev[d] = map[metrics.ID]float64{}
+		}
+		byDev[d][p.Metric] = p.Value
+		models[d] = p.Labels["model"]
+	}
+	if len(byDev) != 2 {
+		t.Fatalf("points for %d devices, want 2: %v", len(byDev), byDev)
+	}
+	if byDev["sda#8"][metrics.SmartTempC] != 34 || byDev["sda#9"][metrics.SmartTempC] != 36 {
+		t.Fatalf("per-drive temps wrong: %v", byDev)
+	}
+	if byDev["sda#9"][metrics.SmartReallocSectors] != 3 {
+		t.Fatalf("sda#9 realloc = %v, want 3", byDev["sda#9"][metrics.SmartReallocSectors])
+	}
+	if models["sda#8"] != "ST4000NM0023" {
+		t.Fatalf("model label = %q, want ST4000NM0023", models["sda#8"])
+	}
+	if c.Status().State != smartStateOK {
+		t.Fatalf("state = %q, want ok", c.Status().State)
+	}
+}
+
+func TestCollectRAIDNoteSurfacesState(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"--scan --json=c":      `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
+		"-i --json=c /dev/sda": fakeVDIdentity,
+		"-a --json=c /dev/sda": `{"smartctl":{"exit_status":4}}`,
+	}}
+	c := newRAIDTestCollector(f)
+	if !c.ensure(context.Background()) {
+		t.Fatalf("ensure should succeed")
+	}
+	waitFor(t, "raid discovery", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.raidBusy && c.raidNote != ""
+	})
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	st := c.Status()
+	if st.State != smartStateRAIDHidden {
+		t.Fatalf("state = %q, want %q", st.State, smartStateRAIDHidden)
+	}
+	if !strings.Contains(st.Message, "SMC3108") {
+		t.Fatalf("message should carry the controller model, got %q", st.Message)
+	}
+}
+
+func TestUpdateReadStateRAIDNote(t *testing.T) {
+	c := &smartCollector{raidNote: "hardware RAID virtual disk sda (SMC3108) hides its member drives"}
+	if !c.updateReadStateLocked(2, 0, 0) {
+		t.Fatalf("raid note with clean reads should warn once")
+	}
+	if c.state != smartStateRAIDHidden {
+		t.Fatalf("state = %q, want %q", c.state, smartStateRAIDHidden)
+	}
+	if c.updateReadStateLocked(2, 0, 0) {
+		t.Fatalf("repeated raid-note tick must not warn again")
+	}
+	if !strings.Contains(c.stateMsg, "SMC3108") {
+		t.Fatalf("stateMsg = %q", c.stateMsg)
+	}
+	if c.updateReadStateLocked(1, 1, 0) {
+		t.Fatalf("warn latch already used")
+	}
+	if c.state != smartStateReadFailed || !strings.Contains(c.stateMsg, "SMC3108") {
+		t.Fatalf("read failures should take precedence but keep the raid note, got %q %q", c.state, c.stateMsg)
+	}
+	c.raidNote = ""
+	if c.updateReadStateLocked(2, 0, 0) {
+		t.Fatalf("recovery should not warn")
+	}
+	if c.state != smartStateOK || c.warned {
+		t.Fatalf("recovery must reset to ok")
 	}
 }
 

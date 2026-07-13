@@ -1,4 +1,4 @@
-package backupserver
+package restserver
 
 import (
 	"bytes"
@@ -47,7 +47,7 @@ const dataName = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 func newTestServer(t *testing.T, reg *fakeRegistry) *httptest.Server {
 	t.Helper()
-	store, err := newDiskStore(t.TempDir())
+	store, err := NewDiskStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("disk store: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestResticRoundTripAppendOnly(t *testing.T) {
 }
 
 func TestDiskStoreExclusiveCreateAndUsage(t *testing.T) {
-	store, err := newDiskStore(t.TempDir())
+	store, err := NewDiskStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("disk store: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestDiskStoreExclusiveCreateAndUsage(t *testing.T) {
 }
 
 func TestDiskStoreRepoHasObjects(t *testing.T) {
-	store, err := newDiskStore(t.TempDir())
+	store, err := NewDiskStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("disk store: %v", err)
 	}

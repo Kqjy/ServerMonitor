@@ -1,10 +1,14 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { page } from '$app/stores';
   import {
     api,
     type BackupTargetsResp,
     type BackupTarget,
     type BackupCredential,
+    type BackupTunnelResp,
+    type BackupTunnelPeer,
+    type BackupNode,
     type Host
   } from '$lib/api';
   import { bytes, timeAgo } from '$lib/format';
@@ -15,7 +19,21 @@
 
   let view = $state<View>('list');
   let data = $state<BackupTargetsResp | null>(null);
+  let tunnel = $state<BackupTunnelResp | null>(null);
+  let nodes = $state<BackupNode[]>([]);
   let hosts = $state<Host[]>([]);
+  let peerToRevoke = $state<BackupTunnelPeer | null>(null);
+  let nodeToDemote = $state<BackupNode | null>(null);
+  let demoteError = $state<string | null>(null);
+
+  let promoting = $state(false);
+  let promoteHostId = $state<number | null>(null);
+  let promoteEndpoint = $state('');
+  let promotePort = $state<number>(51821);
+  let promoteError = $state<string | null>(null);
+  let promoteBusy = $state(false);
+
+  let newDestination = $state<'server' | number>('server');
   let baseUrl = $state('');
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -41,15 +59,87 @@
     loading = true;
     error = null;
     try {
-      const [resp, info] = await Promise.all([api.backupTargets(), api.serverInfo()]);
+      const [resp, info, tun, nodeResp] = await Promise.all([
+        api.backupTargets(),
+        api.serverInfo(),
+        api.backupTunnel().catch(() => null),
+        api.backupNodes().catch(() => null)
+      ]);
       data = resp;
+      tunnel = tun;
+      nodes = nodeResp?.nodes ?? [];
       baseUrl = (info.url || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
     } catch (e) {
       error = (e as Error).message;
     } finally {
       loading = false;
     }
+    void loadHosts();
   }
+
+  async function revokePeer() {
+    if (!peerToRevoke) return;
+    await api.backupTunnelPeerRevoke(peerToRevoke.host_id);
+    peerToRevoke = null;
+    try {
+      tunnel = await api.backupTunnel();
+    } catch {}
+  }
+
+  function openPromote() {
+    promoteHostId = null;
+    promoteEndpoint = '';
+    promotePort = 51821;
+    promoteError = null;
+    promoting = true;
+  }
+
+  function promoteHostChanged() {
+    if (promoteHostId != null && !promoteEndpoint) {
+      const h = hosts.find((x) => x.id === promoteHostId);
+      if (h) promoteEndpoint = h.hostname;
+    }
+  }
+
+  async function promote() {
+    if (promoteHostId == null || !promoteEndpoint.trim()) {
+      promoteError = 'Pick a host and give the endpoint agents reach it at.';
+      return;
+    }
+    promoteBusy = true;
+    promoteError = null;
+    try {
+      await api.backupNodePromote({
+        host_id: promoteHostId,
+        endpoint: promoteEndpoint.trim(),
+        udp_port: promotePort || 51821
+      });
+      promoting = false;
+      const nodeResp = await api.backupNodes().catch(() => null);
+      nodes = nodeResp?.nodes ?? nodes;
+    } catch (e) {
+      promoteError = (e as Error).message;
+    } finally {
+      promoteBusy = false;
+    }
+  }
+
+  async function demoteNode() {
+    if (!nodeToDemote) return;
+    demoteError = null;
+    try {
+      await api.backupNodeDemote(nodeToDemote.host_id);
+      nodeToDemote = null;
+      const nodeResp = await api.backupNodes().catch(() => null);
+      nodes = nodeResp?.nodes ?? nodes;
+    } catch (e) {
+      demoteError = (e as Error).message;
+      nodeToDemote = null;
+    }
+  }
+
+  const promotableHosts = $derived(hosts.filter((h) => !nodes.some((n) => n.host_id === h.id)));
+  const selectedNode = $derived(newDestination === 'server' ? null : (nodes.find((n) => n.host_id === newDestination) ?? null));
 
   async function loadHosts() {
     try {
@@ -57,16 +147,26 @@
     } catch {}
   }
 
-  function openNew() {
+  function sanitizeName(s: string): string {
+    return s.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  }
+
+  function openNew(hostId?: number) {
     newName = '';
-    newHostId = null;
+    newHostId = hostId ?? null;
     newQuotaGiB = null;
+    newDestination = 'server';
     credential = null;
     createError = null;
     firstBlobSeen = false;
     snippetTab = 'linux';
     view = 'new';
-    void loadHosts();
+    void loadHosts().then(() => {
+      if (hostId != null) {
+        const h = hosts.find((x) => x.id === hostId);
+        if (h && !newName) newName = sanitizeName(h.hostname);
+      }
+    });
   }
 
   function backToList() {
@@ -82,12 +182,17 @@
       createError = 'Name must use only letters, digits, dot, dash or underscore.';
       return;
     }
+    if (newDestination !== 'server' && newHostId == null) {
+      createError = 'Node-hosted repositories need a linked host — the node only admits tunnel peers that own a repository on it.';
+      return;
+    }
     creating = true;
     createError = null;
     try {
-      const body: { name: string; host_id?: number; quota_bytes?: number } = { name: newName.trim() };
+      const body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number } = { name: newName.trim() };
       if (newHostId != null) body.host_id = newHostId;
       if (newQuotaGiB != null && newQuotaGiB > 0) body.quota_bytes = Math.round(newQuotaGiB * 1024 ** 3);
+      if (newDestination !== 'server') body.node_host_id = newDestination;
       credential = await api.backupTargetCreate(body);
       startPoll();
     } catch (e) {
@@ -168,14 +273,94 @@
     return 'bg-sky-500/70';
   }
 
-  const repoUrl = $derived(credential ? `rest:${baseUrl}/backup/${credential.name}` : '');
+  type HostBackup = {
+    id: number;
+    hostname: string;
+    state: string;
+    message?: string;
+    repos: string[];
+  };
+
+  const reposByHost = $derived.by(() => {
+    const m = new Map<number, string[]>();
+    for (const t of data?.targets ?? []) {
+      if (t.host_id == null || t.revoked_at) continue;
+      const arr = m.get(t.host_id) ?? [];
+      arr.push(t.name);
+      m.set(t.host_id, arr);
+    }
+    return m;
+  });
+
+  const activeBackupStates = new Set(['ok', 'stale', 'error']);
+  const hostBackups = $derived.by<HostBackup[]>(() =>
+    hosts
+      .filter((h) => activeBackupStates.has(h.collector_status?.backup?.state ?? ''))
+      .map((h) => ({
+        id: h.id,
+        hostname: h.hostname,
+        state: h.collector_status!.backup.state,
+        message: h.collector_status!.backup.message,
+        repos: reposByHost.get(h.id) ?? []
+      }))
+      .sort((a, b) => a.hostname.localeCompare(b.hostname))
+  );
+
+  function stateDot(state: string): string {
+    switch (state) {
+      case 'ok':
+        return 'bg-emerald-400';
+      case 'stale':
+        return 'bg-amber-400';
+      case 'error':
+        return 'bg-rose-400';
+      default:
+        return 'bg-zinc-600';
+    }
+  }
+  function stateText(state: string): string {
+    switch (state) {
+      case 'ok':
+        return 'text-emerald-300';
+      case 'stale':
+        return 'text-amber-300';
+      case 'error':
+        return 'text-rose-300';
+      default:
+        return 'text-zinc-500';
+    }
+  }
+  function stateLabel(state: string): string {
+    switch (state) {
+      case 'ok':
+        return 'backing up';
+      case 'stale':
+        return 'stale';
+      case 'error':
+        return 'error';
+      case 'not_configured':
+        return 'not configured';
+      default:
+        return state || 'unknown';
+    }
+  }
+
+  const tunnelActive = $derived(tunnel?.enabled === true);
+  const publicRepoUrl = $derived(credential ? `rest:${baseUrl}/backup/${credential.name}` : '');
+  const repoSpec = $derived.by(() => {
+    if (!credential) return '';
+    if (selectedNode) return `tunnel:${selectedNode.hostname}/${credential.name}`;
+    return tunnelActive ? `tunnel:${credential.name}` : publicRepoUrl;
+  });
+  const repoUrl = $derived(selectedNode || (tunnelActive && !tunnel?.public_http) ? repoSpec : publicRepoUrl);
+  const linkedHostname = $derived(newHostId != null ? (hosts.find((h) => h.id === newHostId)?.hostname ?? '') : '');
 
   const linuxSnippet = $derived.by(() => {
     if (!credential) return '';
     const vars = [
       'SM_ADMIN_TOKEN=<ADMIN_TOKEN>',
       'SM_ENABLE_BACKUP=1',
-      `SM_BACKUP_REPOS="${repoUrl}"`,
+      `SM_BACKUP_REPOS="${repoSpec}"`,
       `SM_BACKUP_REPO_NAMES="${credential.name}"`,
       `SM_BACKUP_REST_USERNAME="${credential.name}"`,
       `SM_BACKUP_REST_PASSWORD="${credential.password}"`,
@@ -190,7 +375,7 @@
     return [
       '$env:SM_ADMIN_TOKEN="<ADMIN_TOKEN>"',
       '$env:SM_ENABLE_BACKUP="1"',
-      `$env:SM_BACKUP_REPOS="${repoUrl}"`,
+      `$env:SM_BACKUP_REPOS="${repoSpec}"`,
       `$env:SM_BACKUP_REPO_NAMES="${credential.name}"`,
       `$env:SM_BACKUP_REST_USERNAME="${credential.name}"`,
       `$env:SM_BACKUP_REST_PASSWORD="${credential.password}"`,
@@ -201,9 +386,16 @@
 
   const existingToml = $derived.by(() => {
     if (!credential) return '';
+    let source = `url = "${publicRepoUrl}"`;
+    if (selectedNode) {
+      source = `tunnel_name = "${credential.name}"
+tunnel_node = "${selectedNode.hostname}"`;
+    } else if (tunnelActive) {
+      source = `tunnel_name = "${credential.name}"`;
+    }
     return `[[repo]]
 name = "${credential.name}"
-url = "${repoUrl}"
+${source}
 password_file = "/etc/servermonitor-backup/backup.key"
 env_file = "/etc/servermonitor-backup/repo-credentials.env"`;
   });
@@ -216,38 +408,86 @@ RESTIC_REST_PASSWORD=${credential.password}`;
 
   const resticSnippet = $derived.by(() => {
     if (!credential) return '';
+    if (selectedNode || (tunnelActive && !tunnel?.public_http)) {
+      return `export RESTIC_REST_USERNAME=${credential.name}
+export RESTIC_REST_PASSWORD=${credential.password}
+sm-agent backup proxy --config /etc/servermonitor-backup/backup.toml
+restic -r <printed RESTIC_REPOSITORY> snapshots`;
+    }
     return `export RESTIC_REST_USERNAME=${credential.name}
 export RESTIC_REST_PASSWORD=${credential.password}
-restic -r ${repoUrl} init
-restic -r ${repoUrl} backup /etc`;
+restic -r ${publicRepoUrl} init
+restic -r ${publicRepoUrl} backup /etc`;
   });
 
   const activeSnippet = $derived(
     snippetTab === 'linux' ? linuxSnippet : snippetTab === 'windows' ? windowsSnippet : resticSnippet
   );
 
-  onMount(load);
+  onMount(async () => {
+    await load();
+    const sp = $page.url.searchParams;
+    if (sp.get('new') === '1' && data?.configured) {
+      const h = sp.get('host');
+      const hid = h != null ? Number(h) : NaN;
+      openNew(Number.isInteger(hid) && hid > 0 ? hid : undefined);
+    }
+  });
   onDestroy(stopPoll);
 </script>
+
+{#snippet howBackupsWork()}
+  <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
+    <h2 class="text-sm font-medium text-zinc-100">How backups work</h2>
+    <p class="mt-1.5 text-xs text-zinc-400 leading-relaxed max-w-3xl">
+      Monitored hosts back up their own files with restic — encrypted on the host, so the destination only ever sees
+      ciphertext. A destination can be <span class="text-zinc-200">this server</span> or an
+      <span class="text-zinc-200">external</span> rest-server / S3 endpoint. Enable a host's backups at install with
+      <code class="font-mono text-zinc-300">--enable-backup</code>, then watch each host under its
+      <span class="text-zinc-200">Backups</span> tab.
+    </p>
+    <div class="mt-4 flex flex-wrap items-stretch gap-2 text-xs">
+      <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 flex items-center">
+        <div>
+          <div class="text-zinc-200 font-medium">Monitored hosts</div>
+          <div class="text-[11px] text-zinc-500 mt-0.5">run <code class="font-mono">sm-agent backup</code></div>
+        </div>
+      </div>
+      <div class="flex items-center px-1 text-zinc-600">
+        <div class="text-center">
+          <div class="text-[10px] uppercase tracking-wider text-zinc-500">encrypted restic</div>
+          <div class="text-sky-400/70 text-base leading-none">&rarr;</div>
+        </div>
+      </div>
+      <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 flex-1 min-w-[220px]">
+        <div class="text-zinc-200 font-medium">Destination</div>
+        <div class="mt-1 space-y-0.5 text-[11px] text-zinc-400">
+          <div class="flex items-center gap-1.5"><span class="h-1 w-1 rounded-full bg-emerald-400"></span> This server (append-only endpoint{#if tunnelActive}, over WireGuard{/if})</div>
+          <div class="flex items-center gap-1.5"><span class="h-1 w-1 rounded-full bg-zinc-500"></span> External rest-server VPS or S3 / B2</div>
+        </div>
+      </div>
+    </div>
+  </section>
+{/snippet}
 
 <div class="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
   <div class="flex items-start justify-between gap-3 flex-wrap">
     <div>
-      <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Backup targets</h1>
-      <p class="text-xs sm:text-sm text-zinc-500 mt-1">
-        Host encrypted restic backups for your fleet. This server is the append-only endpoint other hosts back up to.
+      <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Backups</h1>
+      <p class="text-xs sm:text-sm text-zinc-500 mt-1 max-w-2xl">
+        Where your fleet backs up, and this server's role as an append-only backup destination.
       </p>
     </div>
-    {#if view === 'list' && data?.configured}
+    {#if view === 'list' && (data?.configured || nodes.length > 0)}
       <button
         type="button"
-        onclick={openNew}
+        onclick={() => openNew()}
         class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium shrink-0">
-        New backup target
+        New repository
       </button>
     {:else if view === 'new'}
       <button type="button" onclick={backToList} class="text-sm px-3 py-2 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 shrink-0">
-        ← All targets
+        ← All repositories
       </button>
     {/if}
   </div>
@@ -258,148 +498,47 @@ restic -r ${repoUrl} backup /etc`;
 
   {#if loading && !data}
     <div class="mt-6 h-40 rounded-xl shimmer"></div>
-  {:else if data && !data.configured}
-    <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-6 text-center">
-      <div class="text-sm text-zinc-300">The backup server is not enabled.</div>
-      <p class="mt-2 text-xs text-zinc-500 max-w-lg mx-auto">
-        Set <code class="font-mono text-zinc-300">BACKUP_DIR</code> to store backups on this server's disk, or
-        <code class="font-mono text-zinc-300">BACKUP_S3_BUCKET</code> (with <code class="font-mono text-zinc-300">BACKUP_S3_ENDPOINT</code> for
-        self-hosted S3) to store them in an object-storage bucket, then restart the server.
-      </p>
-    </section>
-  {:else if view === 'list' && data}
-    {#if data.tls.mode === 'insecure'}
-      <div class="mt-4 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2.5 text-xs text-rose-300">
-        No TLS. The backup endpoint authenticates with HTTP Basic, so credentials would travel in plaintext. Set
-        <span class="font-mono">TLS_CERT_FILE</span>/<span class="font-mono">TLS_KEY_FILE</span>, put it behind a TLS proxy
-        (<span class="font-mono">TRUST_PROXY_TLS=1</span>), or set <span class="font-mono">BACKUP_ACME_DOMAIN</span> for automatic Let's Encrypt.
-      </div>
-    {:else if data.tls.mode === 'acme'}
-      <div class="mt-4 rounded-md border border-emerald-900/50 bg-emerald-950/25 px-3 py-2.5 text-xs text-emerald-300">
-        Automatic TLS (Let's Encrypt) for <span class="font-mono">{data.tls.domain}</span> — a certificate is obtained on the first HTTPS connection.
-      </div>
-    {:else}
-      <div class="mt-4 rounded-md border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-300/90">
-        TLS active ({data.tls.mode === 'proxy' ? 'terminated by a trusted reverse proxy' : 'native certificate'}). Backup traffic is encrypted.
-      </div>
-    {/if}
-
-    <section class="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
-      <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
-        <div class="px-4 sm:px-5 py-4">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Backend</div>
-          <div class="text-lg font-semibold text-zinc-100 mt-1 break-all">{data.storage?.kind === 's3' ? 'Object storage' : 'Local disk'}</div>
-          <div class="text-[11px] text-zinc-500 mt-0.5 font-mono break-all">{data.storage?.location}</div>
-        </div>
-        <div class="px-4 sm:px-5 py-4">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Stored</div>
-          <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(data.targets.reduce((s, t) => s + t.used_bytes, 0))}</div>
-          <div class="text-[11px] text-zinc-500 mt-0.5">across all targets</div>
-        </div>
-        <div class="px-4 sm:px-5 py-4">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Targets</div>
-          <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{data.targets.filter((t) => !t.revoked_at).length}</div>
-          <div class="text-[11px] text-zinc-500 mt-0.5">{data.targets.filter((t) => t.revoked_at).length} revoked</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
-      {#if data.targets.length === 0}
-        <div class="px-4 py-10 text-center text-sm text-zinc-500">
-          No backup targets yet. Create one, then point a host at it.
-        </div>
-      {:else}
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
-                <th class="px-4 py-2.5 font-medium">Target</th>
-                <th class="px-4 py-2.5 font-medium">Linked host</th>
-                <th class="px-4 py-2.5 font-medium">Used</th>
-                <th class="px-4 py-2.5 font-medium">Measured</th>
-                <th class="px-4 py-2.5 font-medium">Created</th>
-                <th class="px-4 py-2.5 font-medium text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-zinc-800/70">
-              {#each data.targets as t (t.id)}
-                <tr class="hover:bg-zinc-900/60">
-                  <td class="px-4 py-3 align-top">
-                    <div class="flex items-center gap-2">
-                      <span class="h-1.5 w-1.5 rounded-full {t.revoked_at ? 'bg-rose-400' : 'bg-emerald-400'}"></span>
-                      <span class="font-mono text-zinc-200">{t.name}</span>
-                    </div>
-                    {#if t.revoked_at}
-                      <span class="ml-3.5 text-[10px] uppercase tracking-wider text-rose-300">revoked</span>
-                    {/if}
-                  </td>
-                  <td class="px-4 py-3 align-top text-zinc-400 text-xs">{t.hostname || '—'}</td>
-                  <td class="px-4 py-3 align-top">
-                    <div class="numeric text-zinc-200 text-xs">{bytes(t.used_bytes)}{#if t.quota_bytes}<span class="text-zinc-500"> / {bytes(t.quota_bytes)}</span>{/if}</div>
-                    {#if t.quota_bytes}
-                      <div class="mt-1.5 h-1.5 w-28 rounded-full bg-zinc-800 overflow-hidden">
-                        <div class="h-full rounded-full {barTone(t.used_bytes, t.quota_bytes)}" style="width: {sharePct(t.used_bytes, t.quota_bytes)}%"></div>
-                      </div>
-                    {:else}
-                      <div class="text-[10px] text-zinc-600 mt-0.5">no quota</div>
-                    {/if}
-                  </td>
-                  <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'}</td>
-                  <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(t.created_at)}</td>
-                  <td class="px-4 py-3 align-top">
-                    <div class="flex items-center justify-end gap-1.5">
-                      <button
-                        type="button"
-                        onclick={() => measure(t.id)}
-                        disabled={measuring === t.id}
-                        class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50">
-                        {measuring === t.id ? 'Measuring…' : 'Measure'}
-                      </button>
-                      <button
-                        type="button"
-                        onclick={() => rotate(t.id)}
-                        class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
-                        Rotate
-                      </button>
-                      {#if t.used_bytes === 0}
-                        <button
-                          type="button"
-                          onclick={() => (toDelete = t)}
-                          title="This target holds no backups — safe to remove"
-                          class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
-                          Delete
-                        </button>
-                      {:else if !t.revoked_at}
-                        <button
-                          type="button"
-                          onclick={() => (toRevoke = t)}
-                          class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
-                          Revoke
-                        </button>
-                      {/if}
-                    </div>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    </section>
-
-    <p class="mt-3 text-[11px] text-zinc-600">
-      Revoking a credential stops new uploads but never deletes stored backups — this endpoint is append-only, including for admins.
-      Remove blobs directly on the storage backend if you need to reclaim space. Empty targets that never received an upload can be deleted outright.
-    </p>
   {:else if view === 'new'}
     {#if !credential}
       <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5 max-w-2xl">
-        <h2 class="text-sm font-medium text-zinc-100">New backup target</h2>
-        <p class="text-xs text-zinc-500 mt-1">A private repository namespace plus a credential the target host uses to upload.</p>
+        <h2 class="text-sm font-medium text-zinc-100">New repository</h2>
+        <p class="text-xs text-zinc-500 mt-1">A private, append-only namespace one host uploads to, plus the credential it authenticates with.</p>
+
+        {#if nodes.length > 0}
+          <div class="mt-4">
+            <label for="bt-dest" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Where is it stored?</label>
+            <select
+              id="bt-dest"
+              bind:value={newDestination}
+              class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm">
+              {#if data?.configured}
+                <option value="server">This server</option>
+              {/if}
+              {#each nodes as n (n.host_id)}
+                <option value={n.host_id} disabled={!n.enrolled}>Node · {n.hostname}{n.enrolled ? '' : ' (coming online…)'}</option>
+              {/each}
+            </select>
+            <p class="mt-1.5 text-[11px] text-zinc-600">Storage nodes receive backups over per-host WireGuard tunnels; nothing is exposed to the internet.</p>
+          </div>
+        {/if}
 
         <div class="mt-4">
-          <label for="bt-name" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Name</label>
+          <label for="bt-host" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Which host will back up here? <span class="text-zinc-600 normal-case">{newDestination === 'server' ? '(optional)' : '(required for node repositories)'}</span></label>
+          <select
+            id="bt-host"
+            bind:value={newHostId}
+            onchange={() => { if (newHostId != null && !newName) { const h = hosts.find((x) => x.id === newHostId); if (h) newName = sanitizeName(h.hostname); } }}
+            class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm">
+            <option value={null}>— none —</option>
+            {#each hosts as h (h.id)}
+              <option value={h.id}>{h.hostname}</option>
+            {/each}
+          </select>
+          <p class="mt-1.5 text-[11px] text-zinc-600">Links this repository to a monitored host for display. The host still needs the install snippet below to actually back up.</p>
+        </div>
+
+        <div class="mt-4">
+          <label for="bt-name" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Repository name</label>
           <input
             id="bt-name"
             type="text"
@@ -408,21 +547,7 @@ restic -r ${repoUrl} backup /etc`;
             spellcheck="false"
             placeholder="web-01-offsite"
             class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm font-mono" />
-          <p class="mt-1.5 text-[11px] text-zinc-600">Letters, digits, dot, dash, underscore. Becomes the repo path and login name.</p>
-        </div>
-
-        <div class="mt-4">
-          <label for="bt-host" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Linked host <span class="text-zinc-600 normal-case">(optional)</span></label>
-          <select
-            id="bt-host"
-            bind:value={newHostId}
-            class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm">
-            <option value={null}>— none —</option>
-            {#each hosts as h (h.id)}
-              <option value={h.id}>{h.hostname}</option>
-            {/each}
-          </select>
-          <p class="mt-1.5 text-[11px] text-zinc-600">Just for display — associates this target with a monitored host.</p>
+          <p class="mt-1.5 text-[11px] text-zinc-600">Letters, digits, dot, dash, underscore. Becomes the repo path and the upload login name.</p>
         </div>
 
         <div class="mt-4">
@@ -449,7 +574,7 @@ restic -r ${repoUrl} backup /etc`;
             disabled={creating || !nameValid}
             onclick={create}
             class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
-            {creating ? 'Creating…' : 'Create target'}
+            {creating ? 'Creating…' : 'Create repository'}
           </button>
         </div>
       </section>
@@ -458,7 +583,7 @@ restic -r ${repoUrl} backup /etc`;
         <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
           <div class="flex items-baseline justify-between gap-3 flex-wrap">
             <div class="min-w-0">
-              <div class="text-xs uppercase tracking-wider text-zinc-500">Credential for <span class="font-mono text-zinc-300">{credential.name}</span></div>
+              <div class="text-xs uppercase tracking-wider text-zinc-500">Upload credential for <span class="font-mono text-zinc-300">{credential.name}</span></div>
               <p class="mt-1 text-[11px] text-amber-300/80">
                 Shown once and stored only as a hash. It authenticates uploads only — it cannot decrypt backups (the repo password never leaves the host).
               </p>
@@ -469,7 +594,7 @@ restic -r ${repoUrl} backup /etc`;
           </div>
           <code class="block mt-3 text-xs font-mono text-zinc-100 break-all bg-zinc-950/60 rounded px-3 py-2 border border-zinc-800">{credential.password}</code>
           <div class="mt-3 flex items-center gap-2">
-            <span class="text-[11px] uppercase tracking-wider text-zinc-500 shrink-0">Repo URL</span>
+            <span class="text-[11px] uppercase tracking-wider text-zinc-500 shrink-0">{tunnelActive && !tunnel?.public_http ? 'Repo (via tunnel)' : 'Repo URL'}</span>
             <code class="flex-1 text-xs font-mono text-zinc-300 break-all bg-zinc-950/60 rounded px-3 py-1.5 border border-zinc-800">{repoUrl}</code>
             <button type="button" onclick={() => copy(repoUrl, 'url')} class="text-[11px] px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 shrink-0">{copied === 'url' ? 'copied' : 'copy'}</button>
           </div>
@@ -497,6 +622,8 @@ restic -r ${repoUrl} backup /etc`;
                 Run in an elevated PowerShell on the target host. Replace <span class="font-mono">&lt;ADMIN_TOKEN&gt;</span> with your server admin token.
               {:else if snippetTab === 'existing'}
                 Already-monitored host with backups enabled? Add this repo to its backup config, then re-run the installer to apply.
+              {:else if tunnelActive && !tunnel?.public_http}
+                The endpoint only exists inside the tunnel, so verification runs on the enrolled host: <span class="font-mono">sm-agent backup proxy</span> opens the tunnel and prints a local <span class="font-mono">RESTIC_REPOSITORY</span> for the restic CLI. Nothing is executed from this UI.
               {:else}
                 Verify connectivity by hand with the restic CLI ({'>='}0.17). Nothing is executed from this UI.
               {/if}
@@ -531,10 +658,24 @@ restic -r ${repoUrl} backup /etc`;
             <div class="flex-1 min-w-0">
               {#if firstBlobSeen}
                 <div class="text-sm font-medium text-emerald-100">Receiving backups — first data arrived</div>
-                <div class="text-xs text-zinc-400 mt-0.5">This target is live. You can add another, or head back to the list.</div>
+                <div class="text-xs text-zinc-400 mt-0.5">
+                  This repository is live.
+                  {#if newHostId != null}
+                    Watch it under <a href="/hosts/{newHostId}?tab=backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">{linkedHostname} → Backups</a>.
+                  {:else}
+                    The host's status appears under its <span class="text-zinc-300">Backups</span> tab.
+                  {/if}
+                </div>
               {:else}
                 <div class="text-sm text-zinc-200">Waiting for the first upload from <span class="font-mono">{credential.name}</span>…</div>
-                <div class="text-xs text-zinc-500 mt-0.5">Turns green once the host runs its first backup to this endpoint.</div>
+                <div class="text-xs text-zinc-500 mt-0.5">
+                  Turns green once the host runs its first backup. After that, its status appears under
+                  {#if newHostId != null}
+                    <a href="/hosts/{newHostId}?tab=backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Hosts → {linkedHostname} → Backups</a>.
+                  {:else}
+                    <span class="text-zinc-300">Hosts → (host) → Backups</span>.
+                  {/if}
+                </div>
               {/if}
             </div>
             <button type="button" onclick={backToList} class="text-sm px-3 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 shrink-0">Done</button>
@@ -542,6 +683,496 @@ restic -r ${repoUrl} backup /etc`;
         </div>
       </section>
     {/if}
+  {:else if data}
+    <div class="mt-6 space-y-4">
+      {@render howBackupsWork()}
+
+      {#if !data.configured && !tunnelActive}
+        <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
+          <h2 class="text-sm font-medium text-zinc-100">This server isn't a backup destination yet</h2>
+          <p class="mt-1 text-xs text-zinc-500 max-w-3xl">
+            That's optional — hosts can back up to any restic endpoint. Pick a path:
+          </p>
+          <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+              <div class="text-sm font-medium text-zinc-200">A · Make this server the destination</div>
+              <p class="mt-1 text-xs text-zinc-500">Turn this server into an append-only endpoint your fleet pushes to — no separate storage box to run.</p>
+              <ol class="mt-3 space-y-1.5 text-xs text-zinc-400 list-decimal list-inside">
+                <li>Set one storage backend: <code class="font-mono text-zinc-300">BACKUP_DIR</code> (this server's disk) or <code class="font-mono text-zinc-300">BACKUP_S3_BUCKET</code> (<code class="font-mono text-zinc-300">BACKUP_S3_ENDPOINT</code> for self-hosted S3).</li>
+                <li>Ensure TLS — the endpoint uses HTTP Basic, so it refuses plaintext.</li>
+                <li>Restart the server, then create a repository here for each host.</li>
+              </ol>
+            </div>
+            <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+              <div class="text-sm font-medium text-zinc-200">B · Use an external destination</div>
+              <p class="mt-1 text-xs text-zinc-500">Keep destinations off this server — hosts back up straight to a rest-server VPS or S3 / B2. Nothing to enable here.</p>
+              <div class="mt-3 text-xs text-zinc-400 space-y-2">
+                <p>Install a host with backups pointed at your endpoint:</p>
+                <pre class="text-[11px] font-mono bg-zinc-950 border border-zinc-800 rounded-md p-2.5 overflow-x-auto whitespace-pre text-zinc-300 select-text">--enable-backup --backup-repos &lt;rest/s3 url&gt;</pre>
+                <p>Then monitor it from its <span class="text-zinc-300">Backups</span> tab.</p>
+              </div>
+            </div>
+          </div>
+          <p class="mt-4 text-[11px] text-zinc-600">
+            Full setup — rest-server, S3/B2, TLS, and disaster recovery — is in <span class="font-mono text-zinc-500">deploy/BACKUPS.md</span>.
+          </p>
+        </section>
+      {:else}
+        {#if tunnelActive && !tunnel?.public_http}
+          <div class="rounded-md border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-300/90">
+            WireGuard tunnel only — backup destinations are reachable solely through enrolled peers (server UDP port
+            <span class="font-mono numeric">{tunnel?.listen_port}</span>). Nothing backup-related is exposed on the web listener, and the tunnels encrypt all backup traffic.
+          </div>
+        {:else if !data.configured}
+          <div class="rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2.5 text-xs text-zinc-400">
+            This server has no storage backend of its own (<span class="font-mono">BACKUP_DIR</span> / <span class="font-mono">BACKUP_S3_BUCKET</span>) — repositories live on promoted storage nodes below.
+          </div>
+        {:else if data.tls.mode === 'insecure'}
+          <div class="rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2.5 text-xs text-rose-300">
+            No TLS. The backup endpoint authenticates with HTTP Basic, so credentials would travel in plaintext. Set
+            <span class="font-mono">TLS_CERT_FILE</span>/<span class="font-mono">TLS_KEY_FILE</span>, put it behind a TLS proxy
+            (<span class="font-mono">TRUST_PROXY_TLS=1</span>), or set <span class="font-mono">BACKUP_ACME_DOMAIN</span> for automatic Let's Encrypt.
+          </div>
+        {:else if data.tls.mode === 'acme'}
+          <div class="rounded-md border border-emerald-900/50 bg-emerald-950/25 px-3 py-2.5 text-xs text-emerald-300">
+            Automatic TLS (Let's Encrypt) for <span class="font-mono">{data.tls.domain}</span> — a certificate is obtained on the first HTTPS connection.
+          </div>
+        {:else}
+          <div class="rounded-md border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-300/90">
+            TLS active ({data.tls.mode === 'proxy' ? 'terminated by a trusted reverse proxy' : 'native certificate'}). Backup traffic is encrypted.
+          </div>
+        {/if}
+
+        <section>
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <div>
+              <h2 class="text-sm font-medium text-zinc-100">Repositories</h2>
+              <p class="mt-0.5 text-xs text-zinc-500">Each repository is a private, append-only namespace one host uploads to — stored on this server or on a storage node. Create one per host.</p>
+            </div>
+          </div>
+
+          <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+            <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
+              <div class="px-4 sm:px-5 py-4">
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Server backend</div>
+                <div class="text-lg font-semibold text-zinc-100 mt-1 break-all">{data.storage ? (data.storage.kind === 's3' ? 'Object storage' : 'Local disk') : 'None (nodes only)'}</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5 font-mono break-all">{data.storage?.location ?? ''}</div>
+              </div>
+              <div class="px-4 sm:px-5 py-4">
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Stored</div>
+                <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(data.targets.reduce((s, t) => s + t.used_bytes, 0))}</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">across all repositories</div>
+              </div>
+              <div class="px-4 sm:px-5 py-4">
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Repositories</div>
+                <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{data.targets.filter((t) => !t.revoked_at).length}</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">{data.targets.filter((t) => t.revoked_at).length} revoked</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+            {#if data.targets.length === 0}
+              <div class="px-4 py-10 text-center text-sm text-zinc-500">
+                No repositories yet. Create one, then point a host at it with the generated snippet.
+              </div>
+            {:else}
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                      <th class="px-4 py-2.5 font-medium">Repository</th>
+                      <th class="px-4 py-2.5 font-medium">Destination</th>
+                      <th class="px-4 py-2.5 font-medium">Linked host</th>
+                      <th class="px-4 py-2.5 font-medium">Used</th>
+                      <th class="px-4 py-2.5 font-medium">Measured</th>
+                      <th class="px-4 py-2.5 font-medium">Created</th>
+                      <th class="px-4 py-2.5 font-medium text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-zinc-800/70">
+                    {#each data.targets as t (t.id)}
+                      <tr class="hover:bg-zinc-900/60">
+                        <td class="px-4 py-3 align-top">
+                          <div class="flex items-center gap-2">
+                            <span class="h-1.5 w-1.5 rounded-full {t.revoked_at ? 'bg-rose-400' : 'bg-emerald-400'}"></span>
+                            <span class="font-mono text-zinc-200">{t.name}</span>
+                          </div>
+                          {#if t.revoked_at}
+                            <span class="ml-3.5 text-[10px] uppercase tracking-wider text-rose-300">revoked</span>
+                          {/if}
+                        </td>
+                        <td class="px-4 py-3 align-top text-xs">
+                          {#if t.node_host_id}
+                            <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{t.node_hostname || `node ${t.node_host_id}`}</span>
+                          {:else}
+                            <span class="text-zinc-400">this server</span>
+                          {/if}
+                        </td>
+                        <td class="px-4 py-3 align-top text-xs">
+                          {#if t.host_id}
+                            <a href="/hosts/{t.host_id}?tab=backups" class="text-sky-300 hover:text-sky-200">{t.hostname || `host ${t.host_id}`}</a>
+                          {:else}
+                            <span class="text-zinc-500">—</span>
+                          {/if}
+                        </td>
+                        <td class="px-4 py-3 align-top">
+                          <div class="numeric text-zinc-200 text-xs">{bytes(t.used_bytes)}{#if t.quota_bytes}<span class="text-zinc-500"> / {bytes(t.quota_bytes)}</span>{/if}</div>
+                          {#if t.quota_bytes}
+                            <div class="mt-1.5 h-1.5 w-28 rounded-full bg-zinc-800 overflow-hidden">
+                              <div class="h-full rounded-full {barTone(t.used_bytes, t.quota_bytes)}" style="width: {sharePct(t.used_bytes, t.quota_bytes)}%"></div>
+                            </div>
+                          {:else}
+                            <div class="text-[10px] text-zinc-600 mt-0.5">no quota</div>
+                          {/if}
+                        </td>
+                        <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'}</td>
+                        <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(t.created_at)}</td>
+                        <td class="px-4 py-3 align-top">
+                          <div class="flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onclick={() => measure(t.id)}
+                              disabled={measuring === t.id}
+                              class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50">
+                              {measuring === t.id ? 'Measuring…' : 'Measure'}
+                            </button>
+                            <button
+                              type="button"
+                              onclick={() => rotate(t.id)}
+                              class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
+                              Rotate
+                            </button>
+                            {#if t.used_bytes === 0}
+                              <button
+                                type="button"
+                                onclick={() => (toDelete = t)}
+                                title="This repository holds no backups — safe to remove"
+                                class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                                Delete
+                              </button>
+                            {:else if !t.revoked_at}
+                              <button
+                                type="button"
+                                onclick={() => (toRevoke = t)}
+                                class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                                Revoke
+                              </button>
+                            {/if}
+                          </div>
+                        </td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {/if}
+          </div>
+
+          <p class="mt-3 text-[11px] text-zinc-600">
+            Revoking a credential stops new uploads but never deletes stored backups — this endpoint is append-only, including for admins.
+            Remove blobs directly on the storage backend if you need to reclaim space. Empty repositories that never received an upload can be deleted outright.
+          </p>
+        </section>
+
+        <section>
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <div>
+              <h2 class="text-sm font-medium text-zinc-100">WireGuard tunnel</h2>
+              <p class="mt-0.5 text-xs text-zinc-500">
+                {#if tunnelActive}
+                  Hosts reach this server's backup endpoint through per-host WireGuard tunnels — no HTTPS exposure needed.
+                {:else}
+                  Off. Set <code class="font-mono text-zinc-400">BACKUP_WG_PORT</code> (e.g. 51820) on the server to take the backup endpoint off the public listener.
+                {/if}
+              </p>
+            </div>
+          </div>
+
+          {#if tunnelActive}
+            <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+              <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
+                <div class="px-4 sm:px-5 py-4">
+                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Endpoint</div>
+                  <div class="text-lg font-semibold text-zinc-100 mt-1 font-mono break-all">{tunnel?.endpoint}</div>
+                  <div class="text-[11px] text-zinc-500 mt-0.5">UDP · silent to anything but enrolled peers</div>
+                </div>
+                <div class="px-4 sm:px-5 py-4">
+                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Tunnel network</div>
+                  <div class="text-lg font-semibold text-zinc-100 mt-1 font-mono">{tunnel?.subnet}</div>
+                  <div class="text-[11px] text-zinc-500 mt-0.5">server at <span class="font-mono">{tunnel?.server_tunnel_ip}</span></div>
+                </div>
+                <div class="px-4 sm:px-5 py-4">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500">Server public key</div>
+                    <button
+                      type="button"
+                      onclick={() => tunnel?.server_public_key && copy(tunnel.server_public_key, 'wgpub')}
+                      class="text-[11px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300">{copied === 'wgpub' ? 'copied' : 'copy'}</button>
+                  </div>
+                  <div class="text-xs font-mono text-zinc-300 mt-2 break-all">{tunnel?.server_public_key}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+              {#if (tunnel?.peers ?? []).length === 0}
+                <div class="px-4 py-10 text-center text-sm text-zinc-500">
+                  No hosts enrolled yet. Install or reconfigure a host with a <code class="font-mono text-zinc-400">tunnel:</code> repository — the install snippet on a new repository does this automatically.
+                </div>
+              {:else}
+                <div class="overflow-x-auto">
+                  <table class="w-full text-sm">
+                    <thead>
+                      <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                        <th class="px-4 py-2.5 font-medium">Host</th>
+                        <th class="px-4 py-2.5 font-medium">Tunnel IP</th>
+                        <th class="px-4 py-2.5 font-medium">Last handshake</th>
+                        <th class="px-4 py-2.5 font-medium">Traffic</th>
+                        <th class="px-4 py-2.5 font-medium">Enrolled</th>
+                        <th class="px-4 py-2.5 font-medium text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-800/70">
+                      {#each tunnel?.peers ?? [] as p (p.host_id)}
+                        <tr class="hover:bg-zinc-900/60">
+                          <td class="px-4 py-3">
+                            <a href="/hosts/{p.host_id}?tab=backups" class="font-mono text-zinc-200 hover:text-zinc-100">{p.hostname}</a>
+                          </td>
+                          <td class="px-4 py-3 text-xs font-mono text-zinc-300">{p.tunnel_ip}</td>
+                          <td class="px-4 py-3">
+                            <div class="flex items-center gap-2 text-xs">
+                              <span class="h-1.5 w-1.5 rounded-full {p.connected ? 'bg-emerald-400' : p.last_handshake ? 'bg-zinc-500' : 'bg-zinc-700'}"></span>
+                              <span class="{p.connected ? 'text-emerald-300' : 'text-zinc-400'} numeric">
+                                {p.last_handshake ? timeAgo(p.last_handshake) : 'never'}
+                              </span>
+                            </div>
+                          </td>
+                          <td class="px-4 py-3 text-xs text-zinc-400 numeric whitespace-nowrap">↓{bytes(p.rx_bytes)} · ↑{bytes(p.tx_bytes)}</td>
+                          <td class="px-4 py-3 text-xs text-zinc-400 numeric whitespace-nowrap">{timeAgo(p.enrolled_at)}</td>
+                          <td class="px-4 py-3 text-right">
+                            <button
+                              type="button"
+                              onclick={() => (peerToRevoke = p)}
+                              class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                              Revoke peer
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {/if}
+            </div>
+            <p class="mt-3 text-[11px] text-zinc-600">
+              A backup host brings its tunnel up only while a backup, check or restore is running, so an idle handshake age is normal.
+              Traffic counters reset when the server restarts. Revoking a peer removes its tunnel access immediately; its repository credential is revoked separately above.
+            </p>
+          {/if}
+        </section>
+
+        <section>
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <div>
+              <h2 class="text-sm font-medium text-zinc-100">Storage nodes</h2>
+              <p class="mt-0.5 text-xs text-zinc-500">
+                Promote a monitored host into a backup destination: its agent serves an append-only restic endpoint inside the tunnel, storing other hosts' encrypted backups on its disk.
+              </p>
+            </div>
+            {#if tunnelActive}
+              <button
+                type="button"
+                onclick={openPromote}
+                class="text-sm px-3 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 shrink-0">
+                Promote a host
+              </button>
+            {/if}
+          </div>
+
+          {#if demoteError}
+            <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{demoteError}</div>
+          {/if}
+
+          {#if !tunnelActive}
+            <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-6 text-sm text-zinc-500">
+              Storage nodes ride the WireGuard control plane — set <code class="font-mono text-zinc-400">BACKUP_WG_PORT</code> on the server first.
+            </div>
+          {:else}
+            {#if promoting}
+              <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5 max-w-2xl">
+                <h3 class="text-sm font-medium text-zinc-100">Promote a host to storage node</h3>
+                <p class="mt-1 text-xs text-zinc-500">
+                  No SSH needed: the host's agent picks the role up within a minute, generates its tunnel key, and starts the append-only endpoint under
+                  <span class="font-mono text-zinc-400">/var/lib/servermonitor/backup-store</span>.
+                </p>
+                <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label for="pn-host" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Host</label>
+                    <select
+                      id="pn-host"
+                      bind:value={promoteHostId}
+                      onchange={promoteHostChanged}
+                      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm">
+                      <option value={null}>— pick —</option>
+                      {#each promotableHosts as h (h.id)}
+                        <option value={h.id}>{h.hostname}</option>
+                      {/each}
+                    </select>
+                  </div>
+                  <div>
+                    <label for="pn-endpoint" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Endpoint other hosts dial</label>
+                    <input
+                      id="pn-endpoint"
+                      type="text"
+                      bind:value={promoteEndpoint}
+                      placeholder="nas-01.lan or 203.0.113.7"
+                      autocomplete="off"
+                      spellcheck="false"
+                      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm font-mono" />
+                  </div>
+                  <div>
+                    <label for="pn-port" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">UDP port</label>
+                    <input
+                      id="pn-port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      bind:value={promotePort}
+                      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm numeric" />
+                  </div>
+                </div>
+                <p class="mt-2 text-[11px] text-zinc-600">
+                  The endpoint must be reachable over UDP from the hosts that will back up here (LAN name or public address; WireGuard stays silent to strangers).
+                </p>
+                {#if promoteError}
+                  <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{promoteError}</div>
+                {/if}
+                <div class="mt-4 flex justify-end gap-2">
+                  <button type="button" onclick={() => (promoting = false)} class="text-sm px-3 py-2 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40">Cancel</button>
+                  <button
+                    type="button"
+                    disabled={promoteBusy || promoteHostId == null}
+                    onclick={promote}
+                    class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
+                    {promoteBusy ? 'Promoting…' : 'Promote'}
+                  </button>
+                </div>
+              </div>
+            {/if}
+
+            <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+              {#if nodes.length === 0}
+                <div class="px-4 py-10 text-center text-sm text-zinc-500">
+                  No storage nodes yet. Promote a connected host to store other hosts' encrypted backups on it.
+                </div>
+              {:else}
+                <div class="overflow-x-auto">
+                  <table class="w-full text-sm">
+                    <thead>
+                      <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                        <th class="px-4 py-2.5 font-medium">Node</th>
+                        <th class="px-4 py-2.5 font-medium">Endpoint</th>
+                        <th class="px-4 py-2.5 font-medium">Tunnel</th>
+                        <th class="px-4 py-2.5 font-medium">Repositories</th>
+                        <th class="px-4 py-2.5 font-medium">Stored</th>
+                        <th class="px-4 py-2.5 font-medium text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-800/70">
+                      {#each nodes as n (n.host_id)}
+                        <tr class="hover:bg-zinc-900/60">
+                          <td class="px-4 py-3">
+                            <a href="/hosts/{n.host_id}" class="font-mono text-zinc-200 hover:text-zinc-100">{n.hostname}</a>
+                          </td>
+                          <td class="px-4 py-3 text-xs font-mono text-zinc-300">{n.endpoint}<span class="text-zinc-600">:{n.udp_port}/udp</span></td>
+                          <td class="px-4 py-3">
+                            <div class="flex items-center gap-2 text-xs">
+                              <span class="h-1.5 w-1.5 rounded-full {n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                              {#if n.enrolled}
+                                <span class="text-emerald-300 font-mono">{n.tunnel_ip}</span>
+                              {:else}
+                                <span class="text-amber-300">coming online…</span>
+                              {/if}
+                            </div>
+                          </td>
+                          <td class="px-4 py-3 text-xs text-zinc-300 numeric">{n.target_count}</td>
+                          <td class="px-4 py-3 text-xs text-zinc-300 numeric">{bytes(n.used_bytes)}</td>
+                          <td class="px-4 py-3 text-right">
+                            <button
+                              type="button"
+                              onclick={() => (nodeToDemote = n)}
+                              class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                              Demote
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {/if}
+            </div>
+            <p class="mt-3 text-[11px] text-zinc-600">
+              A node stores only ciphertext and never holds repo passwords, so it cannot read or prune what it stores. Demoting requires its repositories to be deleted or revoked first; stored data stays on the node's disk.
+            </p>
+          {/if}
+        </section>
+      {/if}
+
+      <section>
+        <h2 class="text-sm font-medium text-zinc-100">Hosts backing themselves up</h2>
+        <p class="mt-0.5 text-xs text-zinc-500">Monitored hosts whose agents report a backup job — wherever the destination is.</p>
+
+        <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+          {#if hostBackups.length === 0}
+            <div class="px-4 py-10 text-center text-sm text-zinc-500">
+              No monitored hosts report backup jobs yet. Enable a host with <code class="font-mono text-zinc-400">--enable-backup</code>{#if data.configured}, or create a repository above and point a host at it{/if}.
+              <div class="mt-3"><a href="/" class="text-xs text-sky-300 hover:text-sky-200">View hosts →</a></div>
+            </div>
+          {:else}
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
+                    <th class="px-4 py-2.5 font-medium">Host</th>
+                    <th class="px-4 py-2.5 font-medium">Backup status</th>
+                    <th class="px-4 py-2.5 font-medium">On this server</th>
+                    <th class="px-4 py-2.5 font-medium text-right"></th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-800/70">
+                  {#each hostBackups as h (h.id)}
+                    <tr class="hover:bg-zinc-900/60">
+                      <td class="px-4 py-3">
+                        <a href="/hosts/{h.id}?tab=backups" class="font-mono text-zinc-200 hover:text-zinc-100">{h.hostname}</a>
+                      </td>
+                      <td class="px-4 py-3">
+                        <div class="flex items-center gap-2">
+                          <span class="h-1.5 w-1.5 rounded-full {stateDot(h.state)}"></span>
+                          <span class="text-xs {stateText(h.state)}">{stateLabel(h.state)}</span>
+                        </div>
+                        {#if h.message}<div class="mt-0.5 text-[11px] text-zinc-600 truncate max-w-xs" title={h.message}>{h.message}</div>{/if}
+                      </td>
+                      <td class="px-4 py-3 text-xs">
+                        {#if h.repos.length > 0}
+                          <span class="text-emerald-300/90 font-mono">{h.repos.join(', ')}</span>
+                        {:else}
+                          <span class="text-zinc-600">external / not linked</span>
+                        {/if}
+                      </td>
+                      <td class="px-4 py-3 text-right">
+                        <a href="/hosts/{h.id}?tab=backups" class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Backups tab</a>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+        </div>
+      </section>
+    </div>
   {/if}
 </div>
 
@@ -565,7 +1196,7 @@ restic -r ${repoUrl} backup /etc`;
 
 <ConfirmDialog
   open={toRevoke !== null}
-  title="Revoke backup target"
+  title="Revoke repository credential"
   body={revokeBody}
   confirmLabel="Revoke"
   danger
@@ -581,7 +1212,7 @@ restic -r ${repoUrl} backup /etc`;
 
 <ConfirmDialog
   open={toDelete !== null}
-  title="Delete backup target"
+  title="Delete repository"
   body={deleteBody}
   confirmLabel="Delete"
   danger
@@ -594,7 +1225,45 @@ restic -r ${repoUrl} backup /etc`;
     lost — this just removes the credential and its entry.
   </p>
   <p class="mt-2 text-xs text-zinc-500">
-    Only empty targets can be deleted. If an upload has landed since this list loaded, the delete is refused and you can
+    Only empty repositories can be deleted. If an upload has landed since this list loaded, the delete is refused and you can
     revoke instead.
+  </p>
+{/snippet}
+
+<ConfirmDialog
+  open={peerToRevoke !== null}
+  title="Revoke tunnel peer"
+  body={revokePeerBody}
+  confirmLabel="Revoke peer"
+  danger
+  onconfirm={revokePeer}
+  onclose={() => (peerToRevoke = null)} />
+
+{#snippet revokePeerBody()}
+  <p class="text-sm text-zinc-300">
+    Remove <span class="font-mono text-zinc-100">{peerToRevoke?.hostname}</span> ({peerToRevoke?.tunnel_ip}) from the tunnel?
+    Its backups over the tunnel stop working until it re-enrolls (re-run the installer or
+    <span class="font-mono text-zinc-100">sm-agent backup tunnel-enroll</span>).
+  </p>
+  <p class="mt-2 text-xs text-zinc-500">Stored backups are kept. The repository credential stays valid and can be revoked separately.</p>
+{/snippet}
+
+<ConfirmDialog
+  open={nodeToDemote !== null}
+  title="Demote storage node"
+  body={demoteNodeBody}
+  confirmLabel="Demote"
+  danger
+  onconfirm={demoteNode}
+  onclose={() => (nodeToDemote = null)} />
+
+{#snippet demoteNodeBody()}
+  <p class="text-sm text-zinc-300">
+    Demote <span class="font-mono text-zinc-100">{nodeToDemote?.hostname}</span>? Its agent stops the storage endpoint within a minute
+    and hosts can no longer back up to it.
+  </p>
+  <p class="mt-2 text-xs text-zinc-500">
+    Refused while the node still has active repositories — revoke or delete them first. Data already stored stays on the node's disk
+    under its store directory until you remove it there.
   </p>
 {/snippet}

@@ -7,6 +7,7 @@ param(
     [string]$BinaryPath,
     [switch]$AdminService,
     [switch]$EnableBackup,
+    [Parameter(HelpMessage = 'tunnel:NAME backs up over the built-in WireGuard tunnel to the ServerMonitor server (requires the server to run with BACKUP_WG_PORT)')]
     [string]$BackupRepos,
     [string]$BackupRepoNames,
     [string]$BackupPaths,
@@ -190,11 +191,36 @@ function New-BackupEnvFile {
     if ($env:SM_BACKUP_S3_SESSION_TOKEN)     { $lines += "AWS_SESSION_TOKEN=$($env:SM_BACKUP_S3_SESSION_TOKEN)" }
     if ($env:SM_BACKUP_REST_USERNAME)        { $lines += "RESTIC_REST_USERNAME=$($env:SM_BACKUP_REST_USERNAME)" }
     if ($env:SM_BACKUP_REST_PASSWORD)        { $lines += "RESTIC_REST_PASSWORD=$($env:SM_BACKUP_REST_PASSWORD)" }
-    if (-not $lines) { return $false }
+    if (-not $lines) {
+        if (Test-Path -LiteralPath $EnvPath) {
+            Lock-Acl -Path $EnvPath -ServiceAccess None
+            return $true
+        }
+        return $false
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($EnvPath, ($lines -join "`n") + "`n", $utf8NoBom)
     Lock-Acl -Path $EnvPath -ServiceAccess None
     return $true
+}
+
+function New-TunnelSectionSnapshot {
+    param([Parameter(Mandatory=$true)][string]$TomlPath)
+    if (-not (Test-Path -LiteralPath $TomlPath)) { return '' }
+    $captured = @()
+    $inside = $false
+    foreach ($line in [System.IO.File]::ReadAllLines($TomlPath)) {
+        if (-not $inside) {
+            if ($line -match '^\s*\[tunnel\]\s*$') {
+                $inside = $true
+                $captured += $line
+            }
+            continue
+        }
+        if ($line -match '^\s*\[') { break }
+        $captured += $line
+    }
+    return ($captured -join "`r`n").TrimEnd()
 }
 
 function Write-BackupToml {
@@ -207,6 +233,7 @@ function Write-BackupToml {
         [string[]]$Names,
         [string[]]$Paths,
         [string]$EnvFilePath,
+        [string]$TunnelSection,
         [string]$PruneMode = 'host',
         [string]$S3Region,
         [switch]$S3PathStyle
@@ -225,16 +252,37 @@ function Write-BackupToml {
     [void]$sb.AppendLine('weekly = 4')
     [void]$sb.AppendLine('monthly = 6')
     for ($i = 0; $i -lt $Repos.Count; $i++) {
-        $name = if ($i -lt $Names.Count -and $Names[$i]) { $Names[$i] } else { "repo$($i + 1)" }
+        $u = $Repos[$i]
+        $tunnelName = if ($u -match '^tunnel:(.*)$') { $Matches[1] } else { '' }
+        $tunnelNode = ''
+        if ($tunnelName -and $tunnelName.Contains('/')) {
+            $tunnelNode = $tunnelName.Substring(0, $tunnelName.IndexOf('/'))
+            $tunnelName = $tunnelName.Substring($tunnelName.IndexOf('/') + 1)
+        }
+        $name = if ($i -lt $Names.Count -and $Names[$i]) {
+            $Names[$i]
+        } elseif ($tunnelName) {
+            $tunnelName
+        } else {
+            "repo$($i + 1)"
+        }
         [void]$sb.AppendLine('')
         [void]$sb.AppendLine('[[repo]]')
         [void]$sb.AppendLine("name = `"$(Escape-Toml $name)`"")
-        [void]$sb.AppendLine("url = `"$(Escape-Toml $Repos[$i])`"")
+        if ($tunnelName) {
+            [void]$sb.AppendLine("tunnel_name = `"$(Escape-Toml $tunnelName)`"")
+            if ($tunnelNode) {
+                [void]$sb.AppendLine("tunnel_node = `"$(Escape-Toml $tunnelNode)`"")
+            }
+        } else {
+            [void]$sb.AppendLine("url = `"$(Escape-Toml $u)`"")
+        }
         [void]$sb.AppendLine("password_file = `"$(Escape-Toml $KeyPath)`"")
-        $u = $Repos[$i]
-        if ($u -match '^(s3|b2|rest):') {
+        if ($u -match '^(s3|b2|rest|tunnel):') {
             if ($EnvFilePath) {
                 [void]$sb.AppendLine("env_file = `"$(Escape-Toml $EnvFilePath)`"")
+            } elseif ($tunnelName) {
+                Write-Warning "repo '$name' targets tunnel: but no REST credentials were provided (set SM_BACKUP_REST_USERNAME/SM_BACKUP_REST_PASSWORD); authentication will fail"
             } else {
                 Write-Warning "repo '$name' targets $($u.Split(':')[0]): but no S3/REST credentials were provided (set SM_BACKUP_S3_* or SM_BACKUP_REST_*); authentication will fail"
             }
@@ -243,6 +291,10 @@ function Write-BackupToml {
             if ($S3Region)   { [void]$sb.AppendLine("s3_region = `"$(Escape-Toml $S3Region)`"") }
             if ($S3PathStyle) { [void]$sb.AppendLine('s3_path_style = true') }
         }
+    }
+    if ($TunnelSection) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine($TunnelSection.TrimEnd())
     }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($TomlPath, $sb.ToString(), $utf8NoBom)
@@ -287,10 +339,24 @@ function Write-RecoveryKit {
     param(
         [Parameter(Mandatory=$true)][string]$KitPath,
         [Parameter(Mandatory=$true)][string]$KeyPath,
+        [Parameter(Mandatory=$true)][string]$TomlPath,
+        [Parameter(Mandatory=$true)][string]$EnvFilePath,
+        [Parameter(Mandatory=$true)][string]$TunnelKeyPath,
         [string[]]$Repos,
         [string[]]$Names
     )
     $pw = (Get-Content -Raw -LiteralPath $KeyPath).Trim()
+    $tunnelSection = New-TunnelSectionSnapshot -TomlPath $TomlPath
+    $tunnelValues = @{}
+    if ($tunnelSection) {
+        foreach ($line in ($tunnelSection -split '\r?\n')) {
+            if ($line -match '^\s*(endpoint|server_public_key|local_ip|server_ip|rest_port)\s*=\s*"([^"]*)"\s*$') {
+                $tunnelValues[$Matches[1]] = $Matches[2]
+            } elseif ($line -match '^\s*(endpoint|server_public_key|local_ip|server_ip|rest_port)\s*=\s*(\S+)\s*$') {
+                $tunnelValues[$Matches[1]] = $Matches[2]
+            }
+        }
+    }
     $lines = @()
     $lines += 'ServerMonitor backup recovery kit'
     $lines += "host: $env:COMPUTERNAME"
@@ -298,12 +364,51 @@ function Write-RecoveryKit {
     $lines += ''
     $lines += 'repositories:'
     for ($i = 0; $i -lt $Repos.Count; $i++) {
-        $name = if ($i -lt $Names.Count -and $Names[$i]) { $Names[$i] } else { "repo$($i + 1)" }
-        $lines += "  [$name] $($Repos[$i])"
+        $u = $Repos[$i]
+        $tunnelName = if ($u -match '^tunnel:(.*)$') { $Matches[1] } else { '' }
+        $name = if ($i -lt $Names.Count -and $Names[$i]) {
+            $Names[$i]
+        } elseif ($tunnelName) {
+            $tunnelName
+        } else {
+            "repo$($i + 1)"
+        }
+        if ($tunnelName) {
+            $lines += "  [$name] tunnel:$tunnelName via $($tunnelValues['endpoint'])"
+        } else {
+            $lines += "  [$name] $u"
+        }
     }
     $lines += ''
     $lines += 'repository password:'
     $lines += "  $pw"
+    if (Test-Path -LiteralPath $EnvFilePath) {
+        $lines += ''
+        $lines += 'REST credentials:'
+        foreach ($line in [System.IO.File]::ReadAllLines($EnvFilePath)) {
+            if ($line -match '^RESTIC_REST_(USERNAME|PASSWORD)=') { $lines += "  $line" }
+        }
+    }
+    if ($tunnelSection) {
+        $lines += ''
+        $lines += 'wireguard tunnel:'
+        foreach ($key in @('endpoint','server_public_key','local_ip','server_ip','rest_port')) {
+            $lines += "  $key`: $($tunnelValues[$key])"
+        }
+        $lines += '  tunnel.key contents (WireGuard private key):'
+        if (Test-Path -LiteralPath $TunnelKeyPath) {
+            $lines += "    $(([System.IO.File]::ReadAllText($TunnelKeyPath)).Trim())"
+        } else {
+            $lines += '    unavailable'
+        }
+        $lines += ''
+        $lines += 'disaster recovery for tunnel repositories:'
+        $lines += '  1. Register the recovery host or reuse a host token in agent.toml.'
+        $lines += '  2. If the old peer was revoked, run:'
+        $lines += '     sm-agent backup tunnel-enroll --config backup.toml --agent-config agent.toml'
+        $lines += '  3. Run: sm-agent backup proxy --config backup.toml'
+        $lines += '  4. Use the printed RESTIC_REPOSITORY with restic and the repository password above.'
+    }
     $lines += ''
     $lines += 'restore any repo on a bare machine (needs restic + this password):'
     $lines += '  restic -r <url> restore latest --target C:\recover'
@@ -365,6 +470,7 @@ function Invoke-BackupProvisioning {
     $backupToml   = Join-Path $backupDir 'backup.toml'
     $backupKey    = Join-Path $backupDir 'backup.key'
     $backupEnvFile = Join-Path $backupDir 'repo-credentials.env'
+    $tunnelKey    = Join-Path $backupDir 'tunnel.key'
     $recoveryKit  = Join-Path $backupDir 'recovery-kit.txt'
     $backupStatus = Join-Path $configDir 'backup-status.json'
     Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
@@ -375,6 +481,21 @@ function Invoke-BackupProvisioning {
     $pathArr = @()
     if ($BackupPaths)     { $pathArr = $BackupPaths.Split(',')     | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
     if (-not $pathArr) { $pathArr = @('C:\Users') }
+    $requestedTunnelRepo = $false
+    foreach ($repo in $repoArr) {
+        if ($repo -match '^tunnel:(.*)$') {
+            $tunnelName = $Matches[1]
+            if ($tunnelName -notmatch '^([A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+$') {
+                throw "invalid tunnel repository '$repo'; use tunnel:NAME (this server) or tunnel:NODE/NAME (a promoted backup node), each part matching ^[A-Za-z0-9._-]+$"
+            }
+            $requestedTunnelRepo = $true
+        }
+    }
+    $hasTunnelRepo = $requestedTunnelRepo
+    if ((-not $repoArr) -and (Test-Path -LiteralPath $backupToml)) {
+        $hasTunnelRepo = [System.IO.File]::ReadAllText($backupToml) -match '(?m)^\s*tunnel_name\s*='
+    }
+    $preservedTunnelSection = if ($hasTunnelRepo) { New-TunnelSectionSnapshot -TomlPath $backupToml } else { '' }
 
     if ($EnableBackup) {
         if ((-not (Test-Path -LiteralPath $backupToml)) -and (-not $repoArr)) {
@@ -382,6 +503,18 @@ function Invoke-BackupProvisioning {
         }
         if (-not (Test-Path -LiteralPath $AgentExe)) {
             throw "agent binary not found at $AgentExe; the backup task runs the admin-only copy in Program Files, not the service-writable one. Re-run with -Reinstall to restore it"
+        }
+        if ($hasTunnelRepo -and $Reconfigure) {
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $tunnelUsage = @(& $AgentExe backup 2>&1) -join "`n"
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($tunnelUsage -notmatch 'tunnel-enroll') {
+                throw "$AgentExe does not support backup tunnel-enroll; re-run with -Reinstall and -BinaryPath pointing at a current sm-agent"
+            }
         }
         if ($BackupPruneMode -ne 'host' -and $BackupPruneMode -ne 'external') {
             throw 'SM_BACKUP_PRUNE_MODE / -BackupPruneMode must be "host" or "external"'
@@ -398,21 +531,41 @@ function Invoke-BackupProvisioning {
         $envFileArg = if ($hasEnvFile) { $backupEnvFile } else { '' }
         $reposWritten = $false
         if ($repoArr) {
-            Write-BackupToml -TomlPath $backupToml -StatusPath $backupStatus -KeyPath $backupKey -ResticPath (Join-Path $installDir 'restic.exe') -Repos $repoArr -Names $nameArr -Paths $pathArr -EnvFilePath $envFileArg -PruneMode $BackupPruneMode -S3Region $BackupS3Region -S3PathStyle:$BackupS3PathStyle
+            Write-BackupToml -TomlPath $backupToml -StatusPath $backupStatus -KeyPath $backupKey -ResticPath (Join-Path $installDir 'restic.exe') -Repos $repoArr -Names $nameArr -Paths $pathArr -EnvFilePath $envFileArg -TunnelSection $preservedTunnelSection -PruneMode $BackupPruneMode -S3Region $BackupS3Region -S3PathStyle:$BackupS3PathStyle
             $reposWritten = $true
         } elseif (Test-Path -LiteralPath $backupToml) {
             Write-Host 'note: -BackupRepos not provided; keeping existing backup.toml'
             Lock-Acl -Path $backupToml -ServiceAccess None
+        }
+        if ($hasTunnelRepo) {
+            $agentConfig = Join-Path $configDir 'agent.toml'
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $AgentExe backup tunnel-enroll --config $backupToml --agent-config $agentConfig
+                $tunnelEnrollExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($tunnelEnrollExit -eq 0) {
+                if (-not (Test-Path -LiteralPath $tunnelKey)) {
+                    throw "sm-agent backup tunnel-enroll succeeded but $tunnelKey was not created"
+                }
+            } elseif ($preservedTunnelSection) {
+                Write-Warning 'sm-agent backup tunnel-enroll failed; keeping the preserved [tunnel] section and continuing'
+            } else {
+                throw 'sm-agent backup tunnel-enroll failed and no existing [tunnel] section is available; backups could never work'
+            }
         }
         & $AgentExe backup init --config $backupToml
         if ($LASTEXITCODE -ne 0) { throw 'sm-agent backup init failed; backup not scheduled' }
         Register-BackupTask -AgentExe $AgentExe -ConfigPath $backupToml -Time $BackupTime
         Register-BackupCheckTask -AgentExe $AgentExe -ConfigPath $backupToml -Time $BackupTime
         if ($keyFresh) {
-            Write-RecoveryKit -KitPath $recoveryKit -KeyPath $backupKey -Repos $repoArr -Names $nameArr
+            Write-RecoveryKit -KitPath $recoveryKit -KeyPath $backupKey -TomlPath $backupToml -EnvFilePath $backupEnvFile -TunnelKeyPath $tunnelKey -Repos $repoArr -Names $nameArr
             Show-RecoveryKit -KitPath $recoveryKit
         } elseif ($reposWritten) {
-            Write-RecoveryKit -KitPath $recoveryKit -KeyPath $backupKey -Repos $repoArr -Names $nameArr
+            Write-RecoveryKit -KitPath $recoveryKit -KeyPath $backupKey -TomlPath $backupToml -EnvFilePath $backupEnvFile -TunnelKeyPath $tunnelKey -Repos $repoArr -Names $nameArr
             Write-Host "note: recovery kit updated at $recoveryKit (password unchanged, not reprinted)"
         } else {
             Write-Host "note: backup recovery kit at $recoveryKit (password not reprinted)"
@@ -426,8 +579,10 @@ function Invoke-BackupProvisioning {
         if ($existingTask) {
             Unregister-ScheduledTask -TaskName 'ServerMonitor Backup' -Confirm:$false
             Write-Host ''
-            Write-Host 'note: removed the ServerMonitor Backup scheduled task. backup.toml, backup.key'
-            Write-Host 'and recovery-kit.txt were KEPT (they guard existing snapshots). Remove manually with:'
+            Write-Host 'note: removed the ServerMonitor Backup scheduled task. backup.toml, backup.key,'
+            Write-Host 'tunnel.key, and recovery-kit.txt were KEPT (they guard existing snapshots). tunnel.key'
+            Write-Host 'is kept alongside backup.key. A still-enrolled WireGuard peer can be revoked from the'
+            Write-Host 'server UI (Backups page). Remove the kept files manually with:'
             Write-Host "  Remove-Item -Recurse '$backupDir'"
             Write-Host ''
         }

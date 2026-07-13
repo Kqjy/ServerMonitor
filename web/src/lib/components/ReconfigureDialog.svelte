@@ -12,7 +12,7 @@
   const ownerState = cs.connections?.state ?? cs.ports?.state;
   const ownersMissing = ownerState === 'no_owners' || ownerState === 'partial_owners';
   const ownersWorking = ownerState === 'ok';
-  const smartWorking = smartState === 'ok';
+  const smartWorking = smartState === 'ok' || smartState === 'raid_unreadable';
 
   const osName = untrack(() => (host.os ?? '').toLowerCase());
   const isWindows = osName.includes('windows');

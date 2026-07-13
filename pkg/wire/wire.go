@@ -67,7 +67,66 @@ type BackupRepoStatus struct {
 	SnapshotCount int64            `json:"snapshot_count,omitempty"`
 	CheckLast     *time.Time       `json:"check_last,omitempty"`
 	CheckSuccess  *bool            `json:"check_success,omitempty"`
+	Tunnel        bool             `json:"tunnel,omitempty"`
 	Snapshots     []BackupSnapshot `json:"snapshots,omitempty"`
+}
+
+type TunnelEnrollRequest struct {
+	PublicKey string `json:"public_key"`
+}
+
+type TunnelEnrollResponse struct {
+	ServerPublicKey string `json:"server_public_key"`
+	Endpoint        string `json:"endpoint"`
+	TunnelIP        string `json:"tunnel_ip"`
+	ServerTunnelIP  string `json:"server_tunnel_ip"`
+	RestPort        int    `json:"rest_port"`
+	ServerStorage   bool   `json:"server_storage"`
+}
+
+type TunnelNodeInfo struct {
+	HostID    int64  `json:"host_id"`
+	Hostname  string `json:"hostname"`
+	PublicKey string `json:"public_key"`
+	Endpoint  string `json:"endpoint"`
+	TunnelIP  string `json:"tunnel_ip"`
+	RestPort  int    `json:"rest_port"`
+}
+
+type TunnelNodesResponse struct {
+	Nodes []TunnelNodeInfo `json:"nodes"`
+}
+
+type NodeTargetInfo struct {
+	Name       string `json:"name"`
+	SecretHash string `json:"secret_hash"`
+	QuotaBytes int64  `json:"quota_bytes,omitempty"`
+	Revoked    bool   `json:"revoked,omitempty"`
+}
+
+type NodePeerInfo struct {
+	PublicKey string `json:"public_key"`
+	TunnelIP  string `json:"tunnel_ip"`
+}
+
+type BackupNodeConfig struct {
+	Enabled      bool             `json:"enabled"`
+	UDPPort      int              `json:"udp_port,omitempty"`
+	StoreDir     string           `json:"store_dir,omitempty"`
+	MaxBlobBytes int64            `json:"max_blob_bytes,omitempty"`
+	TunnelIP     string           `json:"tunnel_ip,omitempty"`
+	RestPort     int              `json:"rest_port,omitempty"`
+	Targets      []NodeTargetInfo `json:"targets,omitempty"`
+	Peers        []NodePeerInfo   `json:"peers,omitempty"`
+}
+
+type NodeUsageEntry struct {
+	Name      string `json:"name"`
+	UsedBytes int64  `json:"used_bytes"`
+}
+
+type BackupNodeUsage struct {
+	Targets []NodeUsageEntry `json:"targets"`
 }
 
 type CollectorStatus struct {

@@ -1,4 +1,4 @@
-package backupserver
+package restserver
 
 import (
 	"context"

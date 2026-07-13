@@ -439,6 +439,63 @@ A target the endpoint holds **no objects** for — one created by mistake, or em
 
 Use **Measure** on a target to walk its repo and refresh the stored-bytes figure and quota bar. Storage totals also appear in the summary tiles at the top of the Backups tab.
 
+## Backing up over the built-in WireGuard tunnel (no exposed endpoint)
+
+The managed endpoint above rides the server's public HTTPS listener. Tunnel mode removes even that: each backup host establishes a **per-host WireGuard tunnel** to the server, and the restic REST endpoint is served **only inside the tunnel** — it does not exist on any real network interface. The only thing the internet can see is one UDP port, and WireGuard never replies to a packet that isn't signed by an enrolled peer key, so scanners see nothing at all. TLS and `BACKUP_ACME_DOMAIN` become unnecessary for backups: the tunnel is the transport encryption, restic's client-side encryption still covers the data, and the per-target Basic-auth credential still gates every request (a tunnel IP grants no authorization by itself).
+
+Everything is userspace Go inside the existing binaries — no kernel WireGuard, no `wg-quick`, no TUN devices, no new capabilities on either side, no interference with an existing WireGuard or Tailscale setup on the host. The agent's tunnel exists **only while a backup, check, restore or init is running**; there is no resident tunnel process.
+
+**Enable it on the server.** Keep one storage backend (`BACKUP_DIR` or `BACKUP_S3_BUCKET`) and add:
+
+- `BACKUP_WG_PORT=51820` — turns tunnel mode on; the UDP port to expose.
+- `BACKUP_WG_ENDPOINT=` — optional `host[:port]` agents should dial. Defaults to the host agents already reach the server by, so most setups leave it empty.
+- `BACKUP_WG_SUBNET=10.83.0.0/16` — tunnel address pool; the server takes the first address.
+- `BACKUP_WG_MTU=1280` — conservative default that survives PPPoE/IPv6 encapsulation; raise toward 1420 on clean paths.
+- `BACKUP_PUBLIC_HTTP=1` — optional. By default tunnel mode takes `/backup` **off** the public listener; set this to serve both (mixed fleet where some hosts cannot use UDP).
+
+The server generates and persists its WireGuard key on first start; peers survive restarts. Docker: map the UDP port in `docker-compose.yml` (`ports: ["51820:51820/udp"]` on the app service) and pass the `BACKUP_*` variables through.
+
+**Point a host at it.** Use the `tunnel:` scheme instead of a `rest:` URL — everything else (credential env vars, prune mode) is identical:
+
+```bash
+sudo SM_ENABLE_BACKUP=1 \
+  SM_BACKUP_REPOS='tunnel:web-01' \
+  SM_BACKUP_REST_USERNAME=web-01 \
+  SM_BACKUP_REST_PASSWORD=<minted> \
+  SM_BACKUP_PRUNE_MODE=external \
+  ./scripts/install-agent-linux.sh --enable-backup --backup-repos 'tunnel:web-01'
+```
+
+The installer runs `sm-agent backup tunnel-enroll`, which generates a WireGuard key (root-owned `tunnel.key` next to `backup.key`, never regenerated), registers the public key with the server over the existing agent-token channel, and writes the returned `[tunnel]` section (server public key, endpoint, tunnel addresses) into `backup.toml`. In `backup.toml` a tunnel repo carries `tunnel_name = "web-01"` instead of `url`. At run time the agent brings the tunnel up in-process, proxies restic through a loopback listener, and tears it down when the run ends. A `tunnel:` repo and `rest:`/`s3:`/`b2:` repos mix freely in one config; if the tunnel cannot come up, only the tunnel repos fail that run — the rest proceed and the failure lands in the status file and alerts like any other repo error.
+
+**Peer management.** The Backups page shows the tunnel card: endpoint, server public key, and every enrolled peer with tunnel IP, last handshake and traffic. Revoking a peer removes tunnel access immediately (independent of the repo credential). Deleting a host revokes its peer automatically. Re-running the installer (or `sm-agent backup tunnel-enroll`) re-enrolls, keeping the existing key and tunnel IP; a host restored from scratch generates a new key and simply enrolls again with its agent token.
+
+**Serialization.** Because both ends of the tunnel key a single WireGuard identity, every tunnel-using command takes the shared `backup.lock` — including `snapshots` and `init`, which run lock-free in URL mode. A second command reports the lock holder and exits instead of silently stealing the tunnel.
+
+**Disaster recovery.** The recovery kit gains the tunnel parameters, the REST credential and the tunnel key. On a rebuilt machine: reinstall the agent (or `sm-agent register` for a token), run `sm-agent backup tunnel-enroll`, then `sm-agent backup proxy --config /etc/servermonitor-backup/backup.toml` — it opens the tunnel, prints a ready-made `RESTIC_REPOSITORY=rest:http://127.0.0.1:<port>/<name>`, and stays up until Ctrl+C so you can drive plain restic against it with the repository password from the kit. Remember the structural caveat: with the ServerMonitor server as the endpoint, the monitoring server and the backup destination share fate — keep the second repo on independent storage (S3/B2 with deny-delete, or another rest-server), exactly like the two-repo posture this feature is built around.
+
+**Constraints.** Agents need outbound UDP to the server's tunnel port (corporate egress filters may block it — those hosts keep using `rest:` over HTTPS with `BACKUP_PUBLIC_HTTP=1`). Throughput through the userspace stack is roughly a few hundred Mbit/s — far above what nightly incremental backups need, but plan restores of multi-TB repos accordingly.
+
+## Storage nodes: promote a monitored host into a backup destination
+
+Any connected host can be **promoted into a storage node**: its resident agent starts serving the same append-only restic REST endpoint — inside its own WireGuard tunnel — and other hosts back up straight to it. The monitoring server stays out of the data path entirely; it is only the control plane (identity, tunnel IPs, credentials, observability). This reproduces the classic storage-VPS posture with zero manual setup on the node.
+
+**Promotion is a UI action, no SSH required.** On the Backups page, *Storage nodes → Promote a host*: pick the host, the endpoint other hosts dial it at (LAN name or public address — one UDP port, silent to non-peers), and the port (default 51821). The node's agent picks the role up within a minute: it generates a tunnel key, enrolls with the server, opens the UDP listener, and serves storage from `/var/lib/servermonitor/backup-store` (Windows: `%ProgramData%\ServerMonitor\backup-store`). Everything is userspace — the agent gains no privileges, and demotion stops it just as fast (refused while the node still has active repositories).
+
+Requirements: the server must run with `BACKUP_WG_PORT` (the tunnel control plane); the node's UDP port must be reachable from the hosts that back up to it. `BACKUP_DIR`/`BACKUP_S3_BUCKET` on the server are **not** required for node-only fleets.
+
+**Create repositories on it.** New repository → destination *Node · hostname*. Node-hosted repositories require the linked host (that's how the node knows which tunnel peer to admit). The install snippet uses the node form of the scheme:
+
+```bash
+--backup-repos 'tunnel:nas-01/web-01'
+```
+
+`tunnel:NODE/NAME` = repository `NAME` on node `NODE`; plain `tunnel:NAME` still targets the server. In `backup.toml` this becomes `tunnel_name = "web-01"` plus `tunnel_node = "nas-01"`, and `sm-agent backup tunnel-enroll` resolves the node's public key, endpoint and tunnel address into `[[tunnel.node]]` blocks. A host can mix destinations freely — one repo on a node, one on S3 — and each still fails independently.
+
+**Trust model.** The node stores ciphertext only: repo passwords never leave the backing-up host, and the node verifies upload credentials against server-distributed hashes, so a compromised node can neither read nor forge backups — it can, at worst, delete its own disk (which is why the two-independent-repos rule still applies; pair a node repo with S3/B2 or a second node). The node's endpoint is append-only exactly like the server's. Upload credentials are still minted and revoked centrally in the UI; per-target usage flows back to the server for quota display.
+
+**Fate sharing note.** A node-hosted repo dies with the node's disk. For the borg-style posture: repo 1 on a storage node in another room/site, repo 2 on object storage with a deny-delete policy — both over their own transports, no shared fate, nothing internet-exposed except silent UDP.
+
 ## Manual runs and troubleshooting
 
 Kick off a backup outside the schedule (this runs it under the unit, with the right user, capability, and sandbox):

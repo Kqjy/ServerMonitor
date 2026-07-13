@@ -5,7 +5,8 @@
     type SeriesEntry,
     type CollectorStatus,
     type BackupRepoRow,
-    type BackupSnapshot
+    type BackupSnapshot,
+    type BackupTargetsResp
   } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes, timeAgo } from '$lib/format';
@@ -30,11 +31,28 @@
   const backupStatus = $derived(collectorStatus.backup);
   const isWindows = $derived((os ?? '').toLowerCase().startsWith('windows'));
 
+  let endpoint = $state<BackupTargetsResp | null>(null);
+  const endpointConfigured = $derived(endpoint?.configured ?? false);
+  const linkedRepo = $derived(endpoint?.targets.find((t) => t.host_id === hostId && !t.revoked_at)?.name ?? null);
+
+  async function loadEndpoint() {
+    try {
+      endpoint = await api.backupTargets();
+    } catch {}
+  }
+
+  const enableSnippet = $derived(
+    isWindows
+      ? `.\\install-agent-windows.ps1 -Reconfigure \`\n  -EnableBackup -BackupRepos '<rest/s3 url>'`
+      : `sudo ./install-agent-linux.sh --enable-backup \\\n  --backup-repos '<rest/s3 url>'`
+  );
+
   type Tone = 'good' | 'warn' | 'bad' | 'none';
 
   type RepoView = {
     repo: string;
     engine?: string;
+    tunnel: boolean;
     success: boolean;
     error?: string;
     lastSuccessIso?: string;
@@ -139,6 +157,7 @@
         return {
           repo: r.repo,
           engine: s.engine,
+          tunnel: s.tunnel === true,
           success: s.success,
           error: s.error,
           lastSuccessIso: s.last_success,
@@ -277,6 +296,7 @@
 
   onMount(() => {
     loadBackups();
+    loadEndpoint();
     timer = setInterval(() => {
       if (chartZoom === null) loadCharts();
     }, 10_000);
@@ -368,12 +388,11 @@
 </script>
 
 <div class="space-y-6">
-  {#if backupStatus?.state === 'not_configured'}
-    <div class="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-300">
-      <p>Backup reporting is not configured on this host.</p>
-      <p class="mt-1 text-xs text-zinc-500">Write a version 1 status file to <span class="font-mono text-zinc-400">/var/lib/servermonitor/backup-status.json</span> or <span class="font-mono text-zinc-400">C:\ProgramData\ServerMonitor\backup-status.json</span>.</p>
-    </div>
-  {:else if backupStatus?.state === 'stale'}
+  <p class="text-xs text-zinc-500">
+    This host backs up its own files with restic to one or more destinations — this server or an external endpoint.
+  </p>
+
+  {#if backupStatus?.state === 'stale'}
     <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
       Backup status is stale{backupStatus.message ? `: ${backupStatus.message}` : ''}.
     </div>
@@ -409,9 +428,39 @@
         <div class="h-32 rounded-lg shimmer"></div>
       </div>
     {:else if views.length === 0 && !backupsError}
-      <div class="p-12 text-center">
-        <h3 class="text-base font-medium text-zinc-100">No repositories reported yet</h3>
-        <p class="mt-1 text-sm text-zinc-500">This host has not reported any backup repositories.</p>
+      <div class="p-6 sm:p-8">
+        <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
+        <p class="mt-1 text-sm text-zinc-500 max-w-xl">
+          {backupStatus?.state === 'not_configured' || !backupStatus
+            ? 'Its agent reports no backup job. Enable backups to protect this host and see restore-ready snapshots here.'
+            : 'The agent reports backups are enabled but no repository status has arrived yet — the first run may not have finished.'}
+        </p>
+
+        {#if endpointConfigured && linkedRepo}
+          <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
+            A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists on this server.
+            Point the agent at it, then it will report here. <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
+          </div>
+        {:else if endpointConfigured}
+          <div class="mt-4">
+            <a
+              href="/backups?new=1&host={hostId}"
+              class="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium">
+              Back up this host to this server →
+            </a>
+            <p class="mt-2 text-[11px] text-zinc-600">Creates a repository on this server and shows the exact install command to run on this host.</p>
+          </div>
+        {/if}
+
+        <div class="mt-5">
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">
+            {endpointConfigured ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
+          </div>
+          <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200 select-text">{enableSnippet}</pre>
+          <p class="mt-2 text-[11px] text-zinc-500">
+            Re-run the installer with these flags{isWindows ? '' : ' (or set the matching SM_* env vars)'} to enable backups in place. Full setup — rest-server, S3/B2, TLS, recovery — is in <span class="font-mono text-zinc-600">deploy/BACKUPS.md</span>.
+          </p>
+        </div>
       </div>
     {:else if views.length > 0}
       <div class="overflow-x-auto">
@@ -433,6 +482,7 @@
                     <span class="h-1.5 w-1.5 shrink-0 rounded-full {toneDot[v.backupTone]}"></span>
                     <span class="truncate font-mono text-zinc-100">{v.repo}</span>
                     {#if v.engine}<span class="shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</span>{/if}
+                    {#if v.tunnel}<span class="shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}
                   </div>
                 </td>
                 <td class="px-3 py-2.5">
@@ -461,7 +511,7 @@
             <header class="flex items-center justify-between gap-3">
               <div class="min-w-0">
                 <h3 class="min-w-0 truncate font-mono text-sm text-zinc-100">{v.repo}</h3>
-                {#if v.engine}<div class="mt-0.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</div>{/if}
+                {#if v.engine}<div class="mt-0.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}{#if v.tunnel}<span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}</div>{:else if v.tunnel}<div class="mt-0.5 text-[10px] uppercase tracking-wider"><span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300">tunnel</span></div>{/if}
               </div>
               <span class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[v.backupTone]}">{runLabel(v.success)}</span>
             </header>

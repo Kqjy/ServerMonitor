@@ -126,6 +126,7 @@ export interface BackupRepoStatus {
   snapshot_count?: number;
   check_last?: string;
   check_success?: boolean;
+  tunnel?: boolean;
   snapshots?: BackupSnapshot[];
 }
 
@@ -155,11 +156,26 @@ export interface BackupTarget {
   name: string;
   host_id?: number;
   hostname?: string;
+  node_host_id?: number;
+  node_hostname?: string;
   quota_bytes?: number;
   used_bytes: number;
   usage_measured_at?: string;
   created_at: string;
   revoked_at?: string;
+}
+
+export interface BackupNode {
+  host_id: number;
+  hostname: string;
+  udp_port: number;
+  endpoint: string;
+  store_dir?: string;
+  tunnel_ip?: string;
+  enrolled: boolean;
+  target_count: number;
+  used_bytes: number;
+  created_at: string;
 }
 
 export interface BackupTargetsResp {
@@ -173,6 +189,29 @@ export interface BackupCredential {
   id: number;
   name: string;
   password: string;
+}
+
+export interface BackupTunnelPeer {
+  host_id: number;
+  hostname: string;
+  tunnel_ip: string;
+  enrolled_at: string;
+  last_handshake?: string;
+  rx_bytes: number;
+  tx_bytes: number;
+  connected: boolean;
+}
+
+export interface BackupTunnelResp {
+  enabled: boolean;
+  public_http: boolean;
+  listen_port?: number;
+  endpoint?: string;
+  subnet?: string;
+  server_public_key?: string;
+  server_tunnel_ip?: string;
+  rest_port?: number;
+  peers: BackupTunnelPeer[];
 }
 
 export interface ProcessSeriesPoint {
@@ -589,7 +628,7 @@ export const api = {
   retention: () => request<RetentionResp>('/api/v1/retention'),
   storage: () => request<StorageResp>('/api/v1/storage'),
   backupTargets: () => request<BackupTargetsResp>('/api/v1/backup-targets'),
-  backupTargetCreate: (body: { name: string; host_id?: number; quota_bytes?: number }) =>
+  backupTargetCreate: (body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number }) =>
     request<BackupCredential>('/api/v1/backup-targets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -600,5 +639,22 @@ export const api = {
   backupTargetMeasure: (id: number) =>
     request<BackupTarget>(`/api/v1/backup-targets/${id}/measure`, { method: 'POST' }),
   backupTargetRevoke: (id: number) => request<void>(`/api/v1/backup-targets/${id}/revoke`, { method: 'POST' }),
-  backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-targets/${id}`, { method: 'DELETE' })
+  backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-targets/${id}`, { method: 'DELETE' }),
+  backupTunnel: () => request<BackupTunnelResp>('/api/v1/backup-tunnel'),
+  backupTunnelPeerRevoke: (hostId: number) =>
+    request<void>(`/api/v1/backup-tunnel/peers/${hostId}`, { method: 'DELETE' }),
+  backupNodes: () => request<{ nodes: BackupNode[] }>('/api/v1/backup-nodes'),
+  backupNodePromote: (body: {
+    host_id: number;
+    endpoint: string;
+    udp_port?: number;
+    store_dir?: string;
+  }) =>
+    request<void>('/api/v1/backup-nodes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }),
+  backupNodeDemote: (hostId: number) =>
+    request<void>(`/api/v1/backup-nodes/${hostId}`, { method: 'DELETE' })
 };

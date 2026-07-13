@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -27,6 +28,11 @@ type Config struct {
 	BackupS3Endpoint     string
 	BackupS3UsePathStyle bool
 	BackupMaxBlobBytes   int64
+	BackupWGPort         int
+	BackupWGEndpoint     string
+	BackupWGSubnet       string
+	BackupWGMTU          int
+	BackupPublicHTTP     bool
 	BackupACMEDomain     string
 	ACMEEmail            string
 	ACMECacheDir         string
@@ -55,6 +61,12 @@ func (c *Config) SecureBrowserSide() bool {
 }
 
 func (c *Config) BackupEnabled() bool { return c.BackupDir != "" || c.BackupS3Bucket != "" }
+
+func (c *Config) BackupTunnelEnabled() bool { return c.BackupWGPort > 0 }
+
+func (c *Config) BackupServesPublicHTTP() bool {
+	return c.BackupEnabled() && (!c.BackupTunnelEnabled() || c.BackupPublicHTTP)
+}
 
 func (c *Config) ACMEEnabled() bool {
 	return c.BackupACMEDomain != "" && !c.ServesTLS() && !c.TrustProxyTLS
@@ -92,6 +104,11 @@ func Load() (*Config, error) {
 		BackupS3Endpoint:     getenv("BACKUP_S3_ENDPOINT", ""),
 		BackupS3UsePathStyle: getenvBool("BACKUP_S3_USE_PATH_STYLE", false),
 		BackupMaxBlobBytes:   getenvInt64("BACKUP_MAX_BLOB_BYTES", 1<<30),
+		BackupWGPort:         getenvInt("BACKUP_WG_PORT", 0),
+		BackupWGEndpoint:     getenv("BACKUP_WG_ENDPOINT", ""),
+		BackupWGSubnet:       getenv("BACKUP_WG_SUBNET", "10.83.0.0/16"),
+		BackupWGMTU:          getenvInt("BACKUP_WG_MTU", 1280),
+		BackupPublicHTTP:     getenvBool("BACKUP_PUBLIC_HTTP", false),
 		BackupACMEDomain:     getenv("BACKUP_ACME_DOMAIN", ""),
 		ACMEEmail:            getenv("ACME_EMAIL", ""),
 		ACMECacheDir:         getenv("ACME_CACHE_DIR", ""),
@@ -132,6 +149,30 @@ func Load() (*Config, error) {
 	}
 	if c.BackupDir != "" && c.BackupS3Bucket != "" {
 		return nil, fmt.Errorf("set BACKUP_DIR or BACKUP_S3_BUCKET, not both")
+	}
+	if c.BackupWGPort != 0 {
+		if c.BackupWGPort < 1 || c.BackupWGPort > 65535 {
+			return nil, fmt.Errorf("BACKUP_WG_PORT must be between 1 and 65535")
+		}
+		prefix, err := netip.ParsePrefix(c.BackupWGSubnet)
+		if err != nil {
+			return nil, fmt.Errorf("BACKUP_WG_SUBNET: %w", err)
+		}
+		if prefix.Addr().Is4() && prefix.Bits() > 30 {
+			return nil, fmt.Errorf("BACKUP_WG_SUBNET %s is too small; use /30 or larger", c.BackupWGSubnet)
+		}
+		if c.BackupWGMTU < 576 || c.BackupWGMTU > 1420 {
+			return nil, fmt.Errorf("BACKUP_WG_MTU must be between 576 and 1420")
+		}
+		if c.BackupWGEndpoint != "" {
+			host := c.BackupWGEndpoint
+			if h, _, splitErr := net.SplitHostPort(c.BackupWGEndpoint); splitErr == nil {
+				host = h
+			}
+			if strings.TrimSpace(host) == "" {
+				return nil, fmt.Errorf("BACKUP_WG_ENDPOINT must be host or host:port")
+			}
+		}
 	}
 	if c.BackupMaxBlobBytes <= 0 {
 		c.BackupMaxBlobBytes = 1 << 30

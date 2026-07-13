@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -19,6 +20,35 @@ type Config struct {
 	PruneMode     string
 	Retention     Retention
 	Repos         []Repo
+	Tunnel        *TunnelSettings
+}
+
+type TunnelSettings struct {
+	PrivateKeyFile  string               `toml:"private_key_file"`
+	ServerPublicKey string               `toml:"server_public_key"`
+	Endpoint        string               `toml:"endpoint"`
+	LocalIP         string               `toml:"local_ip"`
+	ServerIP        string               `toml:"server_ip"`
+	RestPort        int                  `toml:"rest_port"`
+	MTU             int                  `toml:"mtu"`
+	Nodes           []TunnelNodeSettings `toml:"node"`
+}
+
+type TunnelNodeSettings struct {
+	Host      string `toml:"host"`
+	PublicKey string `toml:"public_key"`
+	Endpoint  string `toml:"endpoint"`
+	IP        string `toml:"ip"`
+	RestPort  int    `toml:"rest_port"`
+}
+
+func (t *TunnelSettings) Node(host string) *TunnelNodeSettings {
+	for i := range t.Nodes {
+		if t.Nodes[i].Host == host {
+			return &t.Nodes[i]
+		}
+	}
+	return nil
 }
 
 type Retention struct {
@@ -36,11 +66,26 @@ type RetentionOverride struct {
 type Repo struct {
 	Name         string             `toml:"name"`
 	URL          string             `toml:"url"`
+	TunnelName   string             `toml:"tunnel_name"`
+	TunnelNode   string             `toml:"tunnel_node"`
 	PasswordFile string             `toml:"password_file"`
 	EnvFile      string             `toml:"env_file"`
 	S3Region     string             `toml:"s3_region"`
 	S3PathStyle  bool               `toml:"s3_path_style"`
 	Retention    *RetentionOverride `toml:"retention"`
+
+	tunnelErr error
+}
+
+func (r Repo) UsesTunnel() bool { return r.TunnelName != "" }
+
+func (c Config) HasTunnelRepos() bool {
+	for _, repo := range c.Repos {
+		if repo.UsesTunnel() {
+			return true
+		}
+	}
+	return false
 }
 
 var allowedRepoEnvKeys = map[string]bool{
@@ -105,14 +150,15 @@ func repoEnvSecretValues(env map[string]string) []string {
 }
 
 type rawConfig struct {
-	StatusPath    string        `toml:"status_path"`
-	ResticPath    string        `toml:"restic_path"`
-	Paths         []string      `toml:"paths"`
-	Excludes      []string      `toml:"excludes"`
-	OneFileSystem bool          `toml:"one_file_system"`
-	PruneMode     string        `toml:"prune_mode"`
-	Retention     *rawRetention `toml:"retention"`
-	Repos         []Repo        `toml:"repo"`
+	StatusPath    string          `toml:"status_path"`
+	ResticPath    string          `toml:"restic_path"`
+	Paths         []string        `toml:"paths"`
+	Excludes      []string        `toml:"excludes"`
+	OneFileSystem bool            `toml:"one_file_system"`
+	PruneMode     string          `toml:"prune_mode"`
+	Retention     *rawRetention   `toml:"retention"`
+	Repos         []Repo          `toml:"repo"`
+	Tunnel        *TunnelSettings `toml:"tunnel"`
 }
 
 type rawRetention = RetentionOverride
@@ -161,6 +207,7 @@ func Load(path string) (Config, error) {
 		PruneMode:     strings.TrimSpace(raw.PruneMode),
 		Retention:     defaultRetention(raw.Retention),
 		Repos:         trimmedRepos(raw.Repos),
+		Tunnel:        trimmedTunnel(raw.Tunnel),
 	}
 	if cfg.StatusPath == "" {
 		cfg.StatusPath = DefaultStatusPath()
@@ -204,8 +251,13 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(repo.Name) == "" {
 			return fmt.Errorf("repo[%d].name is required", i)
 		}
-		if strings.TrimSpace(repo.URL) == "" {
-			return fmt.Errorf("repo[%s].url is required", repo.Name)
+		hasURL := strings.TrimSpace(repo.URL) != ""
+		hasTunnel := strings.TrimSpace(repo.TunnelName) != ""
+		if hasURL == hasTunnel {
+			return fmt.Errorf("repo[%s]: exactly one of url or tunnel_name is required", repo.Name)
+		}
+		if hasTunnel && c.Tunnel == nil {
+			return fmt.Errorf("repo[%s].tunnel_name requires a [tunnel] section (run: sm-agent backup tunnel-enroll)", repo.Name)
 		}
 		if strings.TrimSpace(repo.PasswordFile) == "" {
 			return fmt.Errorf("repo[%s].password_file is required", repo.Name)
@@ -216,6 +268,15 @@ func (c Config) Validate() error {
 		if (repo.S3Region != "" || repo.S3PathStyle) && !strings.HasPrefix(repo.URL, "s3:") {
 			return fmt.Errorf("repo[%s].s3_region/s3_path_style require an s3: url", repo.Name)
 		}
+		if hasTunnel && !tunnelRepoNameRE.MatchString(repo.TunnelName) {
+			return fmt.Errorf("repo[%s].tunnel_name must match %s", repo.Name, tunnelRepoNameRE)
+		}
+		if repo.TunnelNode != "" && !hasTunnel {
+			return fmt.Errorf("repo[%s].tunnel_node requires tunnel_name", repo.Name)
+		}
+		if repo.TunnelNode != "" && c.Tunnel != nil && c.Tunnel.Node(repo.TunnelNode) == nil {
+			return fmt.Errorf("repo[%s].tunnel_node %q has no [[tunnel.node]] entry (re-run: sm-agent backup tunnel-enroll)", repo.Name, repo.TunnelNode)
+		}
 		if err := validateRetention(effectiveRetention(c.Retention, repo.Retention)); err != nil {
 			return fmt.Errorf("repo[%s].retention: %w", repo.Name, err)
 		}
@@ -223,6 +284,58 @@ func (c Config) Validate() error {
 			return fmt.Errorf("repo name %q is duplicated", repo.Name)
 		}
 		seen[repo.Name] = true
+	}
+	if c.Tunnel != nil {
+		if err := c.Tunnel.validate(c.needsServerTunnel()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c Config) needsServerTunnel() bool {
+	for _, repo := range c.Repos {
+		if repo.UsesTunnel() && repo.TunnelNode == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *TunnelSettings) validate(needServer bool) error {
+	if strings.TrimSpace(t.PrivateKeyFile) == "" {
+		return fmt.Errorf("tunnel.private_key_file is required")
+	}
+	if strings.TrimSpace(t.LocalIP) == "" {
+		return fmt.Errorf("tunnel.local_ip is required")
+	}
+	if needServer {
+		if strings.TrimSpace(t.ServerPublicKey) == "" {
+			return fmt.Errorf("tunnel.server_public_key is required")
+		}
+		if strings.TrimSpace(t.Endpoint) == "" {
+			return fmt.Errorf("tunnel.endpoint is required")
+		}
+		if strings.TrimSpace(t.ServerIP) == "" {
+			return fmt.Errorf("tunnel.server_ip is required")
+		}
+		if t.RestPort <= 0 || t.RestPort > 65535 {
+			return fmt.Errorf("tunnel.rest_port must be between 1 and 65535")
+		}
+	}
+	if t.MTU != 0 && (t.MTU < 576 || t.MTU > 1420) {
+		return fmt.Errorf("tunnel.mtu must be between 576 and 1420")
+	}
+	for _, node := range t.Nodes {
+		if strings.TrimSpace(node.Host) == "" {
+			return fmt.Errorf("tunnel.node.host is required")
+		}
+		if strings.TrimSpace(node.PublicKey) == "" || strings.TrimSpace(node.Endpoint) == "" || strings.TrimSpace(node.IP) == "" {
+			return fmt.Errorf("tunnel.node[%s]: public_key, endpoint and ip are required", node.Host)
+		}
+		if node.RestPort <= 0 || node.RestPort > 65535 {
+			return fmt.Errorf("tunnel.node[%s].rest_port must be between 1 and 65535", node.Host)
+		}
 	}
 	return nil
 }
@@ -240,6 +353,7 @@ func normalizedConfig(c Config) Config {
 		c.PruneMode = "host"
 	}
 	c.Repos = trimmedRepos(c.Repos)
+	c.Tunnel = trimmedTunnel(c.Tunnel)
 	return c
 }
 
@@ -274,6 +388,8 @@ func trimmedRepos(repos []Repo) []Repo {
 		out = append(out, Repo{
 			Name:         strings.TrimSpace(repo.Name),
 			URL:          strings.TrimSpace(repo.URL),
+			TunnelName:   strings.TrimSpace(repo.TunnelName),
+			TunnelNode:   strings.TrimSpace(repo.TunnelNode),
 			PasswordFile: strings.TrimSpace(repo.PasswordFile),
 			EnvFile:      strings.TrimSpace(repo.EnvFile),
 			S3Region:     strings.TrimSpace(repo.S3Region),
@@ -283,6 +399,34 @@ func trimmedRepos(repos []Repo) []Repo {
 	}
 	return out
 }
+
+func trimmedTunnel(t *TunnelSettings) *TunnelSettings {
+	if t == nil {
+		return nil
+	}
+	nodes := make([]TunnelNodeSettings, 0, len(t.Nodes))
+	for _, node := range t.Nodes {
+		nodes = append(nodes, TunnelNodeSettings{
+			Host:      strings.TrimSpace(node.Host),
+			PublicKey: strings.TrimSpace(node.PublicKey),
+			Endpoint:  strings.TrimSpace(node.Endpoint),
+			IP:        strings.TrimSpace(node.IP),
+			RestPort:  node.RestPort,
+		})
+	}
+	return &TunnelSettings{
+		PrivateKeyFile:  strings.TrimSpace(t.PrivateKeyFile),
+		ServerPublicKey: strings.TrimSpace(t.ServerPublicKey),
+		Endpoint:        strings.TrimSpace(t.Endpoint),
+		LocalIP:         strings.TrimSpace(t.LocalIP),
+		ServerIP:        strings.TrimSpace(t.ServerIP),
+		RestPort:        t.RestPort,
+		MTU:             t.MTU,
+		Nodes:           nodes,
+	}
+}
+
+var tunnelRepoNameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 func effectiveRetention(base Retention, override *RetentionOverride) Retention {
 	retention := base
