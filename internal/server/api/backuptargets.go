@@ -196,7 +196,10 @@ func revokeBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc 
 	}
 }
 
-func backupTargetDeletable(storedUsedBytes int64, repoHasObjects, repoChecked bool) bool {
+func backupTargetDeletable(storedUsedBytes int64, repoHasObjects, repoChecked, nodeHosted bool) bool {
+	if nodeHosted {
+		return false
+	}
 	if storedUsedBytes > 0 {
 		return false
 	}
@@ -217,8 +220,12 @@ func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 			backupTargetLookupError(w, err)
 			return
 		}
+		if t.NodeHostID != nil {
+			writeError(w, http.StatusConflict, "node-hosted backup targets cannot be deleted because their storage namespace cannot be verified empty; revoke them instead")
+			return
+		}
 		var repoHasObjects bool
-		repoChecked := server != nil && t.NodeHostID == nil
+		repoChecked := server != nil
 		if repoChecked {
 			repoHasObjects, err = server.RepoHasObjects(r.Context(), t.Name)
 			if err != nil {
@@ -226,7 +233,7 @@ func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 				return
 			}
 		}
-		if !backupTargetDeletable(t.UsedBytes, repoHasObjects, repoChecked) {
+		if !backupTargetDeletable(t.UsedBytes, repoHasObjects, repoChecked, false) {
 			writeError(w, http.StatusConflict, "backup target still holds data; revoke it instead, then reclaim space on the storage backend")
 			return
 		}

@@ -53,6 +53,8 @@ services:
       BACKUP_PUBLIC_HTTP: ${BACKUP_PUBLIC_HTTP:-}
     expose:
       - "8080"
+    ports:
+      - "${BACKUP_WG_PORT:-51820}:${BACKUP_WG_PORT:-51820}/udp"
     volumes:
       - appdata:/data
     healthcheck:

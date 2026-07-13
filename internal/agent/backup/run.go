@@ -4,14 +4,20 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/process"
 )
 
 const staleLockAfter = 24 * time.Hour
@@ -245,10 +251,15 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		return nil, false, err
 	}
 	lockPath := filepath.Join(dir, "backup.lock")
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, false, err
+	}
+	token := []byte(fmt.Sprintf("%d %s\n", os.Getpid(), hex.EncodeToString(nonce)))
 	for {
 		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
-			if _, writeErr := fmt.Fprintf(file, "%d\n", os.Getpid()); writeErr != nil {
+			if _, writeErr := file.Write(token); writeErr != nil {
 				_ = file.Close()
 				_ = os.Remove(lockPath)
 				return nil, false, writeErr
@@ -257,7 +268,7 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 				_ = os.Remove(lockPath)
 				return nil, false, closeErr
 			}
-			return func() { _ = os.Remove(lockPath) }, false, nil
+			return func() { releaseRunLock(lockPath, token) }, false, nil
 		}
 		if !os.IsExist(err) {
 			return nil, false, err
@@ -272,8 +283,52 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		if now.Sub(info.ModTime()) < staleLockAfter {
 			return nil, true, nil
 		}
+		owner, readErr := os.ReadFile(lockPath)
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		if readErr != nil {
+			return nil, false, readErr
+		}
+		alive, aliveErr := runLockOwnerAlive(owner)
+		if aliveErr != nil {
+			return nil, false, aliveErr
+		}
+		if alive {
+			return nil, true, nil
+		}
+		current, readErr := os.ReadFile(lockPath)
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		if readErr != nil {
+			return nil, false, readErr
+		}
+		if !bytes.Equal(current, owner) {
+			continue
+		}
 		if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			return nil, false, removeErr
 		}
 	}
+}
+
+func runLockOwnerAlive(token []byte) (bool, error) {
+	fields := strings.Fields(string(token))
+	if len(fields) == 0 {
+		return false, errors.New("backup lock has no owner")
+	}
+	pid, err := strconv.ParseInt(fields[0], 10, 32)
+	if err != nil || pid <= 0 {
+		return false, errors.New("backup lock has an invalid owner")
+	}
+	return process.PidExists(int32(pid))
+}
+
+func releaseRunLock(lockPath string, token []byte) {
+	current, err := os.ReadFile(lockPath)
+	if err != nil || !bytes.Equal(current, token) {
+		return
+	}
+	_ = os.Remove(lockPath)
 }

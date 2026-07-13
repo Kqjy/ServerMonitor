@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -146,6 +147,9 @@ func repoEnvSecretValues(env map[string]string) []string {
 		}
 		out = append(out, value)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return len(out[i]) > len(out[j])
+	})
 	return out
 }
 
@@ -255,6 +259,9 @@ func (c Config) Validate() error {
 		hasTunnel := strings.TrimSpace(repo.TunnelName) != ""
 		if hasURL == hasTunnel {
 			return fmt.Errorf("repo[%s]: exactly one of url or tunnel_name is required", repo.Name)
+		}
+		if hasURL && strings.HasPrefix(strings.ToLower(strings.TrimSpace(repo.URL)), "tunnel:") {
+			return fmt.Errorf("repo[%s]: url uses the tunnel: scheme, which is not a restic backend; tunnel repositories must use tunnel_name (and tunnel_node for a node), then run: sm-agent backup tunnel-enroll (or reinstall with a current installer)", repo.Name)
 		}
 		if hasTunnel && c.Tunnel == nil {
 			return fmt.Errorf("repo[%s].tunnel_name requires a [tunnel] section (run: sm-agent backup tunnel-enroll)", repo.Name)

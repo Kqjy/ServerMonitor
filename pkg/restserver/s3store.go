@@ -24,10 +24,18 @@ type S3Config struct {
 }
 
 type s3Store struct {
-	client   *s3.Client
+	client   s3Client
 	bucket   string
 	prefix   string
 	location string
+}
+
+type s3Client interface {
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 func newS3Store(ctx context.Context, cfg S3Config) (*s3Store, error) {
@@ -116,6 +124,9 @@ func (s *s3Store) Create(ctx context.Context, repo, typ, name string, size int64
 	}
 	if !isNotImplemented(err) {
 		return err
+	}
+	if typ != "locks" {
+		return fmt.Errorf("append-only conditional create is unsupported for %s objects: %w", typ, err)
 	}
 	if _, statErr := s.Stat(ctx, repo, typ, name); statErr == nil {
 		return ErrExists
@@ -267,7 +278,7 @@ func (s *s3Store) RepoHasObjects(ctx context.Context, repo string) (bool, error)
 
 type s3ReadSeeker struct {
 	ctx    context.Context
-	client *s3.Client
+	client s3Client
 	bucket string
 	key    string
 	size   int64

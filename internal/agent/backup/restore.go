@@ -56,7 +56,18 @@ func Restore(ctx context.Context, cfg Config, ro RestoreOptions, opts Options) (
 	if cfg.ResticPath == "" {
 		return RestoreResult{}, fmt.Errorf("restic path is not resolved")
 	}
-	ro, err := resolveRestoreOptions(ro)
+	logger := opts.logger()
+	release, skipped, err := acquireRunLock(cfg.StatusPath, opts.now())
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if skipped {
+		logger.Info("another backup operation is in progress; restore skipped")
+		return RestoreResult{LockSkipped: true}, nil
+	}
+	defer release()
+
+	ro, err = resolveRestoreOptions(ro)
 	if err != nil {
 		return RestoreResult{}, err
 	}
@@ -82,17 +93,6 @@ func Restore(ctx context.Context, cfg Config, ro RestoreOptions, opts Options) (
 			return RestoreResult{}, err
 		}
 	}
-
-	logger := opts.logger()
-	release, skipped, err := acquireRunLock(cfg.StatusPath, opts.now())
-	if err != nil {
-		return RestoreResult{}, err
-	}
-	if skipped {
-		logger.Info("another backup operation is in progress; restore skipped")
-		return RestoreResult{LockSkipped: true}, nil
-	}
-	defer release()
 
 	cfg, session := PrepareTunnel(cfg, opts)
 	if session != nil {

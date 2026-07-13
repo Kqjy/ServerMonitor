@@ -12,18 +12,20 @@ func TestBackupTargetDeletable(t *testing.T) {
 		storedUsed  int64
 		hasObjects  bool
 		repoChecked bool
+		nodeHosted  bool
 		want        bool
 	}{
-		{"empty, backend confirms empty", 0, false, true, true},
-		{"empty, no backend configured", 0, false, false, true},
-		{"stored counter shows data", 4096, false, true, false},
-		{"counter clear but backend holds objects", 0, true, true, false},
-		{"zero-byte objects only (bytes==0 but objects exist)", 0, true, true, false},
-		{"counter clear, backend unknown, stays deletable", 0, true, false, true},
+		{"empty, backend confirms empty", 0, false, true, false, true},
+		{"empty, no backend configured", 0, false, false, false, true},
+		{"stored counter shows data", 4096, false, true, false, false},
+		{"counter clear but backend holds objects", 0, true, true, false, false},
+		{"zero-byte objects only (bytes==0 but objects exist)", 0, true, true, false, false},
+		{"counter clear, backend unknown, stays deletable", 0, true, false, false, true},
+		{"node namespace is never hard-deletable", 0, false, false, true, false},
 	}
 	for _, c := range cases {
-		if got := backupTargetDeletable(c.storedUsed, c.hasObjects, c.repoChecked); got != c.want {
-			t.Errorf("%s: backupTargetDeletable(%d,%v,%v) = %v, want %v", c.name, c.storedUsed, c.hasObjects, c.repoChecked, got, c.want)
+		if got := backupTargetDeletable(c.storedUsed, c.hasObjects, c.repoChecked, c.nodeHosted); got != c.want {
+			t.Errorf("%s: backupTargetDeletable(%d,%v,%v,%v) = %v, want %v", c.name, c.storedUsed, c.hasObjects, c.repoChecked, c.nodeHosted, got, c.want)
 		}
 	}
 }

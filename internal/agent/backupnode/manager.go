@@ -135,13 +135,24 @@ func (m *Manager) reconcile(ctx context.Context) {
 	defer m.mu.Unlock()
 
 	if m.runtime != nil && m.runtime.spec == spec {
-		m.runtime.registry.replaceTargets(cfg.Targets)
+		added := m.runtime.registry.replaceTargets(cfg.Targets)
+		if len(added) > 0 {
+			store, storeErr := restserver.NewDiskStore(spec.storeDir)
+			if storeErr != nil {
+				m.logger.Error("backup node usage measurement failed", "err", storeErr)
+				return
+			}
+			if measureErr := measureTargetUsage(ctx, store, m.runtime.registry, added); measureErr != nil {
+				m.logger.Error("backup node usage measurement failed", "err", measureErr)
+				return
+			}
+		}
 		m.reconcilePeersLocked(cfg.Peers)
 		return
 	}
 
 	m.stopLocked()
-	rt, err := m.startRuntime(key, spec, cfg)
+	rt, err := m.startRuntime(ctx, key, spec, cfg)
 	if err != nil {
 		m.logger.Error("backup node start failed", "err", err)
 		return
@@ -153,10 +164,9 @@ func (m *Manager) reconcile(ctx context.Context) {
 		"store_dir", spec.storeDir,
 		"targets", len(cfg.Targets),
 		"peers", len(cfg.Peers))
-	go m.measureInitialUsage(cfg.Targets, spec.storeDir)
 }
 
-func (m *Manager) startRuntime(key wgtunnel.Key, spec runtimeSpec, cfg wire.BackupNodeConfig) (*nodeRuntime, error) {
+func (m *Manager) startRuntime(ctx context.Context, key wgtunnel.Key, spec runtimeSpec, cfg wire.BackupNodeConfig) (*nodeRuntime, error) {
 	addr, err := netip.ParseAddr(spec.tunnelIP)
 	if err != nil {
 		return nil, fmt.Errorf("tunnel ip: %w", err)
@@ -180,6 +190,12 @@ func (m *Manager) startRuntime(key wgtunnel.Key, spec runtimeSpec, cfg wire.Back
 		return nil, err
 	}
 	registry := newLocalRegistry(cfg.Targets)
+	measureCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	if err := measureTargetUsage(measureCtx, store, registry, cfg.Targets); err != nil {
+		device.Close()
+		return nil, err
+	}
 	restPort := spec.restPort
 	if restPort <= 0 {
 		restPort = restserver.TunnelRestPort
@@ -251,25 +267,15 @@ func (m *Manager) reconcilePeersLocked(infos []wire.NodePeerInfo) {
 	}
 }
 
-func (m *Manager) measureInitialUsage(targets []wire.NodeTargetInfo, storeDir string) {
-	store, err := restserver.NewDiskStore(storeDir)
-	if err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+func measureTargetUsage(ctx context.Context, store restserver.Store, registry *localRegistry, targets []wire.NodeTargetInfo) error {
 	for _, t := range targets {
 		used, err := store.RepoUsage(ctx, t.Name)
 		if err != nil {
-			continue
+			return fmt.Errorf("measure repository %q: %w", t.Name, err)
 		}
-		m.mu.Lock()
-		if m.runtime != nil {
-			m.runtime.registry.setUsed(t.Name, used)
-		}
-		m.mu.Unlock()
+		registry.setUsed(t.Name, used)
 	}
-	m.reportUsage(ctx)
+	return nil
 }
 
 func (m *Manager) stop() bool {
@@ -391,6 +397,7 @@ type localTarget struct {
 	quota   int64
 	used    int64
 	revoked bool
+	ready   bool
 	dirty   bool
 }
 
@@ -407,10 +414,11 @@ func newLocalRegistry(targets []wire.NodeTargetInfo) *localRegistry {
 	return r
 }
 
-func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) {
+func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) []wire.NodeTargetInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	seen := map[string]bool{}
+	added := []wire.NodeTargetInfo{}
 	for _, t := range targets {
 		seen[t.Name] = true
 		raw, err := hex.DecodeString(t.SecretHash)
@@ -429,6 +437,7 @@ func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) {
 		r.nextID++
 		r.byName[t.Name] = &localTarget{id: id, hash: hash, quota: t.QuotaBytes, revoked: t.Revoked}
 		r.byID[id] = t.Name
+		added = append(added, t)
 	}
 	for name, t := range r.byName {
 		if !seen[name] {
@@ -436,6 +445,7 @@ func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) {
 			delete(r.byName, name)
 		}
 	}
+	return added
 }
 
 func (r *localRegistry) setUsed(name string, used int64) {
@@ -443,6 +453,7 @@ func (r *localRegistry) setUsed(name string, used int64) {
 	defer r.mu.Unlock()
 	if t, ok := r.byName[name]; ok {
 		t.used = used
+		t.ready = true
 		t.dirty = true
 	}
 }
@@ -472,14 +483,36 @@ func (r *localRegistry) ResolveTarget(ctx context.Context, repo, secret string) 
 	if subtle.ConstantTimeCompare(t.hash[:], candidate[:]) != 1 {
 		return 0, 0, 0, false, nil
 	}
-	if t.revoked {
+	if t.revoked || !t.ready {
 		return 0, 0, 0, false, nil
 	}
 	return t.id, t.quota, t.used, true, nil
 }
 
-func (r *localRegistry) AddUsage(ctx context.Context, id int64, delta int64) error {
+func (r *localRegistry) ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error) {
+	if delta < 0 {
+		return false, errors.New("backup usage reservation must be non-negative")
+	}
 	if delta == 0 {
+		return true, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name, ok := r.byID[id]
+	if !ok {
+		return false, nil
+	}
+	t := r.byName[name]
+	if t.revoked || !t.ready || t.quota > 0 && (delta > t.quota || t.used > t.quota-delta) {
+		return false, nil
+	}
+	t.used += delta
+	t.dirty = true
+	return true, nil
+}
+
+func (r *localRegistry) ReleaseUsage(ctx context.Context, id int64, delta int64) error {
+	if delta <= 0 {
 		return nil
 	}
 	r.mu.Lock()
@@ -489,7 +522,7 @@ func (r *localRegistry) AddUsage(ctx context.Context, id int64, delta int64) err
 		return nil
 	}
 	t := r.byName[name]
-	t.used += delta
+	t.used -= delta
 	if t.used < 0 {
 		t.used = 0
 	}

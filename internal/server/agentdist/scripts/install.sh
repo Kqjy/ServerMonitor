@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
+CANONICAL_INSTALLER_SHA256='81c7da3a6d8193de0fc64b16afaad9043d6becef0593b81deeecfca4fb8d1c28'
 TOKEN="${SM_TOKEN:-}"
 INTERVAL="${SM_INTERVAL:-10}"
 INSECURE="${SM_INSECURE:-0}"
@@ -125,6 +126,94 @@ backup_toml_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+backup_validate_tunnel_repos() {
+    local url tunnel_name
+    local -a repo_arr
+    BACKUP_HAS_TUNNEL=0
+    IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
+    for url in "${repo_arr[@]}"; do
+        url="$(backup_trim "$url")"
+        case "$url" in
+            tunnel:*)
+                tunnel_name="${url#tunnel:}"
+                if [[ ! "$tunnel_name" =~ ^([A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+$ ]]; then
+                    echo "invalid tunnel repository '$url'; use tunnel:NAME (this server) or tunnel:NODE/NAME (a promoted backup node), each part matching ^[A-Za-z0-9._-]+$" >&2
+                    exit 1
+                fi
+                BACKUP_HAS_TUNNEL=1
+                ;;
+        esac
+    done
+}
+
+backup_preserve_tunnel_section() {
+    BACKUP_PRESERVED_TUNNEL_SECTION=""
+    BACKUP_TUNNEL_SECTION_PRESERVED=0
+    [ -f /etc/servermonitor-backup/backup.toml ] || return 0
+    BACKUP_PRESERVED_TUNNEL_SECTION="$(awk '
+        /^[[:space:]]*\[tunnel\][[:space:]]*$/ { found=1; print; next }
+        found && /^[[:space:]]*\[/ { exit }
+        found { print }
+    ' /etc/servermonitor-backup/backup.toml)"
+    [ -n "$BACKUP_PRESERVED_TUNNEL_SECTION" ] && BACKUP_TUNNEL_SECTION_PRESERVED=1
+}
+
+backup_has_tunnel_section() {
+    [ -f /etc/servermonitor-backup/backup.toml ] && grep -Eq '^[[:space:]]*\[tunnel\][[:space:]]*$' /etc/servermonitor-backup/backup.toml
+}
+
+backup_tunnel_value() {
+    local key="$1"
+    awk -v key="$key" '
+        /^[[:space:]]*\[tunnel\][[:space:]]*$/ { found=1; next }
+        found && /^[[:space:]]*\[/ { exit }
+        found && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            value=$0
+            sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (value ~ /^\".*\"$/) {
+                sub(/^\"/, "", value)
+                sub(/\"$/, "", value)
+            }
+            print value
+            exit
+        }
+    ' /etc/servermonitor-backup/backup.toml
+}
+
+backup_require_tunnel_support() {
+    local usage_output
+    usage_output="$(/usr/local/bin/sm-agent backup 2>&1 || true)"
+    if ! grep -q 'tunnel-enroll' <<< "$usage_output"; then
+        echo "/usr/local/bin/sm-agent does not support backup tunnel-enroll; re-run with SM_REINSTALL=1 to download a current sm-agent" >&2
+        exit 1
+    fi
+}
+
+backup_enroll_tunnel() {
+    local enrolled=0
+    [ -f /etc/servermonitor/agent.toml ] || { echo "/etc/servermonitor/agent.toml not found; cannot enroll the backup tunnel" >&2; exit 1; }
+    if /usr/local/bin/sm-agent backup tunnel-enroll --config /etc/servermonitor-backup/backup.toml --agent-config /etc/servermonitor/agent.toml; then
+        enrolled=1
+    fi
+    if [ -f /etc/servermonitor-backup/tunnel.key ]; then
+        chown root:sm-agent /etc/servermonitor-backup/tunnel.key
+        chmod 0440 /etc/servermonitor-backup/tunnel.key
+    elif [ "$enrolled" = "1" ]; then
+        echo "sm-agent backup tunnel-enroll succeeded but /etc/servermonitor-backup/tunnel.key was not created" >&2
+        exit 1
+    fi
+    if [ "$enrolled" = "1" ]; then
+        return 0
+    fi
+    if [ "$BACKUP_TUNNEL_SECTION_PRESERVED" = "1" ]; then
+        echo "warning: sm-agent backup tunnel-enroll failed; keeping the preserved [tunnel] section and continuing" >&2
+        return 0
+    fi
+    echo "sm-agent backup tunnel-enroll failed and no existing [tunnel] section is available; backups could never work" >&2
+    exit 1
+}
+
 provision_restic() {
     local arch_raw arch sha url tmp bz2
     arch_raw="$(uname -m)"
@@ -216,7 +305,7 @@ backup_write_env_file() {
 }
 
 backup_write_toml() {
-    local tmp i name url first item
+    local tmp i name url tunnel_name tunnel_node first item
     local -a repo_arr name_arr path_arr
     IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
     IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
@@ -247,16 +336,37 @@ backup_write_toml() {
             url="$(backup_trim "$url")"
             [ -z "$url" ] && continue
             name="$(backup_trim "${name_arr[$i]:-}")"
+            tunnel_name=""
+            tunnel_node=""
+            case "$url" in
+                tunnel:*)
+                    tunnel_name="${url#tunnel:}"
+                    case "$tunnel_name" in
+                        */*)
+                            tunnel_node="${tunnel_name%%/*}"
+                            tunnel_name="${tunnel_name#*/}"
+                            ;;
+                    esac
+                    [ -z "$name" ] && name="$tunnel_name"
+                    ;;
+            esac
             [ -z "$name" ] && name="repo$((i+1))"
             echo ""
             echo "[[repo]]"
             printf 'name = "%s"\n' "$(backup_toml_escape "$name")"
-            printf 'url = "%s"\n' "$(backup_toml_escape "$url")"
+            if [ -n "$tunnel_name" ]; then
+                printf 'tunnel_name = "%s"\n' "$(backup_toml_escape "$tunnel_name")"
+                [ -n "$tunnel_node" ] && printf 'tunnel_node = "%s"\n' "$(backup_toml_escape "$tunnel_node")"
+            else
+                printf 'url = "%s"\n' "$(backup_toml_escape "$url")"
+            fi
             echo "password_file = \"/etc/servermonitor-backup/backup.key\""
             case "$url" in
-                s3:*|b2:*|rest:*)
+                s3:*|b2:*|rest:*|tunnel:*)
                     if [ -f /etc/servermonitor-backup/repo-credentials.env ]; then
                         echo "env_file = \"/etc/servermonitor-backup/repo-credentials.env\""
+                    elif [ -n "$tunnel_name" ]; then
+                        printf 'note: repo "%s" targets tunnel: but no REST credentials were provided (set SM_BACKUP_REST_USERNAME/SM_BACKUP_REST_PASSWORD); authentication will fail\n' "$name" >&2
                     else
                         printf 'note: repo "%s" targets %s but no S3/REST credentials were provided (set SM_BACKUP_S3_* or SM_BACKUP_REST_*); authentication will fail\n' "$name" "${url%%:*}:" >&2
                     fi
@@ -270,6 +380,10 @@ backup_write_toml() {
             esac
             i=$((i+1))
         done
+        if [ -n "$BACKUP_PRESERVED_TUNNEL_SECTION" ]; then
+            echo ""
+            printf '%s\n' "$BACKUP_PRESERVED_TUNNEL_SECTION"
+        fi
     } > "$tmp"
     chmod 0640 "$tmp"
     chown root:sm-agent "$tmp"
@@ -420,12 +534,13 @@ NOTE
 }
 
 backup_write_recovery_kit() {
-    local tmp host now i name url
+    local tmp host now i name url tunnel_name tunnel_endpoint line key value
     local -a repo_arr name_arr
     IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
     IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
     host="$(hostname -f 2>/dev/null || hostname)"
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    tunnel_endpoint="$(backup_tunnel_value endpoint)"
     tmp="$(mktemp /etc/servermonitor-backup/recovery-kit.txt.XXXXXX)"
     {
         echo "ServerMonitor backup recovery kit"
@@ -438,13 +553,52 @@ backup_write_recovery_kit() {
             url="$(backup_trim "$url")"
             [ -z "$url" ] && continue
             name="$(backup_trim "${name_arr[$i]:-}")"
-            [ -z "$name" ] && name="repo$((i+1))"
-            echo "  [$name] $url"
+            case "$url" in
+                tunnel:*)
+                    tunnel_name="${url#tunnel:}"
+                    [ -z "$name" ] && name="$tunnel_name"
+                    echo "  [$name] tunnel:$tunnel_name via $tunnel_endpoint"
+                    ;;
+                *)
+                    [ -z "$name" ] && name="repo$((i+1))"
+                    echo "  [$name] $url"
+                    ;;
+            esac
             i=$((i+1))
         done
         echo ""
         echo "repository password:"
         echo "  $(cat /etc/servermonitor-backup/backup.key)"
+        if [ -f /etc/servermonitor-backup/repo-credentials.env ]; then
+            echo ""
+            echo "REST credentials:"
+            while IFS= read -r line; do
+                case "$line" in
+                    RESTIC_REST_USERNAME=*|RESTIC_REST_PASSWORD=*) echo "  $line" ;;
+                esac
+            done < /etc/servermonitor-backup/repo-credentials.env
+        fi
+        if backup_has_tunnel_section; then
+            echo ""
+            echo "wireguard tunnel:"
+            for key in endpoint server_public_key local_ip server_ip rest_port; do
+                value="$(backup_tunnel_value "$key")"
+                echo "  $key: $value"
+            done
+            echo "  tunnel.key contents (WireGuard private key):"
+            if [ -f /etc/servermonitor-backup/tunnel.key ]; then
+                sed 's/^/    /' /etc/servermonitor-backup/tunnel.key
+            else
+                echo "    unavailable"
+            fi
+            echo ""
+            echo "disaster recovery for tunnel repositories:"
+            echo "  1. Register the recovery host or reuse a host token in agent.toml."
+            echo "  2. If the old peer was revoked, run:"
+            echo "     sm-agent backup tunnel-enroll --config backup.toml --agent-config agent.toml"
+            echo "  3. Run: sm-agent backup proxy --config backup.toml"
+            echo "  4. Use the printed RESTIC_REPOSITORY with restic and the repository password above."
+        fi
         echo ""
         echo "restore any repo on a bare machine (needs restic + this password):"
         echo "  restic -r <url> restore latest --target /mnt/recover"
@@ -476,6 +630,7 @@ backup_init_as_agent() {
 }
 
 provision_backup() {
+    backup_validate_tunnel_repos
     backup_migrate_legacy
     if [ ! -f /etc/servermonitor-backup/backup.toml ] && [ -z "$BACKUP_REPOS" ]; then
         err "SM_ENABLE_BACKUP requires SM_BACKUP_REPOS (comma-separated restic repo URLs) on a fresh setup"
@@ -489,6 +644,13 @@ provision_backup() {
         err "SM_BACKUP_S3_ACCESS_KEY_ID and SM_BACKUP_S3_SECRET_ACCESS_KEY must be set together"
     fi
     [ -x /usr/local/bin/sm-agent ] || err "/usr/local/bin/sm-agent not found; the backup unit runs the root-owned agent copy, not the sm-agent-writable one. Re-run with SM_REINSTALL=1 to restore it"
+    if [ -z "$BACKUP_REPOS" ] && [ -f /etc/servermonitor-backup/backup.toml ] && grep -Eq '^[[:space:]]*tunnel_name[[:space:]]*=' /etc/servermonitor-backup/backup.toml; then
+        BACKUP_HAS_TUNNEL=1
+    fi
+    if [ "$BACKUP_HAS_TUNNEL" = "1" ]; then
+        backup_preserve_tunnel_section
+        [ "$RECONFIGURE" = "1" ] && backup_require_tunnel_support
+    fi
     warn_backup_capability
     provision_restic
     install -o root -g sm-agent -m 0750 -d /etc/servermonitor-backup
@@ -505,6 +667,9 @@ provision_backup() {
         printf 'note: SM_BACKUP_REPOS not provided; keeping existing /etc/servermonitor-backup/backup.toml\n'
         chmod 0640 /etc/servermonitor-backup/backup.toml
         chown root:sm-agent /etc/servermonitor-backup/backup.toml
+    fi
+    if [ "$BACKUP_HAS_TUNNEL" = "1" ]; then
+        backup_enroll_tunnel
     fi
     if ! backup_init_as_agent; then
         err "sm-agent backup init failed; backup not scheduled"

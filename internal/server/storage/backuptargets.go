@@ -135,21 +135,56 @@ func (b *BackupTargets) SetUsage(ctx context.Context, id int64, used int64) erro
 	return nil
 }
 
-func (b *BackupTargets) AddUsage(ctx context.Context, id int64, delta int64) error {
-	if delta == 0 {
-		return nil
+func (b *BackupTargets) ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error) {
+	if delta < 0 {
+		return false, errors.New("backup usage reservation must be non-negative")
 	}
-	_, err := b.db.Pool.Exec(ctx, `
-		UPDATE backup_targets SET used_bytes = GREATEST(used_bytes + $2, 0)
-		WHERE id = $1
+	if delta == 0 {
+		return true, nil
+	}
+	tag, err := b.db.Pool.Exec(ctx, `
+		UPDATE backup_targets SET used_bytes = used_bytes + $2
+		WHERE id = $1 AND revoked_at IS NULL
+		  AND (quota_bytes IS NULL OR quota_bytes = 0 OR used_bytes <= quota_bytes - $2)
 	`, id, delta)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
 	}
 	b.mu.Lock()
 	for name, a := range b.byName {
 		if a.id == id {
 			a.used += delta
+			if a.used < 0 {
+				a.used = 0
+			}
+			b.byName[name] = a
+		}
+	}
+	b.mu.Unlock()
+	return true, nil
+}
+
+func (b *BackupTargets) ReleaseUsage(ctx context.Context, id int64, delta int64) error {
+	if delta <= 0 {
+		return nil
+	}
+	tag, err := b.db.Pool.Exec(ctx, `
+		UPDATE backup_targets SET used_bytes = GREATEST(used_bytes - $2, 0)
+		WHERE id = $1
+	`, id, delta)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	b.mu.Lock()
+	for name, a := range b.byName {
+		if a.id == id {
+			a.used -= delta
 			if a.used < 0 {
 				a.used = 0
 			}

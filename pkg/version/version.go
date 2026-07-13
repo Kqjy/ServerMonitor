@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-const Version = "0.3.2"
+const Version = "0.3.3"
 
 func IsNewer(a, b string) bool {
 	return compare(a, b) > 0

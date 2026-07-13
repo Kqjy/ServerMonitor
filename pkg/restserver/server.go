@@ -18,7 +18,8 @@ const restV2ContentType = "application/vnd.x.restic.rest.v2"
 
 type Registry interface {
 	ResolveTarget(ctx context.Context, repo, secret string) (id int64, quotaBytes int64, usedBytes int64, ok bool, err error)
-	AddUsage(ctx context.Context, id int64, delta int64) error
+	ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error)
+	ReleaseUsage(ctx context.Context, id int64, delta int64) error
 }
 
 type Server struct {
@@ -228,26 +229,37 @@ func (s *Server) post(w http.ResponseWriter, r *http.Request, repo, typ, name st
 		http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if t.quota > 0 && t.used+r.ContentLength > t.quota {
+	reserved, err := s.registry.ReserveUsage(r.Context(), t.id, r.ContentLength)
+	if err != nil {
+		s.logger.Warn("backup usage reservation", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !reserved {
 		http.Error(w, "quota exceeded", http.StatusRequestEntityTooLarge)
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, r.ContentLength)
 	if err := s.store.Create(r.Context(), repo, typ, name, r.ContentLength, body); err != nil {
+		var maxErr *http.MaxBytesError
+		definitelyNotCommitted := errors.Is(err, ErrExists) || errors.As(err, &maxErr)
+		if definitelyNotCommitted {
+			if releaseErr := s.registry.ReleaseUsage(context.WithoutCancel(r.Context()), t.id, r.ContentLength); releaseErr != nil {
+				s.logger.Warn("backup usage reservation release", "err", releaseErr)
+			}
+		} else {
+			s.logger.Warn("backup usage reservation retained after ambiguous store failure", "err", err)
+		}
 		if errors.Is(err, ErrExists) {
 			http.Error(w, "object already exists", http.StatusForbidden)
 			return
 		}
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		if maxErr != nil {
 			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		s.storeError(w, err)
 		return
-	}
-	if err := s.registry.AddUsage(r.Context(), t.id, r.ContentLength); err != nil {
-		s.logger.Warn("backup usage accounting", "err", err)
 	}
 	w.WriteHeader(http.StatusOK)
 }

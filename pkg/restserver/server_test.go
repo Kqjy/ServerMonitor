@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +12,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 type fakeTarget struct {
@@ -22,10 +28,14 @@ type fakeTarget struct {
 }
 
 type fakeRegistry struct {
-	targets map[string]fakeTarget
+	mu         sync.Mutex
+	targets    map[string]fakeTarget
+	reserveErr error
 }
 
 func (f *fakeRegistry) ResolveTarget(ctx context.Context, repo, secret string) (int64, int64, int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	t, ok := f.targets[repo]
 	if !ok || t.pass != secret {
 		return 0, 0, 0, false, nil
@@ -33,14 +43,44 @@ func (f *fakeRegistry) ResolveTarget(ctx context.Context, repo, secret string) (
 	return t.id, t.quota, t.used, true, nil
 }
 
-func (f *fakeRegistry) AddUsage(ctx context.Context, id int64, delta int64) error {
+func (f *fakeRegistry) ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reserveErr != nil {
+		return false, f.reserveErr
+	}
 	for k, t := range f.targets {
 		if t.id == id {
+			if t.quota > 0 && (delta > t.quota || t.used > t.quota-delta) {
+				return false, nil
+			}
 			t.used += delta
+			f.targets[k] = t
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeRegistry) ReleaseUsage(ctx context.Context, id int64, delta int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, t := range f.targets {
+		if t.id == id {
+			t.used -= delta
+			if t.used < 0 {
+				t.used = 0
+			}
 			f.targets[k] = t
 		}
 	}
 	return nil
+}
+
+func (f *fakeRegistry) used(repo string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.targets[repo].used
 }
 
 const dataName = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -202,6 +242,89 @@ func TestQuotaEnforced(t *testing.T) {
 	}
 }
 
+func TestQuotaReservationIsAtomicAcrossConcurrentUploads(t *testing.T) {
+	reg := &fakeRegistry{targets: map[string]fakeTarget{
+		"host1": {id: 1, pass: "secret", quota: 10},
+	}}
+	ts := newTestServer(t, reg)
+	paths := []string{"/host1/data/" + dataName, "/host1/data/" + strings.Repeat("b", 64)}
+	start := make(chan struct{})
+	statuses := make(chan int, len(paths))
+	for _, path := range paths {
+		go func() {
+			<-start
+			resp := do(t, ts, http.MethodPost, path, "host1", "secret", []byte("123456"), nil)
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	close(start)
+	counts := map[int]int{}
+	for range paths {
+		counts[<-statuses]++
+	}
+	if counts[http.StatusOK] != 1 || counts[http.StatusRequestEntityTooLarge] != 1 {
+		t.Fatalf("concurrent quota statuses = %#v", counts)
+	}
+	if got := reg.used("host1"); got != 6 {
+		t.Fatalf("reserved usage = %d, want 6", got)
+	}
+}
+
+func TestUsageReservationFailurePreventsCommit(t *testing.T) {
+	reg := &fakeRegistry{
+		targets:    map[string]fakeTarget{"host1": {id: 1, pass: "secret"}},
+		reserveErr: errors.New("accounting unavailable"),
+	}
+	ts := newTestServer(t, reg)
+	resp := do(t, ts, http.MethodPost, "/host1/data/"+dataName, "host1", "secret", []byte("payload"), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("reservation failure status = %d, want 500", resp.StatusCode)
+	}
+	reg.mu.Lock()
+	reg.reserveErr = nil
+	reg.mu.Unlock()
+	head := do(t, ts, http.MethodHead, "/host1/data/"+dataName, "host1", "secret", nil, nil)
+	head.Body.Close()
+	if head.StatusCode != http.StatusNotFound {
+		t.Fatalf("object committed without accounting: status=%d", head.StatusCode)
+	}
+}
+
+type commitThenErrorStore struct {
+	Store
+}
+
+func (s commitThenErrorStore) Create(ctx context.Context, repo, typ, name string, size int64, r io.Reader) error {
+	if err := s.Store.Create(ctx, repo, typ, name, size, r); err != nil {
+		return err
+	}
+	return errors.New("response lost after commit")
+}
+
+func TestAmbiguousStoreFailureRetainsUsageReservation(t *testing.T) {
+	reg := &fakeRegistry{targets: map[string]fakeTarget{"host1": {id: 1, pass: "secret"}}}
+	disk, err := NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("disk store: %v", err)
+	}
+	ts := httptest.NewServer(New(commitThenErrorStore{Store: disk}, reg, 1<<20, nil).Routes())
+	t.Cleanup(ts.Close)
+	body := []byte("payload")
+	resp := do(t, ts, http.MethodPost, "/host1/data/"+dataName, "host1", "secret", body, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("ambiguous commit status = %d, want 500", resp.StatusCode)
+	}
+	if got := reg.used("host1"); got != int64(len(body)) {
+		t.Fatalf("usage after ambiguous committed write = %d, want %d", got, len(body))
+	}
+	if size, err := disk.Stat(context.Background(), "host1", "data", dataName); err != nil || size != int64(len(body)) {
+		t.Fatalf("committed object = size %d err %v", size, err)
+	}
+}
+
 func TestResticRoundTripAppendOnly(t *testing.T) {
 	resticBin, err := exec.LookPath("restic")
 	if err != nil {
@@ -319,5 +442,61 @@ func TestDiskStoreRepoHasObjects(t *testing.T) {
 	}
 	if has, err := store.RepoHasObjects(ctx, "zerobyte"); err != nil || !has {
 		t.Fatalf("repo with a zero-byte object: has=%v err=%v, want has=true", has, err)
+	}
+}
+
+type fakeS3Client struct {
+	conditionalPuts   int
+	unconditionalPuts int
+	heads             int
+}
+
+func (f *fakeS3Client) PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if aws.ToString(in.IfNoneMatch) == "*" {
+		f.conditionalPuts++
+		return nil, &smithy.GenericAPIError{Code: "NotImplemented", Message: "conditional put unsupported"}
+	}
+	f.unconditionalPuts++
+	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeS3Client) HeadObject(ctx context.Context, in *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	f.heads++
+	return nil, &smithy.GenericAPIError{Code: "NotFound", Message: "missing"}
+}
+
+func (f *fakeS3Client) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	return nil, errors.New("unexpected get")
+}
+
+func (f *fakeS3Client) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	return nil, errors.New("unexpected list")
+}
+
+func (f *fakeS3Client) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	return nil, errors.New("unexpected delete")
+}
+
+func TestS3ConditionalCreateUnsupportedFailsClosedForImmutableObjects(t *testing.T) {
+	client := &fakeS3Client{}
+	store := &s3Store{client: client, bucket: "bucket", prefix: "backups"}
+	err := store.Create(context.Background(), "host1", "data", dataName, 3, strings.NewReader("abc"))
+	if err == nil || !strings.Contains(err.Error(), "append-only conditional create is unsupported") {
+		t.Fatalf("immutable create error = %v", err)
+	}
+	if client.conditionalPuts != 1 || client.unconditionalPuts != 0 || client.heads != 0 {
+		t.Fatalf("immutable create calls = conditional %d unconditional %d heads %d", client.conditionalPuts, client.unconditionalPuts, client.heads)
+	}
+}
+
+func TestS3ConditionalCreateUnsupportedFallsBackOnlyForLocks(t *testing.T) {
+	client := &fakeS3Client{}
+	store := &s3Store{client: client, bucket: "bucket", prefix: "backups"}
+	err := store.Create(context.Background(), "host1", "locks", dataName, 3, strings.NewReader("abc"))
+	if err != nil {
+		t.Fatalf("lock create: %v", err)
+	}
+	if client.conditionalPuts != 1 || client.unconditionalPuts != 1 || client.heads != 1 {
+		t.Fatalf("lock create calls = conditional %d unconditional %d heads %d", client.conditionalPuts, client.unconditionalPuts, client.heads)
 	}
 }

@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -288,6 +289,16 @@ name = "repo1"
 url = "rest:https://example/repo"
 `,
 			want: "password_file is required",
+		},
+		{
+			name: "tunnel scheme in url",
+			body: `paths = ["/etc"]
+[[repo]]
+name = "repo1"
+url = "tunnel:node/repo1"
+password_file = "/key"
+`,
+			want: "url uses the tunnel: scheme, which is not a restic backend",
 		},
 		{
 			name: "duplicate repo",
@@ -647,7 +658,7 @@ func TestLockNoopAndStaleTakeover(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(lockPath, []byte("123\n"), 0o644); err != nil {
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d active\n", os.Getpid())), 0o644); err != nil {
 		t.Fatalf("write lock: %v", err)
 	}
 	runner := newFakeResticRunner()
@@ -665,6 +676,19 @@ func TestLockNoopAndStaleTakeover(t *testing.T) {
 	}
 	result, err = Run(context.Background(), cfg, Options{Runner: runner})
 	if err != nil {
+		t.Fatalf("Run old live lock: %v", err)
+	}
+	if !result.LockSkipped || len(runner.calls) != 0 {
+		t.Fatalf("old live owner lock must not be stolen, result=%#v calls=%#v", result, runner.calls)
+	}
+	if err := os.WriteFile(lockPath, []byte("2147483647 dead\n"), 0o644); err != nil {
+		t.Fatalf("write dead lock: %v", err)
+	}
+	if err := os.Chtimes(lockPath, stale, stale); err != nil {
+		t.Fatalf("chtimes dead lock: %v", err)
+	}
+	result, err = Run(context.Background(), cfg, Options{Runner: runner})
+	if err != nil {
 		t.Fatalf("Run stale: %v", err)
 	}
 	if !result.AnySucceeded() {
@@ -672,6 +696,27 @@ func TestLockNoopAndStaleTakeover(t *testing.T) {
 	}
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Fatalf("lock should be removed after run, stat err=%v", err)
+	}
+}
+
+func TestRunLockReleaseKeepsReplacementOwner(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	release, skipped, err := acquireRunLock(statusPath, time.Now())
+	if err != nil || skipped {
+		t.Fatalf("acquireRunLock: skipped=%v err=%v", skipped, err)
+	}
+	lockPath := filepath.Join(filepath.Dir(statusPath), "backup.lock")
+	replacement := []byte("2147483647 replacement\n")
+	if err := os.WriteFile(lockPath, replacement, 0o644); err != nil {
+		t.Fatalf("replace lock owner: %v", err)
+	}
+	release()
+	got, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("replacement lock removed: %v", err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement lock changed: %q", got)
 	}
 }
 
@@ -867,6 +912,19 @@ func TestSanitizeResticTextScrubsSecrets(t *testing.T) {
 	}
 	if !strings.Contains(got, "us-east-1") {
 		t.Fatalf("region should not be scrubbed: %q", got)
+	}
+}
+
+func TestSanitizeResticTextScrubsOverlappingSecretsLongestFirst(t *testing.T) {
+	repoEnv := map[string]string{
+		"RESTIC_REST_USERNAME": "tenant",
+		"RESTIC_REST_PASSWORD": "tenant-supersecret",
+	}
+	got := sanitizeResticText("login tenant with tenant-supersecret", Repo{}, repoEnv)
+	for _, leaked := range []string{"tenant", "supersecret"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("overlapping secret leaked %q in %q", leaked, got)
+		}
 	}
 }
 
