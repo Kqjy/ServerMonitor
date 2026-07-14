@@ -262,10 +262,11 @@ func TestRestoreInPlaceRefusedOnWindows(t *testing.T) {
 
 func TestDrillLivePath(t *testing.T) {
 	cases := []struct {
-		name string
-		path string
-		goos string
-		want string
+		name     string
+		path     string
+		goos     string
+		hostRoot string
+		want     string
 	}{
 		{name: "windows drive", path: "/C/Users/foo/file.txt", goos: "windows", want: `C:\Users\foo\file.txt`},
 		{name: "windows lowercase drive", path: "/d/data/x", goos: "windows", want: `d:\data\x`},
@@ -273,11 +274,12 @@ func TestDrillLivePath(t *testing.T) {
 		{name: "windows non-drive prefix", path: "/CC/Users/foo", goos: "windows", want: `\CC\Users\foo`},
 		{name: "linux untouched", path: "/etc/nginx/nginx.conf", goos: "linux", want: "/etc/nginx/nginx.conf"},
 		{name: "linux single-letter dir untouched", path: "/C/data", goos: "linux", want: "/C/data"},
+		{name: "linux host root prefix", path: "/etc/hosts", goos: "linux", hostRoot: "/host", want: "/host/etc/hosts"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := drillLivePath(tc.path, tc.goos); got != tc.want {
-				t.Fatalf("drillLivePath(%q, %q) = %q, want %q", tc.path, tc.goos, got, tc.want)
+			if got := drillLivePath(tc.path, tc.goos, tc.hostRoot); got != tc.want {
+				t.Fatalf("drillLivePath(%q, %q, %q) = %q, want %q", tc.path, tc.goos, tc.hostRoot, got, tc.want)
 			}
 		})
 	}

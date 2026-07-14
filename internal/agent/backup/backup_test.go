@@ -65,9 +65,10 @@ func newFakeResticRunner() *fakeResticRunner {
 
 func (r *fakeResticRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
 	r.calls = append(r.calls, Command{
-		Path: command.Path,
-		Args: append([]string(nil), command.Args...),
-		Env:  append([]string(nil), command.Env...),
+		Path:   command.Path,
+		Args:   append([]string(nil), command.Args...),
+		Env:    append([]string(nil), command.Env...),
+		Chroot: command.Chroot,
 	})
 	key := resticCallKey(command)
 	queue := r.responses[key]
@@ -982,7 +983,7 @@ func TestWithResticEnvPrecedence(t *testing.T) {
 		"RESTIC_REPOSITORY": "s3:https://evil/override",
 		"AWS_ACCESS_KEY_ID": "AKIA123",
 	}
-	env := withResticEnv(repo, "/cache", repoEnv)
+	env := withResticEnv(repo, "/cache", "", repoEnv)
 	if envValue(env, "RESTIC_REPOSITORY") != "s3:https://example/bucket" {
 		t.Fatalf("repo URL must win over env file: %q", envValue(env, "RESTIC_REPOSITORY"))
 	}
@@ -998,7 +999,7 @@ func TestWithResticEnvStripsAmbientPasswordOverrides(t *testing.T) {
 	t.Setenv("RESTIC_PASSWORD", "ambient-plaintext")
 	t.Setenv("RESTIC_PASSWORD_COMMAND", "echo leak")
 	t.Setenv("RESTIC_REPOSITORY_FILE", "/tmp/other-repo")
-	env := withResticEnv(Repo{URL: "rest:https://example/repo", PasswordFile: "/key"}, "/cache", map[string]string{})
+	env := withResticEnv(Repo{URL: "rest:https://example/repo", PasswordFile: "/key"}, "/cache", "", map[string]string{})
 	for _, key := range []string{"RESTIC_PASSWORD", "RESTIC_PASSWORD_COMMAND", "RESTIC_REPOSITORY_FILE"} {
 		if envValue(env, key) != "" {
 			t.Fatalf("%s should be stripped so the configured password_file/repo wins, got %q", key, envValue(env, key))

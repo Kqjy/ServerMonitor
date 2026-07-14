@@ -16,6 +16,7 @@ func TestBackupMetricsMeta(t *testing.T) {
 		{BackupSnapshotCount, "backup_snapshot_count", "count"},
 		{BackupCheckAgeS, "backup_check_age_s", "s"},
 		{BackupCheckOK, "backup_check_ok", "bool"},
+		{BackupAgentStale, "backup_agent_stale", "bool"},
 	}
 	for _, tc := range cases {
 		got := tc.id.Meta()

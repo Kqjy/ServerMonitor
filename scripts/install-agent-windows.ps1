@@ -47,8 +47,9 @@ $Reconfigure = (-not $Reinstall) -and (Test-Path -LiteralPath $cfgPath0)
 if ($Reconfigure) {
     Write-Host ''
     Write-Host 'reconfiguring the existing sm-agent install in place: re-applying the service'
-    Write-Host 'account, privileges, and group memberships, keeping the current identity and'
-    Write-Host 'binary. No re-registration and no admin token needed. Pass -Reinstall (or set'
+    Write-Host 'account, privileges, and group memberships, keeping the current identity. When'
+    Write-Host '-BinaryPath is given, both agent copies are refreshed if its version differs.'
+    Write-Host 'No re-registration and no admin token needed. Pass -Reinstall (or set'
     Write-Host '$env:SM_REINSTALL=1) to force a full fresh install instead.'
     Write-Host ''
 }
@@ -601,12 +602,24 @@ Lock-Acl -Path $runtimeDir -ServiceAccess Modify
 
 $exe        = Join-Path $installDir 'sm-agent.exe'
 $runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
+$script:refreshBinaries = $false
+$oldBinaryVersion = ''
+$newBinaryVersion = ''
 if ($Reconfigure) {
     if (-not (Test-Path -LiteralPath $runtimeExe)) {
         throw "found $cfgPath0 but no agent binary at $runtimeExe; re-run with -Reinstall for a full install"
     }
     if (Test-Path -LiteralPath $exe) { Lock-Acl -Path $exe -ServiceAccess Read }
     Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+    if ($BinaryPath -and (Test-Path -LiteralPath $BinaryPath)) {
+        $newBinaryVersion = (& $BinaryPath --version | Out-String).Trim()
+        if (Test-Path -LiteralPath $exe) {
+            $oldBinaryVersion = (& $exe --version | Out-String).Trim()
+        }
+        if ($newBinaryVersion -ne $oldBinaryVersion) {
+            $script:refreshBinaries = $true
+        }
+    }
 } else {
     Copy-Item -Force -Path $BinaryPath -Destination $exe
     Copy-Item -Force -Path $BinaryPath -Destination $runtimeExe
@@ -652,6 +665,14 @@ if ($svc) {
     Stop-Service -Name 'sm-agent' -Force -ErrorAction SilentlyContinue
     & sc.exe delete sm-agent | Out-Null
     Start-Sleep -Seconds 1
+}
+
+if ($script:refreshBinaries) {
+    Copy-Item -Force -Path $BinaryPath -Destination $exe
+    Copy-Item -Force -Path $BinaryPath -Destination $runtimeExe
+    Lock-Acl -Path $exe -ServiceAccess Read
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+    Write-Host "refreshed sm-agent binaries ($oldBinaryVersion -> $newBinaryVersion)"
 }
 
 $bin = "`"$runtimeExe`" --config `"$cfgPath`""

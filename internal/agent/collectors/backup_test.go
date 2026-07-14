@@ -2,13 +2,16 @@ package collectors
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"servermonitor/pkg/metrics"
+	"servermonitor/pkg/version"
 	"servermonitor/pkg/wire"
 )
 
@@ -16,6 +19,8 @@ func testBackupCollector(path string, now time.Time) *backupCollector {
 	c := newBackupCollector(path)
 	c.now = func() time.Time { return now }
 	c.queryNextRun = func(context.Context) *time.Time { return nil }
+	c.privPath = ""
+	c.execVersion = func(context.Context, string) (string, error) { return "", nil }
 	return c
 }
 
@@ -37,6 +42,190 @@ func backupPointMap(points []wire.Point) map[string]float64 {
 		out[p.Labels["repo"]+"|"+p.Metric.Meta().Name] = p.Value
 	}
 	return out
+}
+
+func backupMetricValue(points []wire.Point, id metrics.ID) (float64, bool) {
+	for _, p := range points {
+		if p.Metric == id {
+			return p.Value, true
+		}
+	}
+	return 0, false
+}
+
+func enableBackupAgentDrift(t *testing.T, c *backupCollector, rawVersion string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sm-agent")
+	if err := os.WriteFile(path, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("write privileged agent: %v", err)
+	}
+	c.privPath = path
+	c.execVersion = func(context.Context, string) (string, error) { return rawVersion, nil }
+	return path
+}
+
+func TestParseAgentVersion(t *testing.T) {
+	got, ok := parseAgentVersion("sm-agent 0.2.0\n")
+	if !ok || got != "0.2.0" {
+		t.Fatalf("parseAgentVersion = %q,%v, want 0.2.0,true", got, ok)
+	}
+	if got, ok := parseAgentVersion("garbage"); ok || got != "" {
+		t.Fatalf("parseAgentVersion garbage = %q,%v, want empty,false", got, ok)
+	}
+}
+
+func TestBackupCollectorOlderPrivilegedAgent(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+	c := testBackupCollector(statusPath, now)
+	enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 1 {
+		t.Fatalf("backup_agent_stale = %v,%v, want 1,true", value, ok)
+	}
+	status := c.Status()
+	if status.State != backupStateStaleAgent {
+		t.Fatalf("state = %q, want %q", status.State, backupStateStaleAgent)
+	}
+	if !strings.Contains(status.Message, "v0.1.0") || !strings.Contains(status.Message, "v"+version.Version) {
+		t.Fatalf("message = %q, want both versions", status.Message)
+	}
+}
+
+func TestBackupCollectorCurrentPrivilegedAgent(t *testing.T) {
+	for _, privilegedVersion := range []string{version.Version, "999.0.0"} {
+		t.Run(privilegedVersion, func(t *testing.T) {
+			now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+			statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+			writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+			c := testBackupCollector(statusPath, now)
+			enableBackupAgentDrift(t, c, "sm-agent "+privilegedVersion+"\n")
+			points, err := c.Collect(context.Background())
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 0 {
+				t.Fatalf("backup_agent_stale = %v,%v, want 0,true", value, ok)
+			}
+			if state := c.Status().State; state != backupStateOK {
+				t.Fatalf("state = %q, want %q", state, backupStateOK)
+			}
+		})
+	}
+}
+
+func TestBackupCollectorUnavailablePrivilegedAgent(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+	tests := []struct {
+		name      string
+		configure func(*backupCollector)
+	}{
+		{"missing", func(c *backupCollector) { c.privPath = filepath.Join(t.TempDir(), "missing") }},
+		{"resident", func(c *backupCollector) {
+			path, err := os.Executable()
+			if err != nil {
+				t.Fatalf("os.Executable: %v", err)
+			}
+			c.privPath = path
+		}},
+		{"exec error", func(c *backupCollector) {
+			enableBackupAgentDrift(t, c, "")
+			c.execVersion = func(context.Context, string) (string, error) { return "", errors.New("failed") }
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testBackupCollector(statusPath, now)
+			tc.configure(c)
+			points, err := c.Collect(context.Background())
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if _, ok := backupMetricValue(points, metrics.BackupAgentStale); ok {
+				t.Fatalf("unexpected backup_agent_stale point: %#v", points)
+			}
+			if state := c.Status().State; state != backupStateOK {
+				t.Fatalf("state = %q, want %q", state, backupStateOK)
+			}
+		})
+	}
+}
+
+func TestBackupCollectorDriftDoesNotOverrideStatus(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		body      string
+		mtime     time.Time
+		wantState string
+	}{
+		{"error", "{", time.Time{}, backupStateError},
+		{"not configured", "", time.Time{}, backupStateNotConfigured},
+		{"stale", `{"version":1,"repos":[]}`, now.Add(-27 * time.Hour), backupStateStale},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+			if tc.body != "" {
+				writeBackupStatus(t, statusPath, tc.body)
+				if !tc.mtime.IsZero() {
+					if err := os.Chtimes(statusPath, tc.mtime, tc.mtime); err != nil {
+						t.Fatalf("chtimes: %v", err)
+					}
+				}
+			}
+			c := testBackupCollector(statusPath, now)
+			enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
+			points, err := c.Collect(context.Background())
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 1 {
+				t.Fatalf("backup_agent_stale = %v,%v, want 1,true", value, ok)
+			}
+			if state := c.Status().State; state != tc.wantState {
+				t.Fatalf("state = %q, want %q", state, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestBackupCollectorPrivilegedAgentFingerprintCache(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+	c := testBackupCollector(statusPath, now)
+	privPath := enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
+	calls := 0
+	c.execVersion = func(context.Context, string) (string, error) {
+		calls++
+		return "sm-agent 0.1.0\n", nil
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect first: %v", err)
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect second: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("execVersion calls = %d, want 1", calls)
+	}
+	touched := now.Add(time.Minute)
+	if err := os.Chtimes(privPath, touched, touched); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect touched: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("execVersion calls after touch = %d, want 2", calls)
+	}
 }
 
 func TestBackupCollectorMissingFile(t *testing.T) {
@@ -238,6 +427,8 @@ func TestBackupCollectorInventoryThrottle(t *testing.T) {
 	c := newBackupCollector(path)
 	c.now = func() time.Time { return now }
 	c.queryNextRun = func(context.Context) *time.Time { return nil }
+	c.privPath = ""
+	c.execVersion = func(context.Context, string) (string, error) { return "", nil }
 
 	first, err := c.CollectBackups(context.Background())
 	if err != nil {
@@ -450,7 +641,7 @@ func TestBackupStatusTruncatesSnapshots(t *testing.T) {
 }
 
 func TestBackupMetricIDs(t *testing.T) {
-	if metrics.BackupLastSuccessAgeS != 1000 || metrics.BackupCheckOK != 1007 {
+	if metrics.BackupLastSuccessAgeS != 1000 || metrics.BackupCheckOK != 1007 || metrics.BackupAgentStale != 1013 {
 		t.Fatalf("backup metric ID block changed")
 	}
 }

@@ -94,8 +94,8 @@
       <h2 class="text-sm font-medium text-zinc-100">Reconfigure agent</h2>
       <p class="mt-1 text-[11px] text-zinc-500">
         Run this on <span class="font-mono text-zinc-400">{host.hostname}</span>. The installer detects the existing
-        agent and restarts it with the chosen capabilities — no token, no re-registration, identity and binary
-        unchanged.
+        agent and restarts it with the chosen capabilities — no token, no re-registration, identity unchanged;
+        the agent binary is refreshed from the server if its version differs.
       </p>
     </header>
 

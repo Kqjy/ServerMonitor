@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.2.6 .
-docker push registry.example.com/servermonitor-agent:0.2.6
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.5 .
+docker push registry.example.com/servermonitor-agent:0.3.5
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.2.6
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.5
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -121,7 +121,36 @@ On the host install, note that `--enable-smart` (`CAP_SYS_RAWIO` + `disk` group)
 
 ### Managed backups
 
-Not supported from the containerized agent — `--enable-backup` and the `sm-agent backup` machinery are host-install only for now. The backup job needs to read the host's real filesystem with its own capability grant and its own systemd timer, none of which this recipe provides. Use the host install on machines you want backed up; see [BACKUPS.md](BACKUPS.md).
+The containerized agent can back up its host itself — no second host-installed agent. It provisions its own restic setup into the `sm-agent-state` volume and runs a scheduled backup + weekly integrity check, reporting to the same host under its **Backups** tab.
+
+**Enable it.** Create a repository on the server first (**Backups → New repository**) to get a `rest:` URL + upload credential, then add to `.env.agent`:
+
+```ini
+SM_ENABLE_BACKUP=1
+SM_BACKUP_REPOS=rest:https://monitor.example.com/backup/web-07
+SM_BACKUP_REST_USERNAME=web-07
+SM_BACKUP_REST_PASSWORD=<the minted credential>
+SM_BACKUP_TIME=02:30
+```
+
+Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `TZ` (so `SM_BACKUP_TIME` is interpreted in your zone). Repos must be **remote** (`rest:`/`s3:`/`b2:`/`sftp:`); `tunnel:` repositories are host-install only for now.
+
+**What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume **mounted twice** (`/var/lib/servermonitor` and `/host/var/lib/servermonitor`).
+
+**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. Each backup runs restic **chrooted into `/host`**, so snapshots record host-native paths (`/etc`, not `/host/etc`) and are interchangeable with a host-installed agent's snapshots. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot).
+
+**Recovery kit — do this once, keep it offline:**
+
+```bash
+docker compose -f deploy/docker-compose.agent.yml exec sm-agent \
+  /usr/local/bin/sm-agent backup recovery-kit
+```
+
+It prints the repository password. **`docker compose down -v` destroys the volume and the key** — without the kit, existing backups become unrecoverable ciphertext.
+
+**Restore is staging-only.** `sm-agent backup restore …` restores into `/var/lib/servermonitor/restore/<snapshot>/` inside the volume; copy it onto the host with `docker cp`. In-place restore is refused from a container (restoring to `/` would hit the container, and `/host` is read-only); restore in place from the host runbook instead. See [BACKUPS.md](BACKUPS.md).
+
+**Security notes.** Backups add **no new host-read power** — the resident agent already holds `CAP_DAC_READ_SEARCH` over `/host`. The real root-equivalence is the **Docker socket**; put a read-only socket proxy in front (see the socket note above) when backups are on. Keep `prune_mode = external` (the default) so a compromised agent can add snapshots but not delete history against an append-only endpoint. On rootless Docker or SELinux-enforcing hosts, verify `chroot` + the nested rw-over-ro `/host` mount work before relying on it.
 
 ### Port / process owner attribution
 

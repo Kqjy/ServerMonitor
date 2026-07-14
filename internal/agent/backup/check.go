@@ -63,6 +63,9 @@ func Check(ctx context.Context, cfg Config, co CheckOptions, opts Options) (Chec
 	if err := cfg.Validate(); err != nil {
 		return CheckResult{}, err
 	}
+	if err := validateHostRoot(opts.HostRoot); err != nil {
+		return CheckResult{}, err
+	}
 	if cfg.ResticPath == "" {
 		return CheckResult{}, fmt.Errorf("restic path is not resolved")
 	}
@@ -274,7 +277,7 @@ func runDrill(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts 
 
 	for _, file := range sample {
 		restored := filepath.Join(tmpRoot, filepath.FromSlash(file.Path))
-		live := drillLivePath(file.Path, opts.goos())
+		live := drillLivePath(file.Path, opts.goos(), opts.HostRoot)
 		decision, err := compareDrillFile(restored, live, snapshot.Time)
 		if err != nil {
 			return err
@@ -286,8 +289,11 @@ func runDrill(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts 
 	return nil
 }
 
-func drillLivePath(lsPath, goos string) string {
+func drillLivePath(lsPath, goos, hostRoot string) string {
 	if goos != "windows" {
+		if hostRoot != "" {
+			return hostRoot + lsPath
+		}
 		return lsPath
 	}
 	trimmed := strings.TrimPrefix(lsPath, "/")

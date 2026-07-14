@@ -34,7 +34,7 @@ if ($env:SM_BACKUP_S3_PATH_STYLE -eq '1') { $BackupS3PathStyle = $true }
 
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
-$CanonicalInstallerSha256 = '56d6d3922a5c9ea3a6eab783fe38dde4bdc38e170043a2c75a69fcae548d18f5'
+$CanonicalInstallerSha256 = '0a2416643cb25b83b2d6358157478d6fc7cab2e646a8238a2ae4f621e2cf8b92'
 $ResticVersion = '0.19.0'
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -47,9 +47,9 @@ $Reconfigure = (-not $Reinstall) -and (Test-Path -LiteralPath $cfgPath)
 if ($Reconfigure) {
     Write-Host ''
     Write-Host 'reconfiguring the existing sm-agent install in place: re-applying the service'
-    Write-Host 'account, privileges, and group memberships, keeping the current identity and'
-    Write-Host 'binary. No re-download and no token needed. Set $env:SM_REINSTALL=1 to force a'
-    Write-Host 'full fresh install instead.'
+    Write-Host 'account, privileges, and group memberships, keeping the current identity. The'
+    Write-Host 'binary is refreshed from the server when its version differs. No re-registration'
+    Write-Host 'or token input is needed. Set $env:SM_REINSTALL=1 to force a full fresh install.'
     Write-Host ''
 }
 
@@ -635,6 +635,10 @@ $exe        = Join-Path $installDir 'sm-agent.exe'
 $runtimeExe = Join-Path $runtimeDir 'sm-agent.exe'
 $cfgPath    = Join-Path $configDir 'agent.toml'
 $spoolPath  = Join-Path $configDir 'spool.db'
+$script:refreshBinaries = $false
+$oldBinaryVersion = ''
+$newBinaryVersion = ''
+$refreshTmp = ''
 
 if ($Reconfigure) {
     if (-not (Test-Path -LiteralPath $runtimeExe)) {
@@ -644,6 +648,25 @@ if ($Reconfigure) {
     Lock-Acl -Path $runtimeExe -ServiceAccess Modify
     Lock-Acl -Path $cfgPath    -ServiceAccess Modify
     if (Test-Path -LiteralPath $spoolPath) { Lock-Acl -Path $spoolPath -ServiceAccess Modify }
+    $cfgText = [System.IO.File]::ReadAllText($cfgPath)
+    $tokenMatch = [regex]::Match($cfgText, '(?m)^token\s*=\s*"([^"]*)"')
+    if (-not $tokenMatch.Success -or -not $tokenMatch.Groups[1].Value) {
+        Write-Warning "could not read the agent token from $cfgPath; keeping the current sm-agent binaries"
+    } else {
+        if ($Insecure -or ($cfgText -match '(?m)^insecure_skip_verify\s*=\s*true')) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        $refreshTmp = Join-Path $env:TEMP ('sm-agent-' + [System.IO.Path]::GetRandomFileName())
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=windows-amd64" -Headers @{ 'X-Agent-Token' = $tokenMatch.Groups[1].Value } -OutFile $refreshTmp
+            $newBinaryVersion = (& $refreshTmp --version | Out-String).Trim()
+            if (Test-Path -LiteralPath $exe) { $oldBinaryVersion = (& $exe --version | Out-String).Trim() }
+            if ($newBinaryVersion -and ($newBinaryVersion -ne $oldBinaryVersion)) { $script:refreshBinaries = $true }
+        } catch {
+            Write-Warning ("could not download the current sm-agent from {0}; keeping the current binaries: {1}" -f $ServerUrl, $_.Exception.Message)
+            $script:refreshBinaries = $false
+        }
+    }
 }
 
 if (-not $Reconfigure) {
@@ -692,6 +715,17 @@ if ($existing) {
     Stop-Service -Name 'sm-agent' -Force -ErrorAction SilentlyContinue
     & sc.exe delete sm-agent | Out-Null
     Start-Sleep -Seconds 1
+}
+
+if ($script:refreshBinaries) {
+    Copy-Item -Force -LiteralPath $refreshTmp -Destination $exe
+    Copy-Item -Force -LiteralPath $refreshTmp -Destination $runtimeExe
+    Lock-Acl -Path $exe        -ServiceAccess Read
+    Lock-Acl -Path $runtimeExe -ServiceAccess Modify
+    Write-Host "refreshed sm-agent binaries ($oldBinaryVersion -> $newBinaryVersion)"
+}
+if ($refreshTmp -and (Test-Path -LiteralPath $refreshTmp)) {
+    Remove-Item -Force -LiteralPath $refreshTmp -ErrorAction SilentlyContinue
 }
 
 $binPath = "`"$runtimeExe`" --config `"$cfgPath`""

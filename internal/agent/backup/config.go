@@ -22,6 +22,17 @@ type Config struct {
 	Retention     Retention
 	Repos         []Repo
 	Tunnel        *TunnelSettings
+	Schedule      *ScheduleSettings
+}
+
+type ScheduleSettings struct {
+	Enabled             bool
+	BackupTime          string
+	BackupJitterS       int
+	CheckWeekday        string
+	CheckTime           string
+	CheckJitterS        int
+	CheckReadDataSubset string
 }
 
 type TunnelSettings struct {
@@ -163,6 +174,17 @@ type rawConfig struct {
 	Retention     *rawRetention   `toml:"retention"`
 	Repos         []Repo          `toml:"repo"`
 	Tunnel        *TunnelSettings `toml:"tunnel"`
+	Schedule      *rawSchedule    `toml:"schedule"`
+}
+
+type rawSchedule struct {
+	Enabled             bool   `toml:"enabled"`
+	BackupTime          string `toml:"backup_time"`
+	BackupJitterS       int    `toml:"backup_jitter_s"`
+	CheckWeekday        string `toml:"check_weekday"`
+	CheckTime           string `toml:"check_time"`
+	CheckJitterS        int    `toml:"check_jitter_s"`
+	CheckReadDataSubset string `toml:"check_read_data_subset"`
 }
 
 type rawRetention = RetentionOverride
@@ -212,6 +234,7 @@ func Load(path string) (Config, error) {
 		Retention:     defaultRetention(raw.Retention),
 		Repos:         trimmedRepos(raw.Repos),
 		Tunnel:        trimmedTunnel(raw.Tunnel),
+		Schedule:      parseSchedule(raw.Schedule),
 	}
 	if cfg.StatusPath == "" {
 		cfg.StatusPath = DefaultStatusPath()
@@ -223,6 +246,21 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("validate backup config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func parseSchedule(raw *rawSchedule) *ScheduleSettings {
+	if raw == nil {
+		return nil
+	}
+	return &ScheduleSettings{
+		Enabled:             raw.Enabled,
+		BackupTime:          strings.TrimSpace(raw.BackupTime),
+		BackupJitterS:       raw.BackupJitterS,
+		CheckWeekday:        strings.TrimSpace(raw.CheckWeekday),
+		CheckTime:           strings.TrimSpace(raw.CheckTime),
+		CheckJitterS:        raw.CheckJitterS,
+		CheckReadDataSubset: strings.TrimSpace(raw.CheckReadDataSubset),
+	}
 }
 
 func (c Config) Validate() error {

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='81c7da3a6d8193de0fc64b16afaad9043d6becef0593b81deeecfca4fb8d1c28'
+CANONICAL_INSTALLER_SHA256='34c9d3cff98c17226681f89b8430b382fbb1c4eef5fcde6a7eb5a02d55b2c89b'
 TOKEN="${SM_TOKEN:-}"
 INTERVAL="${SM_INTERVAL:-10}"
 INSECURE="${SM_INSECURE:-0}"
@@ -39,6 +39,66 @@ fi
 
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
+
+detect_platform() {
+    local os arch_raw
+    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    arch_raw="$(uname -m)"
+    case "$arch_raw" in
+        x86_64|amd64) printf '%s-amd64' "$os" ;;
+        aarch64|arm64) printf '%s-arm64' "$os" ;;
+        *) return 1 ;;
+    esac
+}
+
+agent_binary_version() {
+    "$1" --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' || true
+}
+
+agent_token_from_config() {
+    awk -F'"' '/^token[[:space:]]*=/ { print $2; exit }' /etc/servermonitor/agent.toml
+}
+
+refresh_agent_binaries() {
+    if [ "$RECONFIGURE" != "1" ]; then
+        install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
+        install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
+        return 0
+    fi
+    local platform token old_version new_version
+    local -a curl_opts
+    if ! platform="$(detect_platform)"; then
+        printf 'warning: unsupported arch %s for a server binary download; keeping the current sm-agent binaries\n' "$(uname -m)" >&2
+        return 0
+    fi
+    token="$(agent_token_from_config)"
+    if [ -z "$token" ]; then
+        printf 'warning: no token found in /etc/servermonitor/agent.toml; keeping the current sm-agent binaries\n' >&2
+        return 0
+    fi
+    curl_opts=(-fsSL)
+    [ "$INSECURE" = "1" ] && curl_opts+=(-k)
+    grep -Eq '^[[:space:]]*insecure_skip_verify[[:space:]]*=[[:space:]]*true' /etc/servermonitor/agent.toml && curl_opts+=(-k)
+    if ! curl "${curl_opts[@]}" --config - -o "$TMP/sm-agent" "$SERVER_URL/api/v1/agent/binary?platform=$platform" <<CURLCFG
+header = "X-Agent-Token: $token"
+CURLCFG
+    then
+        printf 'warning: could not download the current sm-agent from %s; keeping the current binaries\n' "$SERVER_URL" >&2
+        return 0
+    fi
+    chmod 0755 "$TMP/sm-agent"
+    new_version="$(agent_binary_version "$TMP/sm-agent")"
+    old_version="$(agent_binary_version /usr/local/bin/sm-agent)"
+    if [ -z "$new_version" ]; then
+        printf 'warning: downloaded sm-agent did not report a version; keeping the current binaries\n' >&2
+        return 0
+    fi
+    if [ "$new_version" != "$old_version" ]; then
+        install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
+        install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
+        printf 'refreshed sm-agent binaries (v%s -> v%s)\n' "$old_version" "$new_version"
+    fi
+}
 
 has_nvme_device() {
     local dev
@@ -100,6 +160,29 @@ install_smartmontools() {
         printf 'smartmontools installed: %s\n' "$(command -v smartctl)"
     else
         printf 'warning: smartmontools install attempt finished but smartctl is not on PATH; install manually for SMART support\n' >&2
+    fi
+}
+
+install_bzip2() {
+    if command -v bunzip2 >/dev/null 2>&1; then
+        return 0
+    fi
+    printf 'installing bzip2 (required to unpack restic) ...\n'
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bzip2 >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q bzip2 >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q bzip2 >/dev/null 2>&1 || true
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive --quiet install bzip2 >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache --quiet bzip2 >/dev/null 2>&1 || true
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --noconfirm --needed --quiet bzip2 >/dev/null 2>&1 || true
+    else
+        printf 'warning: no known package manager; install bzip2 manually to unpack restic\n' >&2
     fi
 }
 
@@ -230,7 +313,8 @@ provision_restic() {
         return 0
     fi
     command -v sha256sum >/dev/null 2>&1 || err "sha256sum required to verify the restic download"
-    command -v bunzip2 >/dev/null 2>&1 || err "bunzip2 (bzip2) required to unpack restic"
+    install_bzip2
+    command -v bunzip2 >/dev/null 2>&1 || err "bunzip2 (bzip2) required to unpack restic; install it and re-run"
     url="https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${arch}.bz2"
     tmp="$(mktemp -d)"
     bz2="$tmp/restic.bz2"
@@ -692,6 +776,9 @@ need install
 need uname
 need useradd
 
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
 REINSTALL="${SM_REINSTALL:-0}"
 RECONFIGURE=0
 if [ "$REINSTALL" != "1" ] && [ -f /etc/servermonitor/agent.toml ]; then
@@ -700,9 +787,10 @@ if [ "$REINSTALL" != "1" ] && [ -f /etc/servermonitor/agent.toml ]; then
     cat >&2 <<'NOTE'
 
 reconfiguring the existing sm-agent install in place: re-applying capabilities
-and group memberships from the SM_ENABLE_* flags, keeping the current identity
-and binary. No re-registration and no token needed. To force a full fresh
-install instead (re-download the binary, rewrite the config), set SM_REINSTALL=1.
+and group memberships from the SM_ENABLE_* flags, keeping the current identity.
+The binary is refreshed from the server when its version differs. No
+re-registration or token input is needed. To force a full fresh install instead
+(re-download the binary, rewrite the config), set SM_REINSTALL=1.
 
 NOTE
 fi
@@ -727,17 +815,7 @@ case "$SERVER_URL" in
     *) err "server URL must start with https:// (got: $SERVER_URL)" ;;
 esac
 
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH_RAW="$(uname -m)"
-case "$ARCH_RAW" in
-    x86_64|amd64) ARCH=amd64 ;;
-    aarch64|arm64) ARCH=arm64 ;;
-    *) err "unsupported arch: $ARCH_RAW" ;;
-esac
-
-PLATFORM="${OS}-${ARCH}"
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+PLATFORM="$(detect_platform)" || err "unsupported arch: $(uname -m)"
 
 CURL_OPTS=(-fsSL)
 [ "$INSECURE" = "1" ] && CURL_OPTS+=(-k)
@@ -770,10 +848,7 @@ usermod -G "$(IFS=,; printf '%s' "${PRESENT_GROUPS[*]:-}")" sm-agent
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
 install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
-if [ "$RECONFIGURE" != "1" ]; then
-    install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
-    install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
-fi
+refresh_agent_binaries
 
 if [ "$RECONFIGURE" != "1" ]; then
 INSECURE_LINE=false

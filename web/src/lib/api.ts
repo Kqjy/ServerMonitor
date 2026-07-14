@@ -657,6 +657,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }),
+  backupNodeUpdate: (hostId: number, body: { endpoint: string; udp_port?: number }) =>
+    request<void>(`/api/v1/backup-nodes/${hostId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }),
   backupNodeDemote: (hostId: number) =>
     request<void>(`/api/v1/backup-nodes/${hostId}`, { method: 'DELETE' })
 };

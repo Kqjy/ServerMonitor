@@ -19,6 +19,7 @@ type Command struct {
 	Path         string
 	Args         []string
 	Env          []string
+	Chroot       string
 	OnStdoutLine func([]byte)
 }
 
@@ -39,11 +40,20 @@ type Options struct {
 	Now              func() time.Time
 	GOOS             string
 	ProgressInterval time.Duration
+	HostRoot         string
+	Containerized    bool
 }
 
 func (ExecRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
 	cmd := exec.CommandContext(ctx, command.Path, command.Args...)
 	cmd.Env = command.Env
+	cmd.WaitDelay = 30 * time.Second
+	setGracefulCancel(cmd)
+	if command.Chroot != "" {
+		if err := setChroot(cmd, command.Chroot); err != nil {
+			return CommandResult{}, err
+		}
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -142,31 +152,45 @@ func defaultResticInstallPath(goos string) string {
 	return "/usr/local/bin/sm-restic"
 }
 
-var strippedResticEnvKeys = []string{"RESTIC_PASSWORD", "RESTIC_PASSWORD_COMMAND", "RESTIC_REPOSITORY_FILE"}
+var allowedResticEnvKeys = map[string]bool{
+	"PATH":               true,
+	"HOME":               true,
+	"TZ":                 true,
+	"TMPDIR":             true,
+	"HTTP_PROXY":         true,
+	"HTTPS_PROXY":        true,
+	"NO_PROXY":           true,
+	"http_proxy":         true,
+	"https_proxy":        true,
+	"no_proxy":           true,
+	"SSL_CERT_FILE":      true,
+	"SSL_CERT_DIR":       true,
+	"RESTIC_CACERT":      true,
+	"RESTIC_COMPRESSION": true,
+	"RESTIC_PACK_SIZE":   true,
+}
 
-func withResticEnv(repo Repo, cacheDir string, repoEnv map[string]string) []string {
-	overrides := make(map[string]string, len(repoEnv)+3)
+func withResticEnv(repo Repo, cacheDir, tmpDir string, repoEnv map[string]string) []string {
+	overrides := make(map[string]string, len(repoEnv)+4)
 	for key, value := range repoEnv {
 		overrides[key] = value
 	}
 	overrides["RESTIC_REPOSITORY"] = repo.URL
 	overrides["RESTIC_PASSWORD_FILE"] = repo.PasswordFile
 	overrides["RESTIC_CACHE_DIR"] = cacheDir
-	return envWithOverrides(stripEnvKeys(os.Environ(), strippedResticEnvKeys...), overrides)
+	if tmpDir != "" {
+		overrides["TMPDIR"] = tmpDir
+	}
+	return envWithOverrides(allowlistEnv(os.Environ(), allowedResticEnvKeys), overrides)
 }
 
-func stripEnvKeys(env []string, keys ...string) []string {
-	drop := make(map[string]bool, len(keys))
-	for _, key := range keys {
-		drop[key] = true
-	}
-	out := make([]string, 0, len(env))
+func allowlistEnv(env []string, allowed map[string]bool) []string {
+	out := make([]string, 0, len(allowed))
 	for _, item := range env {
 		key, _, ok := strings.Cut(item, "=")
-		if ok && drop[key] {
-			continue
+		if ok && allowed[key] {
+			out = append(out, item)
 		}
-		out = append(out, item)
 	}
 	return out
 }
@@ -199,14 +223,14 @@ func envWithOverrides(base []string, overrides map[string]string) []string {
 }
 
 func resticCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, opts Options) (CommandResult, error) {
-	return resticCommandStream(ctx, cfg, repo, cacheDir, args, args[0], opts, nil)
+	return resticCommandStream(ctx, cfg, repo, cacheDir, args, args[0], "", opts, nil)
 }
 
 func resticCommandAction(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options) (CommandResult, error) {
-	return resticCommandStream(ctx, cfg, repo, cacheDir, args, action, opts, nil)
+	return resticCommandStream(ctx, cfg, repo, cacheDir, args, action, "", opts, nil)
 }
 
-func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options, onStdoutLine func([]byte)) (CommandResult, error) {
+func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action, chrootRoot string, opts Options, onStdoutLine func([]byte)) (CommandResult, error) {
 	if repo.tunnelErr != nil {
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, repo.tunnelErr)
 	}
@@ -217,10 +241,18 @@ func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir st
 	if err != nil {
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, err)
 	}
+	tmpDir := ""
+	if chrootRoot != "" {
+		tmpDir = filepath.Join(filepath.Dir(cacheDir), "restic-tmp")
+		if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+			return CommandResult{}, fmt.Errorf("%s failed: create restic temp dir: %w", action, err)
+		}
+	}
 	result, err := opts.runner().Run(ctx, Command{
 		Path:         cfg.ResticPath,
 		Args:         resticGlobalArgs(repo, args),
-		Env:          withResticEnv(repo, cacheDir, repoEnv),
+		Env:          withResticEnv(repo, cacheDir, tmpDir, repoEnv),
+		Chroot:       chrootRoot,
 		OnStdoutLine: onStdoutLine,
 	})
 	if err != nil {

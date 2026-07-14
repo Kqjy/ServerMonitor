@@ -43,7 +43,8 @@ with the server and writes /etc/servermonitor/agent.toml.
 Re-running on a host that already has /etc/servermonitor/agent.toml reconfigures
 the service in place: it re-derives capabilities and group memberships from the
 --enable-* flags and restarts, without re-registering and without an admin token
-(--server and --binary are not required in that mode). Pass --reinstall, or set
+(--server and --binary are not required in that mode). When --binary is given,
+both agent copies are refreshed if its version differs. Pass --reinstall, or set
 SM_REINSTALL=1, to force a full fresh install instead.
 
 Admin token MUST come from SM_ADMIN_TOKEN env var or --admin-token-file PATH.
@@ -82,6 +83,59 @@ Examples:
   $0 --server https://... --admin-token-file /root/admin.token --binary ./sm-agent --enable-smart --enable-docker
 EOF
   exit 1
+}
+
+check_binary_source_dir() {
+  [[ -f "$BIN_PATH" ]] || { echo "binary not found: $BIN_PATH" >&2; exit 1; }
+  local bin_dir bin_dir_perms bin_dir_owner
+  bin_dir="$(cd "$(dirname "$BIN_PATH")" && pwd)"
+  bin_dir_perms="$(stat -c '%a' "$bin_dir")"
+  bin_dir_owner="$(stat -c '%u' "$bin_dir")"
+  if [[ "${bin_dir_perms: -1}" =~ [2367] ]]; then
+    echo "refusing: binary source dir $bin_dir is world-writable (mode $bin_dir_perms)" >&2
+    exit 1
+  fi
+  if [[ ${#bin_dir_perms} -ge 2 && "${bin_dir_perms: -2:1}" =~ [2367] && "$bin_dir_owner" != "0" ]]; then
+    echo "refusing: binary source dir $bin_dir is group-writable and not root-owned (mode $bin_dir_perms owner uid $bin_dir_owner)" >&2
+    exit 1
+  fi
+}
+
+agent_binary_version() {
+  "$1" --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' || true
+}
+
+resident_agent_binary_version() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u sm-agent -- /opt/servermonitor/sm-agent --version 2>/dev/null | awk 'NR == 1 { print $2; exit }' || true
+  else
+    su -s /bin/sh -c '/opt/servermonitor/sm-agent --version 2>/dev/null' sm-agent | awk 'NR == 1 { print $2; exit }' || true
+  fi
+}
+
+refresh_agent_binaries() {
+  if [ "$RECONFIGURE" != "1" ]; then
+    install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
+    install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
+    return 0
+  fi
+  local old_version new_version resident_version
+  if [ -n "$BIN_PATH" ]; then
+    check_binary_source_dir
+    new_version="$(agent_binary_version "$BIN_PATH")"
+    old_version="$(agent_binary_version /usr/local/bin/sm-agent)"
+    if [ "$new_version" != "$old_version" ]; then
+      install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
+      install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
+      echo "refreshed sm-agent binaries (v$old_version -> v$new_version)"
+    fi
+    return 0
+  fi
+  old_version="$(agent_binary_version /usr/local/bin/sm-agent)"
+  resident_version="$(resident_agent_binary_version)"
+  if [ "$old_version" != "$resident_version" ]; then
+    echo "warning: /usr/local/bin/sm-agent is v$old_version but the resident agent is v$resident_version; the backup/restore units run stale code. Re-run with --binary /path/to/sm-agent to refresh." >&2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -182,6 +236,29 @@ install_smartmontools() {
     echo "smartmontools installed: $(command -v smartctl)"
   else
     echo "warning: smartmontools install attempt finished but smartctl is not on PATH; install manually for SMART support" >&2
+  fi
+}
+
+install_bzip2() {
+  if command -v bunzip2 >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "installing bzip2 (required to unpack restic) ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bzip2 >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q bzip2 >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q bzip2 >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive --quiet install bzip2 >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache --quiet bzip2 >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -S --noconfirm --needed --quiet bzip2 >/dev/null 2>&1 || true
+  else
+    echo "warning: no known package manager; install bzip2 manually to unpack restic" >&2
   fi
 }
 
@@ -312,7 +389,8 @@ provision_restic() {
     return 0
   fi
   command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum required to verify the restic download" >&2; exit 1; }
-  command -v bunzip2 >/dev/null 2>&1 || { echo "bunzip2 (bzip2) required to unpack restic" >&2; exit 1; }
+  install_bzip2
+  command -v bunzip2 >/dev/null 2>&1 || { echo "bunzip2 (bzip2) required to unpack restic; install it and re-run" >&2; exit 1; }
   url="https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${arch}.bz2"
   tmp="$(mktemp -d)"
   bz2="$tmp/restic.bz2"
@@ -787,8 +865,9 @@ if [ "$REINSTALL" != "1" ] && [[ -f /etc/servermonitor/agent.toml ]]; then
 
 reconfiguring the existing sm-agent install in place: re-applying capabilities
 and group memberships from the --enable-* flags, keeping the current identity
-and binary. No re-registration and no admin token needed. To force a full fresh
-install instead (re-register, rewrite config), re-run with --reinstall.
+without re-registration or an admin token. When --binary is given, both agent
+copies are refreshed if its version differs. To force a full fresh install
+instead (re-register, rewrite config), re-run with --reinstall.
 
 NOTE
 fi
@@ -808,19 +887,7 @@ case "$SERVER_URL" in
   *)         echo "server URL must start with https://" >&2; exit 1 ;;
 esac
 
-[[ -f "$BIN_PATH" ]] || { echo "binary not found: $BIN_PATH" >&2; exit 1; }
-
-BIN_DIR="$(cd "$(dirname "$BIN_PATH")" && pwd)"
-BIN_DIR_PERMS="$(stat -c '%a' "$BIN_DIR")"
-BIN_DIR_OWNER="$(stat -c '%u' "$BIN_DIR")"
-if [[ "${BIN_DIR_PERMS: -1}" =~ [2367] ]]; then
-  echo "refusing: binary source dir $BIN_DIR is world-writable (mode $BIN_DIR_PERMS)" >&2
-  exit 1
-fi
-if [[ ${#BIN_DIR_PERMS} -ge 2 && "${BIN_DIR_PERMS: -2:1}" =~ [2367] && "$BIN_DIR_OWNER" != "0" ]]; then
-  echo "refusing: binary source dir $BIN_DIR is group-writable and not root-owned (mode $BIN_DIR_PERMS owner uid $BIN_DIR_OWNER)" >&2
-  exit 1
-fi
+check_binary_source_dir
 fi
 
 id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group --comment 'ServerMonitor agent' sm-agent
@@ -864,12 +931,10 @@ else
   rm -f "$SMART_UDEV_RULES"
 fi
 
-[ "$RECONFIGURE" = "1" ] || install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
-
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
 install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
-[ "$RECONFIGURE" = "1" ] || install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
+refresh_agent_binaries
 
 if [ "$RECONFIGURE" != "1" ]; then
 ARGS=(--server "$SERVER_URL" --interval "$INTERVAL")

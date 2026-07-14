@@ -6,7 +6,8 @@
     type CollectorStatus,
     type BackupRepoRow,
     type BackupSnapshot,
-    type BackupTargetsResp
+    type BackupTargetsResp,
+    type BackupNode
   } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
   import { bytes, timeAgo, timeUntil } from '$lib/format';
@@ -20,17 +21,27 @@
     range,
     sampleIntervalS = 10,
     collectorStatus = {},
-    os
+    os,
+    externallyManaged = false
   }: {
     hostId: number;
     range: Range;
     sampleIntervalS?: number;
     collectorStatus?: Record<string, CollectorStatus>;
     os?: string;
+    externallyManaged?: boolean;
   } = $props();
 
   const backupStatus = $derived(collectorStatus.backup);
   const isWindows = $derived((os ?? '').toLowerCase().startsWith('windows'));
+  let baseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
+
+  async function loadServerInfo() {
+    try {
+      const info = await api.serverInfo();
+      if (info?.url) baseUrl = info.url.replace(/\/+$/, '');
+    } catch {}
+  }
 
   let endpoint = $state<BackupTargetsResp | null>(null);
   const endpointConfigured = $derived(endpoint?.configured ?? false);
@@ -42,10 +53,20 @@
     } catch {}
   }
 
+  let nodeRole = $state<BackupNode | null>(null);
+  const isStorageNode = $derived(nodeRole !== null);
+
+  async function loadNodeRole() {
+    try {
+      const resp = await api.backupNodes();
+      nodeRole = resp.nodes.find((n) => n.host_id === hostId) ?? null;
+    } catch {}
+  }
+
   const enableSnippet = $derived(
     isWindows
-      ? `.\\install-agent-windows.ps1 -Reconfigure \`\n  -EnableBackup -BackupRepos '<rest/s3 url>'`
-      : `sudo ./install-agent-linux.sh --enable-backup \\\n  --backup-repos '<rest/s3 url>'`
+      ? `$env:SM_ENABLE_BACKUP="1"; $env:SM_BACKUP_REPOS="<rest/s3 url>"; iex (iwr -useb ${baseUrl}/install.ps1).Content`
+      : `SM_ENABLE_BACKUP=1 SM_BACKUP_REPOS="<rest/s3 url>" \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_REPOS bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
   );
 
   type Tone = 'good' | 'warn' | 'bad' | 'none';
@@ -55,6 +76,7 @@
     engine?: string;
     tunnel: boolean;
     success: boolean;
+    pending: boolean;
     error?: string;
     lastSuccessIso?: string;
     lastFinishedIso?: string;
@@ -178,7 +200,8 @@
     return Math.max(0, (Date.now() - t) / 1000);
   }
 
-  function backupTone(success: boolean, ageSecs: number | null): Tone {
+  function backupTone(success: boolean, ageSecs: number | null, pending = false): Tone {
+    if (pending) return 'none';
     if (!success) return 'bad';
     if (ageSecs === null) return 'none';
     if (ageSecs > 50 * 3600) return 'bad';
@@ -219,11 +242,13 @@
         const s = r.status;
         const lastSuccessAgeS = ageS(s.last_success);
         const checkAgeS = ageS(s.check_last);
+        const pending = !s.success && !s.error && !s.last_finished && !s.last_success;
         return {
           repo: r.repo,
           engine: s.engine,
           tunnel: s.tunnel === true,
           success: s.success,
+          pending,
           error: s.error,
           lastSuccessIso: s.last_success,
           lastFinishedIso: s.last_finished,
@@ -236,13 +261,16 @@
           checkLastIso: s.check_last,
           checkSuccess: s.check_success,
           checkAgeS,
-          backupTone: backupTone(s.success, lastSuccessAgeS),
+          backupTone: backupTone(s.success, lastSuccessAgeS, pending),
           checkTone: checkTone(s.check_success, s.check_last, checkAgeS),
           snapshots: s.snapshots ?? []
         };
       })
       .sort((a, b) => a.repo.localeCompare(b.repo))
   );
+
+  const notBackingUp = $derived(!backupsLoading && views.length === 0 && runningRepos.length === 0);
+  const hideBackupDetail = $derived(notBackingUp && (isStorageNode || externallyManaged));
 
   function durationText(secs: number, extraDigits = 0): string {
     if (!isFinite(secs)) return 'n/a';
@@ -268,8 +296,8 @@
     if (isNaN(d.getTime())) return '—';
     return d.toLocaleString();
   }
-  function runLabel(success: boolean): string {
-    return success ? 'ok' : 'failed';
+  function runLabel(success: boolean, pending = false): string {
+    return pending ? 'scheduled' : success ? 'ok' : 'failed';
   }
 
   async function loadBackups(manual = false) {
@@ -363,6 +391,8 @@
   onMount(() => {
     loadBackups();
     loadEndpoint();
+    loadNodeRole();
+    loadServerInfo();
     timer = setInterval(() => {
       if (chartZoom === null) loadCharts();
     }, 10_000);
@@ -471,13 +501,37 @@
 </script>
 
 <div class="space-y-6">
-  <p class="text-xs text-zinc-500">
-    This host backs up its own files with restic to one or more destinations — this server or an external endpoint.
-  </p>
+  {#if !hideBackupDetail}
+    <p class="text-xs text-zinc-500">
+      This host backs up its own files with restic to one or more destinations — this server or an external endpoint.
+    </p>
+  {/if}
+
+  {#if isStorageNode && nodeRole}
+    <div class="rounded-lg border border-sky-900/50 bg-sky-950/20 px-4 py-3">
+      <div class="flex items-start gap-2.5">
+        <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full {nodeRole.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-sky-100">This host is a storage node</div>
+          <p class="mt-0.5 text-xs text-zinc-400 leading-relaxed">
+            Its agent serves an append-only restic endpoint at
+            <span class="font-mono text-zinc-300">{nodeRole.endpoint}:{nodeRole.udp_port}/udp</span>, storing other hosts'
+            encrypted backups on its disk — {nodeRole.target_count}
+            {nodeRole.target_count === 1 ? 'repository' : 'repositories'}, {bytes(nodeRole.used_bytes)} stored.
+            Manage it under <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Backups → Storage nodes</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if backupStatus?.state === 'stale'}
     <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
       Backup status is stale{backupStatus.message ? `: ${backupStatus.message}` : ''}.
+    </div>
+  {:else if backupStatus?.state === 'stale_agent'}
+    <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
+      Backup agent binary is outdated{backupStatus.message ? `: ${backupStatus.message}` : ''}. Reconfigure this host to refresh it: <code>{isWindows ? `iex (iwr -useb ${baseUrl}/install.ps1).Content` : `sudo bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`}</code> For offline installs, re-run the install script with --binary (Linux) or -BinaryPath (Windows).
     </div>
   {:else if backupStatus?.state === 'error'}
     <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
@@ -514,6 +568,24 @@
       <div class="p-6 sm:p-8">
         {#if runningRepos.length > 0}
           <h3 class="flex items-center gap-2 text-base font-medium text-zinc-100"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>First backup is running <span class="numeric text-sm font-normal text-emerald-300">(started {durationText(displayedElapsed(runningRepos[0]))} ago)</span></h3>
+        {:else if isStorageNode}
+          <h3 class="text-base font-medium text-zinc-100">This host isn't backing up its own files</h3>
+          <p class="mt-1 text-sm text-zinc-500 max-w-xl">
+            It's acting as a storage node — a destination that holds other hosts' encrypted backups (see the note above). Storing
+            backups for the fleet and backing up its own files are separate roles; this host does only the former.
+          </p>
+        {:else if externallyManaged}
+          <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
+          <p class="mt-1 text-sm text-zinc-500 max-w-xl">
+            This agent is externally managed (a container image or read-only filesystem). Managed backups <span class="text-zinc-300">are</span>
+            supported — a Dockerized agent backs up its host directly. Enable it by setting
+            <span class="font-mono text-zinc-300">SM_ENABLE_BACKUP=1</span> plus a repository, then redeploy the container.
+          </p>
+          <p class="mt-3 text-sm text-zinc-500 max-w-xl">
+            Create a repository under <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Backups</a>
+            to mint the credential, then follow <span class="font-mono text-zinc-600">deploy/AGENT-DOCKER.md → Managed backups</span>.
+            A host-installed agent uses <span class="font-mono text-zinc-300">--enable-backup</span> instead.
+          </p>
         {:else}
           <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
           <p class="mt-1 text-sm text-zinc-500 max-w-xl">
@@ -523,31 +595,33 @@
           </p>
         {/if}
 
-        {#if endpointConfigured && linkedRepo}
-          <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
-            A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists on this server.
-            Point the agent at it, then it will report here. <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
-          </div>
-        {:else if endpointConfigured}
-          <div class="mt-4">
-            <a
-              href="/backups?new=1&host={hostId}"
-              class="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium">
-              Back up this host to this server →
-            </a>
-            <p class="mt-2 text-[11px] text-zinc-600">Creates a repository on this server and shows the exact install command to run on this host.</p>
+        {#if !isStorageNode && !externallyManaged}
+          {#if endpointConfigured && linkedRepo}
+            <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
+              A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists on this server.
+              Point the agent at it, then it will report here. <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
+            </div>
+          {:else if endpointConfigured}
+            <div class="mt-4">
+              <a
+                href="/backups?new=1&host={hostId}"
+                class="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium">
+                Back up this host to this server →
+              </a>
+              <p class="mt-2 text-[11px] text-zinc-600">Creates a repository on this server and shows the exact install command to run on this host.</p>
+            </div>
+          {/if}
+
+          <div class="mt-5">
+            <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">
+              {endpointConfigured ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
+            </div>
+            <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200 select-text">{enableSnippet}</pre>
+            <p class="mt-2 text-[11px] text-zinc-500">
+              Run this on the host — the installer detects the existing agent and enables backups in place. Full setup — rest-server, S3/B2, TLS, recovery — is in <span class="font-mono text-zinc-600">deploy/BACKUPS.md</span>.
+            </p>
           </div>
         {/if}
-
-        <div class="mt-5">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">
-            {endpointConfigured ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
-          </div>
-          <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200 select-text">{enableSnippet}</pre>
-          <p class="mt-2 text-[11px] text-zinc-500">
-            Re-run the installer with these flags{isWindows ? '' : ' (or set the matching SM_* env vars)'} to enable backups in place. Full setup — rest-server, S3/B2, TLS, recovery — is in <span class="font-mono text-zinc-600">deploy/BACKUPS.md</span>.
-          </p>
-        </div>
       </div>
     {:else if views.length > 0}
       <div class="overflow-x-auto">
@@ -577,8 +651,8 @@
                     <div class="flex items-center gap-2 text-emerald-300"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span>backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span></div>
                   {:else}
                     <div class="flex items-center gap-2">
-                      <span class="numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : 'never'}</span>
-                      {#if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
+                      <span class="numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : v.pending ? 'not yet' : 'never'}</span>
+                      {#if v.pending}<span class="text-[10px] uppercase tracking-wider text-zinc-500">scheduled</span>{:else if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
                     </div>
                   {/if}
                 </td>
@@ -607,7 +681,7 @@
               {#if isRunning(v.repo)}
                 <span class="shrink-0 rounded-md border border-emerald-900/60 bg-emerald-950/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">running</span>
               {:else}
-                <span class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[v.backupTone]}">{runLabel(v.success)}</span>
+                <span class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[v.backupTone]}">{runLabel(v.success, v.pending)}</span>
               {/if}
             </header>
             {#if isRunning(v.repo)}
@@ -667,6 +741,7 @@
     {/if}
   </section>
 
+  {#if !hideBackupDetail}
   {#if chartsError}
     <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
       Failed to load backup history: {chartsError}
@@ -703,6 +778,7 @@
         </div>
       </section>
     </div>
+  {/if}
   {/if}
 
   {#if !backupsLoading && !backupsError && views.length > 0}

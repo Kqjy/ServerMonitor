@@ -152,6 +152,17 @@ The installer prints a capability warning when enabling, and rewrites all three 
 
 **Windows:** same flow with `-EnableBackup`, `-BackupRepos`, `-BackupRepoNames`, `-BackupPaths`, `-BackupTime` (or the same `SM_*` env vars). restic goes to `C:\Program Files\ServerMonitor\restic.exe`; config, key, and recovery kit live in `%ProgramData%\ServerMonitor\Backup\`, a subdirectory locked to SYSTEM and Administrators only (the agent's service account cannot touch it); the schedule is a **ServerMonitor Backup** scheduled task plus a weekly **ServerMonitor Backup Check** task (SYSTEM, 6-hour random delay, `backup check --read-data-subset 5%`), both executing the admin-only agent copy in `C:\Program Files\ServerMonitor`. There is no restore task — restore is the documented elevated invocation above. Backups run with `--use-fs-snapshot`, so open files are captured consistently via VSS. Default path is `C:\Users`.
 
+### Containerized (Docker) agents
+
+A host running only the [Dockerized agent](AGENT-DOCKER.md) can back **itself** up without a second host-installed agent — there is no `--enable-backup` installer step; the resident agent provisions and schedules everything from env. Set `SM_ENABLE_BACKUP=1`, `SM_BACKUP_REPOS`, and the credential in `.env.agent`; full recipe in [AGENT-DOCKER.md → Managed backups](AGENT-DOCKER.md#managed-backups). The differences from a host install:
+
+- **No systemd.** The schedule (daily backup + weekly check) runs inside the agent and is caught up on boot; there is no `sm-backup` timer/unit.
+- **Chrooted backups.** The backup runs restic chrooted into `/host`, so snapshots record host-native paths and interoperate with host-installed snapshots — provided the recipe keeps `uts: host`, `cap_add: SYS_CHROOT`, and the twice-mounted `sm-agent-state` volume.
+- **Remote repos only** (`rest:`/`s3:`/`b2:`/`sftp:`) — `tunnel:` is host-install only for now.
+- **`prune_mode` defaults to `external`** (a container should not hold deletion authority over history).
+- **Restore is staging-only**; in-place is refused (copy the staged restore out with `docker cp`).
+- **Recovery kit on demand:** `docker compose … exec sm-agent /usr/local/bin/sm-agent backup recovery-kit`. The key lives only in the `sm-agent-state` volume — `docker compose down -v` destroys it, so keep the kit offline.
+
 ## The recovery kit
 
 The kit contains the hostname, each repository's logical name and full URL (credentials included), the repository password, and the restore one-liner. **Store it in a password manager immediately.** No other copy exists anywhere — the monitoring server deliberately never sees the password, so there is nothing to recover it from. Lose the kit and the host together, and the backups are permanently unreadable.

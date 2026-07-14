@@ -443,25 +443,9 @@ func promoteBackupNodeHandler(nodes *storage.BackupNodes, hosts *storage.Hosts) 
 			writeError(w, http.StatusNotFound, "host not found")
 			return
 		}
-		endpoint := strings.TrimSpace(req.Endpoint)
-		if endpoint == "" {
-			writeError(w, http.StatusBadRequest, "endpoint is required (host or host:port agents can reach this node's UDP tunnel at)")
-			return
-		}
-		host := endpoint
-		if h, _, err := net.SplitHostPort(endpoint); err == nil {
-			host = h
-		}
-		if strings.TrimSpace(host) == "" {
-			writeError(w, http.StatusBadRequest, "endpoint must be host or host:port")
-			return
-		}
-		port := req.UDPPort
-		if port == 0 {
-			port = 51821
-		}
-		if port < 1 || port > 65535 {
-			writeError(w, http.StatusBadRequest, "udp_port must be between 1 and 65535")
+		endpoint, port, msg := normalizeNodeEndpoint(req.Endpoint, req.UDPPort)
+		if msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
 		maxBlob := req.MaxBlobBytes
@@ -469,6 +453,57 @@ func promoteBackupNodeHandler(nodes *storage.BackupNodes, hosts *storage.Hosts) 
 			maxBlob = 1 << 30
 		}
 		if err := nodes.Promote(r.Context(), req.HostID, port, endpoint, strings.TrimSpace(req.StoreDir), maxBlob); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}
+}
+
+func normalizeNodeEndpoint(rawEndpoint string, udpPort int) (string, int, string) {
+	endpoint := strings.TrimSpace(rawEndpoint)
+	if endpoint == "" {
+		return "", 0, "endpoint is required (host or host:port agents can reach this node's UDP tunnel at)"
+	}
+	host := endpoint
+	if h, _, err := net.SplitHostPort(endpoint); err == nil {
+		host = h
+	}
+	if strings.TrimSpace(host) == "" {
+		return "", 0, "endpoint must be host or host:port"
+	}
+	port := udpPort
+	if port == 0 {
+		port = 51821
+	}
+	if port < 1 || port > 65535 {
+		return "", 0, "udp_port must be between 1 and 65535"
+	}
+	return endpoint, port, ""
+}
+
+func updateBackupNodeHandler(nodes *storage.BackupNodes) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, err := strconv.ParseInt(chi.URLParam(r, "hostID"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid host id")
+			return
+		}
+		var req promoteNodeRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		endpoint, port, msg := normalizeNodeEndpoint(req.Endpoint, req.UDPPort)
+		if msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+		if err := nodes.UpdateEndpoint(r.Context(), hostID, port, endpoint); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "node not found")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

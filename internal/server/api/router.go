@@ -147,6 +147,7 @@ func New(d Deps) *Router {
 					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers, nodePeerStats))
 					r.Get("/backup-nodes", listBackupNodesHandler(d.BackupNodes))
 					r.Post("/backup-nodes", promoteBackupNodeHandler(d.BackupNodes, d.Hosts))
+					r.Patch("/backup-nodes/{hostID}", updateBackupNodeHandler(d.BackupNodes))
 					r.Delete("/backup-nodes/{hostID}", demoteBackupNodeHandler(d.BackupNodes))
 				}
 			})

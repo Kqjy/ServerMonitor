@@ -53,6 +53,9 @@ func Restore(ctx context.Context, cfg Config, ro RestoreOptions, opts Options) (
 	if err := cfg.Validate(); err != nil {
 		return RestoreResult{}, err
 	}
+	if err := validateHostRoot(opts.HostRoot); err != nil {
+		return RestoreResult{}, err
+	}
 	if cfg.ResticPath == "" {
 		return RestoreResult{}, fmt.Errorf("restic path is not resolved")
 	}
@@ -79,7 +82,7 @@ func Restore(ctx context.Context, cfg Config, ro RestoreOptions, opts Options) (
 	statusDir := filepath.Dir(cfg.StatusPath)
 	var target string
 	if ro.InPlace {
-		target, err = inPlaceTarget(opts.goos())
+		target, err = inPlaceTarget(opts.goos(), opts.Containerized)
 		if err != nil {
 			return RestoreResult{}, err
 		}
@@ -191,9 +194,12 @@ func findRepo(repos []Repo, name string) (Repo, error) {
 	return Repo{}, fmt.Errorf("repo %q not found", name)
 }
 
-func inPlaceTarget(goos string) (string, error) {
+func inPlaceTarget(goos string, containerized bool) (string, error) {
 	if goos == "windows" {
 		return "", fmt.Errorf("in-place restore is not supported on Windows: restic restores drive letters as subdirectories of the target; restore to a staging directory and copy files into place")
+	}
+	if containerized {
+		return "", fmt.Errorf("in-place restore is disabled in a containerized agent: restoring to / would target the container filesystem, not the host. Restore to the staging directory (omit --in-place), then copy files onto the host, e.g. with docker cp")
 	}
 	return "/", nil
 }

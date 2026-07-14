@@ -95,6 +95,9 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 	if err := cfg.Validate(); err != nil {
 		return RunResult{}, err
 	}
+	if err := validateHostRoot(opts.HostRoot); err != nil {
+		return RunResult{}, err
+	}
 	if cfg.ResticPath == "" {
 		return RunResult{}, fmt.Errorf("restic path is not resolved")
 	}
@@ -247,7 +250,7 @@ func finishRepoStatus(status RepoStatus, opts Options, err error, logger *slog.L
 }
 
 func runBackupCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) (backupSummary, error) {
-	result, err := resticCommandStream(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos()), "backup", opts, func(line []byte) {
+	result, err := resticCommandStream(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos()), "backup", opts.HostRoot, opts, func(line []byte) {
 		if update, ok := parseBackupProgressLine(line); ok && progress != nil {
 			progress.update(update)
 		}
@@ -360,11 +363,10 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		return nil, false, err
 	}
 	lockPath := filepath.Join(dir, "backup.lock")
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
+	token, err := newRunLockToken()
+	if err != nil {
 		return nil, false, err
 	}
-	token := []byte(fmt.Sprintf("%d %s\n", os.Getpid(), hex.EncodeToString(nonce)))
 	for {
 		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
@@ -389,9 +391,6 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		if statErr != nil {
 			return nil, false, statErr
 		}
-		if now.Sub(info.ModTime()) < staleLockAfter {
-			return nil, true, nil
-		}
 		owner, readErr := os.ReadFile(lockPath)
 		if os.IsNotExist(readErr) {
 			continue
@@ -399,12 +398,25 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		if readErr != nil {
 			return nil, false, readErr
 		}
-		alive, aliveErr := runLockOwnerAlive(owner)
-		if aliveErr != nil {
-			return nil, false, aliveErr
-		}
-		if alive {
-			return nil, true, nil
+		if isVersionedLockToken(owner) {
+			alive, aliveErr := runLockOwnerAlive(owner)
+			if aliveErr != nil {
+				return nil, false, aliveErr
+			}
+			if alive {
+				return nil, true, nil
+			}
+		} else {
+			if now.Sub(info.ModTime()) < staleLockAfter {
+				return nil, true, nil
+			}
+			alive, aliveErr := runLockOwnerAlive(owner)
+			if aliveErr != nil {
+				return nil, false, aliveErr
+			}
+			if alive {
+				return nil, true, nil
+			}
 		}
 		current, readErr := os.ReadFile(lockPath)
 		if os.IsNotExist(readErr) {
@@ -416,10 +428,67 @@ func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {
 		if !bytes.Equal(current, owner) {
 			continue
 		}
-		if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
-			return nil, false, removeErr
+		reclaimNonce := make([]byte, 8)
+		if _, err := rand.Read(reclaimNonce); err != nil {
+			return nil, false, err
 		}
+		reclaimPath := lockPath + ".reclaim." + hex.EncodeToString(reclaimNonce)
+		if err := os.Rename(lockPath, reclaimPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, false, err
+		}
+		grabbed, grabErr := os.ReadFile(reclaimPath)
+		if grabErr != nil {
+			_ = os.Remove(reclaimPath)
+			return nil, false, grabErr
+		}
+		if bytes.Equal(grabbed, owner) {
+			if removeErr := os.Remove(reclaimPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return nil, false, removeErr
+			}
+			continue
+		}
+		if err := renameNoReplace(reclaimPath, lockPath); err != nil {
+			_ = os.Remove(reclaimPath)
+		}
+		return nil, true, nil
 	}
+}
+
+func renameNoReplace(oldpath, newpath string) error {
+	if err := os.Link(oldpath, newpath); err != nil {
+		return err
+	}
+	return os.Remove(oldpath)
+}
+
+const runLockVersion = "v2"
+
+func newRunLockToken() ([]byte, error) {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return []byte(fmt.Sprintf("%s %d %d %s\n", runLockVersion, os.Getpid(), selfStartTime(), hex.EncodeToString(nonce))), nil
+}
+
+func selfStartTime() int64 {
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		return 0
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		return 0
+	}
+	return ct
+}
+
+func isVersionedLockToken(token []byte) bool {
+	fields := strings.Fields(string(token))
+	return len(fields) > 0 && fields[0] == runLockVersion
 }
 
 func runLockOwnerAlive(token []byte) (bool, error) {
@@ -427,11 +496,44 @@ func runLockOwnerAlive(token []byte) (bool, error) {
 	if len(fields) == 0 {
 		return false, errors.New("backup lock has no owner")
 	}
+	if fields[0] == runLockVersion {
+		if len(fields) < 3 {
+			return false, errors.New("backup lock token is malformed")
+		}
+		pid, err := strconv.ParseInt(fields[1], 10, 32)
+		if err != nil || pid <= 0 {
+			return false, errors.New("backup lock has an invalid owner")
+		}
+		start, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil {
+			return false, errors.New("backup lock has an invalid owner start time")
+		}
+		return pidAliveWithStart(int32(pid), start)
+	}
 	pid, err := strconv.ParseInt(fields[0], 10, 32)
 	if err != nil || pid <= 0 {
 		return false, errors.New("backup lock has an invalid owner")
 	}
 	return process.PidExists(int32(pid))
+}
+
+func pidAliveWithStart(pid int32, start int64) (bool, error) {
+	exists, err := process.PidExists(pid)
+	if err != nil || !exists {
+		return false, err
+	}
+	if start == 0 {
+		return true, nil
+	}
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return false, nil
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		return true, nil
+	}
+	return ct == start, nil
 }
 
 func releaseRunLock(lockPath string, token []byte) {

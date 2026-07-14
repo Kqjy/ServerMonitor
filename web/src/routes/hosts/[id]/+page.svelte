@@ -307,7 +307,7 @@
       {:else if tabModel === 'ports'}<PortsTab hostId={id} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} />
       {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
-      {:else if tabModel === 'backups'}<BackupsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} os={host.os} />
+      {:else if tabModel === 'backups'}<BackupsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} os={host.os} externallyManaged={host.externally_managed ?? false} />
       {/if}
     </div>
 

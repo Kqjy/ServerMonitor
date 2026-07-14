@@ -23,6 +23,7 @@ import (
 
 	agentbackup "servermonitor/internal/agent/backup"
 	"servermonitor/internal/agent/backupnode"
+	"servermonitor/internal/agent/backupsched"
 	"servermonitor/internal/agent/collectors"
 	"servermonitor/internal/agent/config"
 	"servermonitor/internal/agent/runner"
@@ -136,6 +137,8 @@ func main() {
 
 	nodeManager := backupnode.New(cfg.ServerURL, cfg.Token, cfg.InsecureSkip, filepath.Dir(cfg.BackupStatusPath), logger)
 	go nodeManager.Run(ctx)
+
+	backupScheduler := maybeStartBackupScheduler(ctx, logger)
 
 	go func() {
 		for {
@@ -259,8 +262,13 @@ func main() {
 		}
 	}()
 
-	if err := r.Run(ctx); err != nil {
-		if errors.Is(err, runner.ErrDeregistered) {
+	runErr := r.Run(ctx)
+	if backupScheduler != nil {
+		cancel()
+		waitScheduler(backupScheduler, 40*time.Second)
+	}
+	if runErr != nil {
+		if errors.Is(runErr, runner.ErrDeregistered) {
 			logger.Error("host deregistered by server, agent shutting down",
 				"server", cfg.ServerURL,
 				"sentinel", sentinel)
@@ -273,7 +281,7 @@ func main() {
 			}
 			os.Exit(exitCodeDeregistered)
 		}
-		logger.Error("runner", "err", err)
+		logger.Error("runner", "err", runErr)
 		os.Exit(1)
 	}
 	if upgradeStaged.Load() {
@@ -295,9 +303,125 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
+func maybeStartBackupScheduler(ctx context.Context, logger *slog.Logger) *backupsched.Scheduler {
+	if !agentbackup.IsContainerized() || !backupEnabledEnv(os.Getenv) {
+		return nil
+	}
+	if res, err := agentbackup.Provision(os.Getenv); err != nil {
+		logger.Error("backup provisioning failed; scheduled backups disabled this boot", "err", err)
+		return nil
+	} else if res.KeyGenerated {
+		logger.Info("generated backup encryption key (kept forever; export it with: sm-agent backup recovery-kit)")
+	}
+	configPath := agentbackup.DefaultConfigPath()
+	cfg, err := agentbackup.Load(configPath)
+	if err != nil {
+		logger.Error("could not load backup config after provisioning; scheduled backups disabled", "err", err)
+		return nil
+	}
+	if cfg.Schedule == nil || !cfg.Schedule.Enabled {
+		logger.Info("backup provisioned but scheduling is off; run backups manually with: sm-agent backup run")
+		return nil
+	}
+	sched := backupsched.New(schedulerConfig(cfg.Schedule), backupsched.Options{
+		StatePath: filepath.Join(filepath.Dir(cfg.StatusPath), "backup-schedule.json"),
+		RunBackup: func(ctx context.Context) error {
+			if _, err := agentbackup.InitFromConfigPath(ctx, configPath, agentbackup.BaseOptions(logger)); err != nil {
+				return err
+			}
+			_, err := agentbackup.RunFromConfigPath(ctx, configPath, agentbackup.BaseOptions(logger))
+			return err
+		},
+		RunCheck: func(ctx context.Context) error {
+			_, err := agentbackup.CheckFromConfigPath(ctx, configPath, agentbackup.CheckOptions{ReadDataSubset: cfg.Schedule.CheckReadDataSubset}, agentbackup.BaseOptions(logger))
+			return err
+		},
+		Logger: logger.With("component", "backupsched"),
+	})
+	collectors.SetBackupNextRunSource(func(context.Context) *time.Time { return sched.NextBackupRun() })
+	collectors.SetBackupScheduledRepos(repoNames(cfg.Repos))
+	go sched.Run(ctx)
+	logger.Info("scheduled backups enabled", "config", configPath, "backup_time", cfg.Schedule.BackupTime)
+	return sched
+}
+
+func repoNames(repos []agentbackup.Repo) []string {
+	out := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		out = append(out, repo.Name)
+	}
+	return out
+}
+
+func backupEnabledEnv(getenv func(string) string) bool {
+	switch strings.ToLower(strings.TrimSpace(getenv("SM_ENABLE_BACKUP"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func schedulerConfig(s *agentbackup.ScheduleSettings) backupsched.Config {
+	backupTime := s.BackupTime
+	if backupTime == "" {
+		backupTime = "02:30"
+	}
+	checkTime := s.CheckTime
+	if checkTime == "" {
+		checkTime = "00:00"
+	}
+	backupJitter := 900
+	if s.BackupJitterS > 0 {
+		backupJitter = s.BackupJitterS
+	}
+	checkJitter := 21600
+	if s.CheckJitterS > 0 {
+		checkJitter = s.CheckJitterS
+	}
+	return backupsched.Config{
+		BackupTime:   backupTime,
+		BackupJitter: time.Duration(backupJitter) * time.Second,
+		CheckWeekday: parseWeekday(s.CheckWeekday),
+		CheckTime:    checkTime,
+		CheckJitter:  time.Duration(checkJitter) * time.Second,
+	}
+}
+
+func parseWeekday(s string) time.Weekday {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "sunday":
+		return time.Sunday
+	case "tuesday":
+		return time.Tuesday
+	case "wednesday":
+		return time.Wednesday
+	case "thursday":
+		return time.Thursday
+	case "friday":
+		return time.Friday
+	case "saturday":
+		return time.Saturday
+	default:
+		return time.Monday
+	}
+}
+
+func waitScheduler(s *backupsched.Scheduler, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
 func backupCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -309,7 +433,7 @@ func backupCmd(args []string) {
 		fs := flag.NewFlagSet("backup run", flag.ExitOnError)
 		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
 		_ = fs.Parse(args[1:])
-		result, err := agentbackup.RunFromConfigPath(ctx, *configPath, agentbackup.Options{Logger: logger})
+		result, err := agentbackup.RunFromConfigPath(ctx, *configPath, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup run failed", "err", err)
 			os.Exit(1)
@@ -321,7 +445,7 @@ func backupCmd(args []string) {
 		fs := flag.NewFlagSet("backup init", flag.ExitOnError)
 		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
 		_ = fs.Parse(args[1:])
-		result, err := agentbackup.InitFromConfigPath(ctx, *configPath, agentbackup.Options{Logger: logger})
+		result, err := agentbackup.InitFromConfigPath(ctx, *configPath, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup init failed", "err", err)
 			os.Exit(1)
@@ -335,7 +459,7 @@ func backupCmd(args []string) {
 		repoName := fs.String("repo", "", "repo name")
 		jsonOut := fs.Bool("json", false, "print JSON")
 		_ = fs.Parse(args[1:])
-		result, err := agentbackup.SnapshotsFromConfigPath(ctx, *configPath, *repoName, agentbackup.Options{Logger: logger})
+		result, err := agentbackup.SnapshotsFromConfigPath(ctx, *configPath, *repoName, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup snapshots failed", "err", err)
 			os.Exit(1)
@@ -368,7 +492,7 @@ func backupCmd(args []string) {
 			Repo:           *repoName,
 			ReadDataSubset: *readDataSubset,
 			Drill:          *drill,
-		}, agentbackup.Options{Logger: logger})
+		}, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup check failed", "err", err)
 			os.Exit(1)
@@ -411,6 +535,25 @@ func backupCmd(args []string) {
 		if result.Warning != "" {
 			fmt.Fprintf(os.Stderr, "warning: %s\n", result.Warning)
 		}
+	case "provision":
+		fs := flag.NewFlagSet("backup provision", flag.ExitOnError)
+		_ = fs.Parse(args[1:])
+		res, err := agentbackup.Provision(os.Getenv)
+		if err != nil {
+			logger.Error("backup provision failed", "err", err)
+			os.Exit(1)
+		}
+		fmt.Printf("provisioned %s (key_generated=%v, config_rewritten=%v)\n", res.ConfigPath, res.KeyGenerated, res.Rewrote)
+	case "recovery-kit":
+		fs := flag.NewFlagSet("backup recovery-kit", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		_ = fs.Parse(args[1:])
+		kit, err := agentbackup.RenderRecoveryKit(*configPath)
+		if err != nil {
+			logger.Error("backup recovery-kit failed", "err", err)
+			os.Exit(1)
+		}
+		fmt.Print(kit)
 	case "proxy":
 		fs := flag.NewFlagSet("backup proxy", flag.ExitOnError)
 		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
@@ -421,7 +564,7 @@ func backupCmd(args []string) {
 			logger.Error("backup proxy failed", "err", err)
 			os.Exit(1)
 		}
-		info, err := agentbackup.StartProxy(cfg, *listen, agentbackup.Options{Logger: logger})
+		info, err := agentbackup.StartProxy(cfg, *listen, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup proxy failed", "err", err)
 			os.Exit(1)
@@ -456,7 +599,7 @@ func backupCmd(args []string) {
 			Target:   *target,
 			InPlace:  *inPlace,
 			Instance: *instance,
-		}, agentbackup.Options{Logger: logger})
+		}, agentbackup.BaseOptions(logger))
 		if err != nil {
 			logger.Error("backup restore failed", "err", err)
 			os.Exit(1)
@@ -475,7 +618,7 @@ func backupCmd(args []string) {
 				result.Summary.BytesRestored, result.Summary.TotalBytes, result.Summary.FilesSkipped)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
 }

@@ -33,6 +33,12 @@
   let promoteError = $state<string | null>(null);
   let promoteBusy = $state(false);
 
+  let editingNode = $state<BackupNode | null>(null);
+  let editEndpoint = $state('');
+  let editPort = $state<number>(51821);
+  let editError = $state<string | null>(null);
+  let editBusy = $state(false);
+
   let newDestination = $state<'server' | number>('server');
   let baseUrl = $state('');
   let loading = $state(true);
@@ -87,11 +93,43 @@
   }
 
   function openPromote() {
+    editingNode = null;
     promoteHostId = null;
     promoteEndpoint = '';
     promotePort = 51821;
     promoteError = null;
     promoting = true;
+  }
+
+  function openEdit(node: BackupNode) {
+    promoting = false;
+    editingNode = node;
+    editEndpoint = node.endpoint;
+    editPort = node.udp_port || 51821;
+    editError = null;
+  }
+
+  async function saveEdit() {
+    if (!editingNode) return;
+    if (!editEndpoint.trim()) {
+      editError = 'Give the endpoint agents reach this node at.';
+      return;
+    }
+    editBusy = true;
+    editError = null;
+    try {
+      await api.backupNodeUpdate(editingNode.host_id, {
+        endpoint: editEndpoint.trim(),
+        udp_port: editPort || 51821
+      });
+      editingNode = null;
+      const nodeResp = await api.backupNodes().catch(() => null);
+      nodes = nodeResp?.nodes ?? nodes;
+    } catch (e) {
+      editError = (e as Error).message;
+    } finally {
+      editBusy = false;
+    }
   }
 
   function promoteHostChanged() {
@@ -292,7 +330,7 @@
     return m;
   });
 
-  const activeBackupStates = new Set(['ok', 'stale', 'error']);
+  const activeBackupStates = new Set(['ok', 'stale', 'error', 'scheduled']);
   const hostBackups = $derived.by<HostBackup[]>(() =>
     hosts
       .filter((h) => activeBackupStates.has(h.collector_status?.backup?.state ?? ''))
@@ -314,6 +352,8 @@
         return 'bg-amber-400';
       case 'error':
         return 'bg-rose-400';
+      case 'scheduled':
+        return 'bg-sky-400';
       default:
         return 'bg-zinc-600';
     }
@@ -326,6 +366,8 @@
         return 'text-amber-300';
       case 'error':
         return 'text-rose-300';
+      case 'scheduled':
+        return 'text-sky-300';
       default:
         return 'text-zinc-500';
     }
@@ -338,6 +380,8 @@
         return 'stale';
       case 'error':
         return 'error';
+      case 'scheduled':
+        return 'scheduled';
       case 'not_configured':
         return 'not configured';
       default:
@@ -1065,6 +1109,54 @@ restic -r ${publicRepoUrl} backup /etc`;
               </div>
             {/if}
 
+            {#if editingNode}
+              <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5 max-w-2xl">
+                <h3 class="text-sm font-medium text-zinc-100">Edit endpoint for <span class="font-mono">{editingNode.hostname}</span></h3>
+                <p class="mt-1 text-xs text-zinc-500">
+                  Update where backup hosts dial this node. The node's agent applies a new UDP port on its next config poll (within a minute); enrolled hosts pick up the change on their next backup run.
+                </p>
+                <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div class="sm:col-span-2">
+                    <label for="en-endpoint" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Endpoint other hosts dial</label>
+                    <input
+                      id="en-endpoint"
+                      type="text"
+                      bind:value={editEndpoint}
+                      placeholder="nas-01.lan or 203.0.113.7"
+                      autocomplete="off"
+                      spellcheck="false"
+                      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm font-mono" />
+                  </div>
+                  <div>
+                    <label for="en-port" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">UDP port</label>
+                    <input
+                      id="en-port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      bind:value={editPort}
+                      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm numeric" />
+                  </div>
+                </div>
+                <p class="mt-2 text-[11px] text-zinc-600">
+                  Must be reachable over UDP from the hosts that back up here. This only changes the dial address — the node's stored data and repositories are untouched.
+                </p>
+                {#if editError}
+                  <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{editError}</div>
+                {/if}
+                <div class="mt-4 flex justify-end gap-2">
+                  <button type="button" onclick={() => (editingNode = null)} class="text-sm px-3 py-2 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40">Cancel</button>
+                  <button
+                    type="button"
+                    disabled={editBusy || !editEndpoint.trim()}
+                    onclick={saveEdit}
+                    class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
+                    {editBusy ? 'Saving…' : 'Save endpoint'}
+                  </button>
+                </div>
+              </div>
+            {/if}
+
             <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
               {#if nodes.length === 0}
                 <div class="px-4 py-10 text-center text-sm text-zinc-500">
@@ -1103,12 +1195,20 @@ restic -r ${publicRepoUrl} backup /etc`;
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{n.target_count}</td>
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{bytes(n.used_bytes)}</td>
                           <td class="px-4 py-3 text-right">
-                            <button
-                              type="button"
-                              onclick={() => (nodeToDemote = n)}
-                              class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
-                              Demote
-                            </button>
+                            <div class="flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onclick={() => openEdit(n)}
+                                class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
+                                Edit endpoint
+                              </button>
+                              <button
+                                type="button"
+                                onclick={() => (nodeToDemote = n)}
+                                class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                                Demote
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       {/each}

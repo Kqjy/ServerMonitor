@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"servermonitor/pkg/metrics"
+	"servermonitor/pkg/version"
 	"servermonitor/pkg/wire"
 )
 
@@ -21,8 +22,10 @@ const (
 	backupStateUnknown       = "unknown"
 	backupStateOK            = "ok"
 	backupStateNotConfigured = "not_configured"
+	backupStateScheduled     = "scheduled"
 	backupStateError         = "error"
 	backupStateStale         = "stale"
+	backupStateStaleAgent    = "stale_agent"
 	backupStatusStaleAfter   = 26 * time.Hour
 	backupSnapshotLimit      = 50
 	backupInventoryInterval  = 15 * time.Minute
@@ -42,6 +45,12 @@ type backupCollector struct {
 	lastStatusOK             bool
 	lastRunningRepo          string
 	queryNextRun             func(ctx context.Context) *time.Time
+	scheduledRepos           []string
+	privPath                 string
+	privFingerprint          backupStatusFingerprint
+	privVersion              string
+	privVersionOK            bool
+	execVersion              func(ctx context.Context, path string) (string, error)
 }
 
 type backupStatusFingerprint struct {
@@ -54,7 +63,46 @@ var defaultBackupCollector = newBackupCollector(defaultBackupStatusPath())
 func init() { Register(defaultBackupCollector) }
 
 func newBackupCollector(path string) *backupCollector {
-	return &backupCollector{path: path, now: time.Now, queryNextRun: nextBackupRun}
+	return &backupCollector{
+		path:         path,
+		now:          time.Now,
+		queryNextRun: nextBackupRun,
+		privPath:     defaultPrivilegedAgentPath(),
+		execVersion:  execAgentVersion,
+	}
+}
+
+func defaultPrivilegedAgentPath() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "/usr/local/bin/sm-agent"
+	case "windows":
+		if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
+			return filepath.Join(programFiles, "ServerMonitor", "sm-agent.exe")
+		}
+		return `C:\Program Files\ServerMonitor\sm-agent.exe`
+	default:
+		return ""
+	}
+}
+
+func execAgentVersion(ctx context.Context, path string) (string, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := run(cmdCtx, path, "--version")
+	return string(out), err
+}
+
+func parseAgentVersion(raw string) (string, bool) {
+	value := strings.TrimSpace(raw)
+	if !strings.HasPrefix(value, "sm-agent ") {
+		return "", false
+	}
+	fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(value, "sm-agent ")))
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
 }
 
 func parseSystemdNextElapse(raw string) *time.Time {
@@ -106,6 +154,27 @@ func nextBackupRun(ctx context.Context) *time.Time {
 
 func SetBackupStatusPath(path string) {
 	defaultBackupCollector.setPath(path)
+}
+
+func SetBackupNextRunSource(fn func(ctx context.Context) *time.Time) {
+	if fn == nil {
+		return
+	}
+	defaultBackupCollector.mu.Lock()
+	defaultBackupCollector.queryNextRun = fn
+	defaultBackupCollector.mu.Unlock()
+}
+
+func SetBackupScheduledRepos(names []string) {
+	defaultBackupCollector.mu.Lock()
+	defaultBackupCollector.scheduledRepos = append([]string(nil), names...)
+	defaultBackupCollector.mu.Unlock()
+}
+
+func (c *backupCollector) scheduledReposCopy() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.scheduledRepos...)
 }
 
 func defaultBackupStatusPath() string {
@@ -163,8 +232,19 @@ func (c *backupCollector) currentTime() time.Time {
 func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := c.currentTime()
 	out := c.backupProgressPoints(now)
+	staleAgent, privilegedPresent, staleAgentMsg := c.privilegedAgentDrift(ctx)
+	if privilegedPresent {
+		value := 0.0
+		if staleAgent {
+			value = 1
+		}
+		out = append(out, point(now, metrics.BackupAgentStale, nil, value))
+	}
 	info, status, ok := c.readBackupStatus()
 	if !ok {
+		if len(c.scheduledReposCopy()) > 0 {
+			c.setState(backupStateScheduled, "")
+		}
 		return out, nil
 	}
 	out = append(out, backupPoints(now, status.Repos)...)
@@ -173,7 +253,57 @@ func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	} else {
 		c.setState(backupStateOK, "")
 	}
+	if staleAgent && c.Status().State == backupStateOK {
+		c.setState(backupStateStaleAgent, staleAgentMsg)
+	}
 	return out, nil
+}
+
+func (c *backupCollector) privilegedAgentDrift(ctx context.Context) (stale bool, present bool, msg string) {
+	if c.privPath == "" {
+		return false, false, ""
+	}
+	info, err := os.Stat(c.privPath)
+	if err != nil {
+		return false, false, ""
+	}
+	residentPath, err := os.Executable()
+	if err != nil {
+		return false, false, ""
+	}
+	resolvedResidentPath, err := filepath.EvalSymlinks(residentPath)
+	if err != nil {
+		resolvedResidentPath, err = filepath.Abs(residentPath)
+		if err != nil {
+			return false, false, ""
+		}
+	}
+	privilegedPath, err := filepath.EvalSymlinks(c.privPath)
+	if err != nil {
+		privilegedPath, err = filepath.Abs(c.privPath)
+		if err != nil {
+			return false, false, ""
+		}
+	}
+	if resolvedResidentPath == privilegedPath {
+		return false, false, ""
+	}
+	fingerprint := backupStatusFingerprint{mtime: info.ModTime(), size: info.Size()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.privFingerprint != fingerprint {
+		raw, execErr := c.execVersion(ctx, c.privPath)
+		parsed, ok := parseAgentVersion(raw)
+		c.privFingerprint = fingerprint
+		c.privVersion = parsed
+		c.privVersionOK = execErr == nil && ok
+	}
+	if !c.privVersionOK {
+		return false, false, ""
+	}
+	stale = version.IsNewer(version.Version, c.privVersion)
+	msg = fmt.Sprintf("backup agent copy v%s is older than the resident agent v%s", c.privVersion, version.Version)
+	return stale, true, msg
 }
 
 type backupProgressFile struct {
@@ -230,7 +360,16 @@ func (c *backupCollector) swapRunningRepo(repo string, live bool) string {
 func (c *backupCollector) CollectBackups(ctx context.Context) ([]wire.BackupRepoStatus, error) {
 	info, status, ok := c.readBackupStatus()
 	if !ok {
-		return nil, nil
+		repos := c.scheduledReposCopy()
+		if len(repos) == 0 {
+			return nil, nil
+		}
+		next := c.queryNextRun(ctx)
+		out := make([]wire.BackupRepoStatus, 0, len(repos))
+		for _, name := range repos {
+			out = append(out, wire.BackupRepoStatus{Name: name, Engine: "restic", NextRun: next})
+		}
+		return out, nil
 	}
 	now := c.currentTime()
 	fingerprint := backupStatusFingerprint{mtime: info.ModTime(), size: info.Size()}

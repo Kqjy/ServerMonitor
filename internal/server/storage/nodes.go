@@ -68,6 +68,20 @@ func (n *BackupNodes) Promote(ctx context.Context, hostID int64, udpPort int, en
 	return err
 }
 
+func (n *BackupNodes) UpdateEndpoint(ctx context.Context, hostID int64, udpPort int, endpoint string) error {
+	res, err := n.db.Pool.Exec(ctx, `
+		UPDATE backup_nodes SET udp_port = $2, endpoint = $3, updated_at = now()
+		WHERE host_id = $1
+	`, hostID, udpPort, endpoint)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (n *BackupNodes) Demote(ctx context.Context, hostID int64) error {
 	var targetCount int
 	err := n.db.Pool.QueryRow(ctx, `

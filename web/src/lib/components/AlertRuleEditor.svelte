@@ -49,7 +49,8 @@
     { label: 'Backup stale', name: 'Backup stale', metric: 'backup_last_success_age_s', comparator: '>', threshold: 93600, severity: 'warning' },
     { label: 'Backup failed', name: 'Backup failed', metric: 'backup_last_run_ok', comparator: '<', threshold: 1, severity: 'critical' },
     { label: 'Check failing', name: 'Backup check failing', metric: 'backup_check_ok', comparator: '<', threshold: 1, severity: 'warning' },
-    { label: 'Check overdue', name: 'Backup check overdue', metric: 'backup_check_age_s', comparator: '>', threshold: 3456000, severity: 'warning' }
+    { label: 'Check overdue', name: 'Backup check overdue', metric: 'backup_check_age_s', comparator: '>', threshold: 3456000, severity: 'warning' },
+    { label: 'Backup agent outdated', name: 'Backup agent outdated', metric: 'backup_agent_stale', comparator: '>', threshold: 0, severity: 'warning' }
   ];
 
   function pairsToText(pairs: Record<string, string> | undefined | null): string {
