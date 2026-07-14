@@ -14,7 +14,12 @@ ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
 ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
-ENABLE_BACKUP="${SM_ENABLE_BACKUP:-0}"
+ENABLE_BACKUP=0
+DISABLE_BACKUP=0
+case "$(printf '%s' "${SM_ENABLE_BACKUP:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) ENABLE_BACKUP=1 ;;
+    0|false|no|off) DISABLE_BACKUP=1 ;;
+esac
 BACKUP_REPOS="${SM_BACKUP_REPOS:-}"
 BACKUP_REPO_NAMES="${SM_BACKUP_REPO_NAMES:-}"
 BACKUP_PATHS="${SM_BACKUP_PATHS:-}"
@@ -35,7 +40,7 @@ RESTIC_VERSION="0.19.0"
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-time HH:MM] [--reinstall]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--disable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-time HH:MM] [--reinstall]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
@@ -44,8 +49,9 @@ Re-running on a host that already has /etc/servermonitor/agent.toml reconfigures
 the service in place: it re-derives capabilities and group memberships from the
 --enable-* flags and restarts, without re-registering and without an admin token
 (--server and --binary are not required in that mode). When --binary is given,
-both agent copies are refreshed if its version differs. Pass --reinstall, or set
-SM_REINSTALL=1, to force a full fresh install instead.
+both agent copies are refreshed if its version differs. Existing scheduled
+backups are kept across a reconfigure unless you pass --disable-backup. Pass
+--reinstall, or set SM_REINSTALL=1, to force a full fresh install instead.
 
 Admin token MUST come from SM_ADMIN_TOKEN env var or --admin-token-file PATH.
 The --admin-token flag is deliberately not supported here: argv is visible in
@@ -152,7 +158,8 @@ while [[ $# -gt 0 ]]; do
     --enable-gpu)        ENABLE_GPU=1; shift ;;
     --enable-network)    ENABLE_NETWORK=1; shift ;;
     --enable-all)        ENABLE_ALL=1; shift ;;
-    --enable-backup)     ENABLE_BACKUP=1; shift ;;
+    --enable-backup)     ENABLE_BACKUP=1; DISABLE_BACKUP=0; shift ;;
+    --disable-backup)    DISABLE_BACKUP=1; ENABLE_BACKUP=0; shift ;;
     --backup-repos)      BACKUP_REPOS="$2"; shift 2 ;;
     --backup-repo-names) BACKUP_REPO_NAMES="$2"; shift 2 ;;
     --backup-paths)      BACKUP_PATHS="$2"; shift 2 ;;
@@ -1014,8 +1021,12 @@ systemctl status --no-pager sm-agent.service || true
 if [ "$ENABLE_BACKUP" = "1" ]; then
   provision_backup
 elif [ -f /etc/systemd/system/sm-backup.timer ] || [ -f /etc/systemd/system/sm-backup.service ]; then
-  backup_migrate_legacy
-  backup_remove_units
+  if [ "$DISABLE_BACKUP" = "1" ]; then
+    backup_migrate_legacy
+    backup_remove_units
+  else
+    printf 'note: keeping the existing sm-backup schedule; the refreshed agent keeps backing up. Pass --disable-backup to remove it.\n'
+  fi
 fi
 
 echo

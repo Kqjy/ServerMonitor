@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='34c9d3cff98c17226681f89b8430b382fbb1c4eef5fcde6a7eb5a02d55b2c89b'
+CANONICAL_INSTALLER_SHA256='a06aa6cfaed205c680f330cf789d826eabe3d5d522f7a5654b2ddbeed5f3fa9a'
 TOKEN="${SM_TOKEN:-}"
 INTERVAL="${SM_INTERVAL:-10}"
 INSECURE="${SM_INSECURE:-0}"
@@ -14,7 +14,12 @@ ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
 ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
-ENABLE_BACKUP="${SM_ENABLE_BACKUP:-0}"
+ENABLE_BACKUP=0
+DISABLE_BACKUP=0
+case "$(printf '%s' "${SM_ENABLE_BACKUP:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) ENABLE_BACKUP=1 ;;
+    0|false|no|off) DISABLE_BACKUP=1 ;;
+esac
 BACKUP_REPOS="${SM_BACKUP_REPOS:-}"
 BACKUP_REPO_NAMES="${SM_BACKUP_REPO_NAMES:-}"
 BACKUP_PATHS="${SM_BACKUP_PATHS:-}"
@@ -934,8 +939,12 @@ systemctl restart sm-agent.service
 if [ "$ENABLE_BACKUP" = "1" ]; then
     provision_backup
 elif [ -f /etc/systemd/system/sm-backup.timer ] || [ -f /etc/systemd/system/sm-backup.service ]; then
-    backup_migrate_legacy
-    backup_remove_units
+    if [ "$DISABLE_BACKUP" = "1" ]; then
+        backup_migrate_legacy
+        backup_remove_units
+    else
+        printf 'note: keeping the existing sm-backup schedule; the refreshed agent keeps backing up. Pass SM_ENABLE_BACKUP=0 to remove it.\n'
+    fi
 fi
 
 if [ "$RECONFIGURE" = "1" ]; then

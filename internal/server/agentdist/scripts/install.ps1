@@ -6,6 +6,7 @@ param(
     [switch]$AdminService,
     [switch]$EnableSmart,
     [switch]$EnableBackup,
+    [switch]$DisableBackup,
     [string]$BackupRepos,
     [string]$BackupRepoNames,
     [string]$BackupPaths,
@@ -24,6 +25,9 @@ if ($IntervalS -le 0) {
 if ($env:SM_ADMIN_SERVICE -eq '1') { $AdminService = $true }
 if ($env:SM_ENABLE_SMART -eq '1')  { $EnableSmart  = $true }
 if ($env:SM_ENABLE_BACKUP -eq '1') { $EnableBackup = $true }
+if ($env:SM_ENABLE_BACKUP -in @('0','false','no','off')) { $DisableBackup = $true }
+if ($PSBoundParameters.ContainsKey('EnableBackup'))  { $DisableBackup = $false }
+if ($PSBoundParameters.ContainsKey('DisableBackup')) { $EnableBackup  = $false }
 if (-not $BackupRepos     -and $env:SM_BACKUP_REPOS)      { $BackupRepos     = $env:SM_BACKUP_REPOS }
 if (-not $BackupRepoNames -and $env:SM_BACKUP_REPO_NAMES) { $BackupRepoNames = $env:SM_BACKUP_REPO_NAMES }
 if (-not $BackupPaths     -and $env:SM_BACKUP_PATHS)      { $BackupPaths     = $env:SM_BACKUP_PATHS }
@@ -34,7 +38,7 @@ if ($env:SM_BACKUP_S3_PATH_STYLE -eq '1') { $BackupS3PathStyle = $true }
 
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
-$CanonicalInstallerSha256 = '0a2416643cb25b83b2d6358157478d6fc7cab2e646a8238a2ae4f621e2cf8b92'
+$CanonicalInstallerSha256 = '6a85b77640f69acd16b5c2578ac3c9dd11ddd4a51631d8fd6014644982a747e3'
 $ResticVersion = '0.19.0'
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -507,7 +511,9 @@ function Invoke-BackupProvisioning {
     $tunnelKey    = Join-Path $backupDir 'tunnel.key'
     $recoveryKit  = Join-Path $backupDir 'recovery-kit.txt'
     $backupStatus = Join-Path $configDir 'backup-status.json'
-    Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
+    if ($EnableBackup -or $DisableBackup) {
+        Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
+    }
     $repoArr = @()
     if ($BackupRepos)     { $repoArr = $BackupRepos.Split(',')     | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
     $nameArr = @()
@@ -604,7 +610,7 @@ function Invoke-BackupProvisioning {
         } else {
             Write-Host "note: backup recovery kit at $recoveryKit (password not reprinted)"
         }
-    } else {
+    } elseif ($DisableBackup) {
         $existingCheck = Get-ScheduledTask -TaskName 'ServerMonitor Backup Check' -ErrorAction SilentlyContinue
         if ($existingCheck) {
             Unregister-ScheduledTask -TaskName 'ServerMonitor Backup Check' -Confirm:$false
@@ -617,6 +623,11 @@ function Invoke-BackupProvisioning {
             Write-Host 'and recovery-kit.txt were KEPT (they guard existing snapshots). Remove manually with:'
             Write-Host "  Remove-Item -Recurse '$backupDir'"
             Write-Host ''
+        }
+    } else {
+        $existingTask = Get-ScheduledTask -TaskName 'ServerMonitor Backup' -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Write-Host 'note: keeping the existing ServerMonitor Backup scheduled task; the refreshed agent keeps backing up. Pass -DisableBackup (or $env:SM_ENABLE_BACKUP=0) to remove it.'
         }
     }
 }

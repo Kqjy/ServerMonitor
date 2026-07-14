@@ -7,6 +7,7 @@ param(
     [string]$BinaryPath,
     [switch]$AdminService,
     [switch]$EnableBackup,
+    [switch]$DisableBackup,
     [Parameter(HelpMessage = 'tunnel:NAME backs up over the built-in WireGuard tunnel to the ServerMonitor server (requires the server to run with BACKUP_WG_PORT)')]
     [string]$BackupRepos,
     [string]$BackupRepoNames,
@@ -32,6 +33,9 @@ Assert-Elevated
 
 if ($env:SM_ADMIN_SERVICE -eq '1') { $AdminService = $true }
 if ($env:SM_ENABLE_BACKUP -eq '1') { $EnableBackup = $true }
+if ($env:SM_ENABLE_BACKUP -in @('0','false','no','off')) { $DisableBackup = $true }
+if ($PSBoundParameters.ContainsKey('EnableBackup'))  { $DisableBackup = $false }
+if ($PSBoundParameters.ContainsKey('DisableBackup')) { $EnableBackup  = $false }
 if (-not $BackupRepos     -and $env:SM_BACKUP_REPOS)      { $BackupRepos     = $env:SM_BACKUP_REPOS }
 if (-not $BackupRepoNames -and $env:SM_BACKUP_REPO_NAMES) { $BackupRepoNames = $env:SM_BACKUP_REPO_NAMES }
 if (-not $BackupPaths     -and $env:SM_BACKUP_PATHS)      { $BackupPaths     = $env:SM_BACKUP_PATHS }
@@ -474,7 +478,9 @@ function Invoke-BackupProvisioning {
     $tunnelKey    = Join-Path $backupDir 'tunnel.key'
     $recoveryKit  = Join-Path $backupDir 'recovery-kit.txt'
     $backupStatus = Join-Path $configDir 'backup-status.json'
-    Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
+    if ($EnableBackup -or $DisableBackup) {
+        Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
+    }
     $repoArr = @()
     if ($BackupRepos)     { $repoArr = $BackupRepos.Split(',')     | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
     $nameArr = @()
@@ -571,7 +577,7 @@ function Invoke-BackupProvisioning {
         } else {
             Write-Host "note: backup recovery kit at $recoveryKit (password not reprinted)"
         }
-    } else {
+    } elseif ($DisableBackup) {
         $existingCheck = Get-ScheduledTask -TaskName 'ServerMonitor Backup Check' -ErrorAction SilentlyContinue
         if ($existingCheck) {
             Unregister-ScheduledTask -TaskName 'ServerMonitor Backup Check' -Confirm:$false
@@ -586,6 +592,11 @@ function Invoke-BackupProvisioning {
             Write-Host 'server UI (Backups page). Remove the kept files manually with:'
             Write-Host "  Remove-Item -Recurse '$backupDir'"
             Write-Host ''
+        }
+    } else {
+        $existingTask = Get-ScheduledTask -TaskName 'ServerMonitor Backup' -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Write-Host 'note: keeping the existing ServerMonitor Backup scheduled task; the refreshed agent keeps backing up. Pass -DisableBackup (or $env:SM_ENABLE_BACKUP=0) to remove it.'
         }
     }
 }
