@@ -9,10 +9,11 @@
     type BackupTargetsResp
   } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
-  import { bytes, timeAgo } from '$lib/format';
+  import { bytes, timeAgo, timeUntil } from '$lib/format';
   import { TableSort } from '$lib/sort.svelte';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
+  import { subscribeHost, type LivePoint } from '$lib/sse';
 
   let {
     hostId,
@@ -57,6 +58,7 @@
     error?: string;
     lastSuccessIso?: string;
     lastFinishedIso?: string;
+    nextRunIso?: string;
     lastSuccessAgeS: number | null;
     durationS: number | null;
     addedBytes: number | null;
@@ -90,7 +92,70 @@
   let chartsGen = 0;
   let chartsAC: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let liveTimer: ReturnType<typeof setInterval> | null = null;
+  let liveUnsub: (() => void) | null = null;
   let prevRange: Range | null = null;
+
+  type LiveBackup = {
+    running: boolean;
+    elapsedS: number;
+    lastSeen: number;
+    percent: number;
+    bytesDone: number;
+    totalBytes: number;
+  };
+
+  let liveBackups = $state<Record<string, LiveBackup>>({});
+  let liveNow = $state(Date.now());
+  const liveFreshMs = 30_000;
+
+  function isRunning(repo: string): boolean {
+    const live = liveBackups[repo];
+    return !!live && live.running && liveNow - live.lastSeen < liveFreshMs;
+  }
+
+  function displayedElapsed(repo: string): number {
+    const live = liveBackups[repo];
+    if (!live) return 0;
+    return Math.max(0, live.elapsedS + (liveNow - live.lastSeen) / 1000);
+  }
+
+  function refreshAfterRun() {
+    void loadBackups();
+    void loadCharts();
+  }
+
+  function receiveLive(points: LivePoint[]) {
+    const next = { ...liveBackups };
+    const now = Date.now();
+    let completed = false;
+    for (const point of points) {
+      const repo = point.labels?.repo;
+      if (!repo) continue;
+      const current = next[repo] ?? { running: false, elapsedS: 0, lastSeen: 0, percent: 0, bytesDone: 0, totalBytes: 0 };
+      const previousRunning = current.running && now - current.lastSeen < liveFreshMs;
+      const updated = { ...current };
+      if (point.metric === 'backup_running') {
+        updated.running = point.v === 1;
+        updated.lastSeen = now;
+        if (previousRunning && !updated.running) completed = true;
+      } else if (point.metric === 'backup_run_elapsed_s') {
+        updated.elapsedS = point.v;
+      } else if (point.metric === 'backup_progress_pct') {
+        updated.percent = Math.max(0, Math.min(100, point.v));
+      } else if (point.metric === 'backup_progress_bytes') {
+        updated.bytesDone = Math.max(0, point.v);
+      } else if (point.metric === 'backup_progress_total_bytes') {
+        updated.totalBytes = Math.max(0, point.v);
+      }
+      next[repo] = updated;
+    }
+    liveBackups = next;
+    liveNow = now;
+    if (completed) refreshAfterRun();
+  }
+
+  const runningRepos = $derived(Object.keys(liveBackups).filter((repo) => isRunning(repo)));
 
   let selectedRepo = $state<string>('');
   let selectedSnap = $state<string | null>(null);
@@ -162,6 +227,7 @@
           error: s.error,
           lastSuccessIso: s.last_success,
           lastFinishedIso: s.last_finished,
+          nextRunIso: s.next_run,
           lastSuccessAgeS,
           durationS: s.duration_s ?? null,
           addedBytes: s.added_bytes ?? null,
@@ -300,9 +366,26 @@
     timer = setInterval(() => {
       if (chartZoom === null) loadCharts();
     }, 10_000);
+    liveUnsub = subscribeHost(hostId, ['backup_running', 'backup_run_elapsed_s', 'backup_progress_pct', 'backup_progress_bytes', 'backup_progress_total_bytes'], receiveLive);
+    liveTimer = setInterval(() => {
+      const now = Date.now();
+      let completed = false;
+      const next = { ...liveBackups };
+      for (const [repo, live] of Object.entries(next)) {
+        if (live.running && now - live.lastSeen >= liveFreshMs) {
+          next[repo] = { ...live, running: false };
+          completed = true;
+        }
+      }
+      liveBackups = next;
+      liveNow = now;
+      if (completed) refreshAfterRun();
+    }, 1000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    if (liveTimer) clearInterval(liveTimer);
+    liveUnsub?.();
     if (copyTimer) clearTimeout(copyTimer);
     chartsAC?.abort();
     backupsAC?.abort();
@@ -429,12 +512,16 @@
       </div>
     {:else if views.length === 0 && !backupsError}
       <div class="p-6 sm:p-8">
-        <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
-        <p class="mt-1 text-sm text-zinc-500 max-w-xl">
-          {backupStatus?.state === 'not_configured' || !backupStatus
-            ? 'Its agent reports no backup job. Enable backups to protect this host and see restore-ready snapshots here.'
-            : 'The agent reports backups are enabled but no repository status has arrived yet — the first run may not have finished.'}
-        </p>
+        {#if runningRepos.length > 0}
+          <h3 class="flex items-center gap-2 text-base font-medium text-zinc-100"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>First backup is running <span class="numeric text-sm font-normal text-emerald-300">(started {durationText(displayedElapsed(runningRepos[0]))} ago)</span></h3>
+        {:else}
+          <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
+          <p class="mt-1 text-sm text-zinc-500 max-w-xl">
+            {backupStatus?.state === 'not_configured' || !backupStatus
+              ? 'Its agent reports no backup job. Enable backups to protect this host and see restore-ready snapshots here.'
+              : 'The agent reports backups are enabled but no repository status has arrived yet — the first run may not have finished.'}
+          </p>
+        {/if}
 
         {#if endpointConfigured && linkedRepo}
           <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
@@ -486,10 +573,14 @@
                   </div>
                 </td>
                 <td class="px-3 py-2.5">
-                  <div class="flex items-center gap-2">
-                    <span class="numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : 'never'}</span>
-                    {#if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
-                  </div>
+                  {#if isRunning(v.repo)}
+                    <div class="flex items-center gap-2 text-emerald-300"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span>backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span></div>
+                  {:else}
+                    <div class="flex items-center gap-2">
+                      <span class="numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : 'never'}</span>
+                      {#if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
+                    </div>
+                  {/if}
                 </td>
                 <td class="px-3 py-2.5">
                   <div class="flex items-center gap-2">
@@ -513,8 +604,22 @@
                 <h3 class="min-w-0 truncate font-mono text-sm text-zinc-100">{v.repo}</h3>
                 {#if v.engine}<div class="mt-0.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}{#if v.tunnel}<span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}</div>{:else if v.tunnel}<div class="mt-0.5 text-[10px] uppercase tracking-wider"><span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300">tunnel</span></div>{/if}
               </div>
-              <span class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[v.backupTone]}">{runLabel(v.success)}</span>
+              {#if isRunning(v.repo)}
+                <span class="shrink-0 rounded-md border border-emerald-900/60 bg-emerald-950/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">running</span>
+              {:else}
+                <span class="shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[v.backupTone]}">{runLabel(v.success)}</span>
+              {/if}
             </header>
+            {#if isRunning(v.repo)}
+              <div class="mt-3">
+                <div class="h-1.5 overflow-hidden rounded-full bg-zinc-800"><div class="h-full rounded-full bg-emerald-500" style="width: {liveBackups[v.repo].percent}%"></div></div>
+                <div class="mt-1.5 flex items-center justify-between gap-3 text-[11px] text-zinc-400">
+                  <span class="text-emerald-300">backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span>
+                  <span class="numeric whitespace-nowrap">{Math.round(liveBackups[v.repo].percent)}% — {liveBackups[v.repo].totalBytes > 0 ? `${bytes(liveBackups[v.repo].bytesDone)} of ${bytes(liveBackups[v.repo].totalBytes)}` : `${bytes(liveBackups[v.repo].bytesDone)} processed`}</span>
+                </div>
+                {#if liveBackups[v.repo].percent >= 100}<div class="mt-1 text-[10px] text-zinc-500">Data transfer complete; finalizing the backup.</div>{/if}
+              </div>
+            {/if}
             <div class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Last success</div>
@@ -523,6 +628,10 @@
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Last run</div>
                 <div class="mt-0.5 numeric text-zinc-300">{v.lastFinishedIso ? timeAgo(v.lastFinishedIso) : 'n/a'}</div>
+              </div>
+              <div>
+                <div class="text-[10px] uppercase tracking-wider text-zinc-500">Next run</div>
+                <div class="mt-0.5 numeric text-zinc-300">{absTime(v.nextRunIso)}{#if v.nextRunIso}<span class="ml-2 text-xs text-zinc-500">{timeUntil(v.nextRunIso)}</span>{/if}</div>
               </div>
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Duration</div>

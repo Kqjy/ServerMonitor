@@ -45,6 +45,17 @@ export function timeAgo(iso?: string): string {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
+export function timeUntil(iso?: string): string {
+  if (!iso) return '';
+  const ms = new Date(iso).getTime() - Date.now();
+  if (isNaN(ms)) return '';
+  if (ms <= 0) return 'due now';
+  if (ms < 60_000) return `in ${Math.floor(ms / 1000)}s`;
+  if (ms < 3_600_000) return `in ${Math.floor(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `in ${Math.floor(ms / 3_600_000)}h`;
+  return `in ${Math.floor(ms / 86_400_000)}d`;
+}
+
 export function statusFor(iso?: string, intervalS = 10): 'good' | 'warn' | 'bad' | 'idle' {
   if (!iso) return 'idle';
   const sec = (Date.now() - new Date(iso).getTime()) / 1000;

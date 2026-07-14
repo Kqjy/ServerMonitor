@@ -68,6 +68,7 @@ type BackupRepoStatus struct {
 	CheckLast     *time.Time       `json:"check_last,omitempty"`
 	CheckSuccess  *bool            `json:"check_success,omitempty"`
 	Tunnel        bool             `json:"tunnel,omitempty"`
+	NextRun       *time.Time       `json:"next_run,omitempty"`
 	Snapshots     []BackupSnapshot `json:"snapshots,omitempty"`
 }
 
@@ -125,8 +126,16 @@ type NodeUsageEntry struct {
 	UsedBytes int64  `json:"used_bytes"`
 }
 
+type NodePeerStat struct {
+	PublicKey         string `json:"public_key"`
+	LastHandshakeUnix int64  `json:"last_handshake_unix,omitempty"`
+	RxBytes           int64  `json:"rx_bytes,omitempty"`
+	TxBytes           int64  `json:"tx_bytes,omitempty"`
+}
+
 type BackupNodeUsage struct {
 	Targets []NodeUsageEntry `json:"targets"`
+	Peers   []NodePeerStat   `json:"peers,omitempty"`
 }
 
 type CollectorStatus struct {

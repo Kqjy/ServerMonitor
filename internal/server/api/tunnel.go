@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -36,6 +37,7 @@ type tunnelPeerView struct {
 	RxBytes       int64      `json:"rx_bytes"`
 	TxBytes       int64      `json:"tx_bytes"`
 	Connected     bool       `json:"connected"`
+	Via           string     `json:"via,omitempty"`
 }
 
 type backupTunnelResponse struct {
@@ -51,6 +53,79 @@ type backupTunnelResponse struct {
 }
 
 const tunnelHandshakeConnectedWindow = 3 * time.Minute
+
+type nodePeerStat struct {
+	LastHandshake time.Time
+	RxBytes       int64
+	TxBytes       int64
+	NodeHostname  string
+	ReportedAt    time.Time
+}
+
+type NodePeerStatsCache struct {
+	mu      sync.Mutex
+	entries map[wgtunnel.Key]map[int64]nodePeerStat
+}
+
+func NewNodePeerStatsCache() *NodePeerStatsCache {
+	return &NodePeerStatsCache{entries: map[wgtunnel.Key]map[int64]nodePeerStat{}}
+}
+
+func (c *NodePeerStatsCache) Store(nodeHostID int64, nodeHostname string, stats []wire.NodePeerStat) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, stat := range stats {
+		key, err := wgtunnel.ParseKey(stat.PublicKey)
+		if err != nil {
+			continue
+		}
+		lastHandshake := time.Time{}
+		if stat.LastHandshakeUnix > 0 {
+			lastHandshake = time.Unix(stat.LastHandshakeUnix, 0).UTC()
+		}
+		byNode := c.entries[key]
+		if byNode == nil {
+			byNode = map[int64]nodePeerStat{}
+			c.entries[key] = byNode
+		}
+		byNode[nodeHostID] = nodePeerStat{
+			LastHandshake: lastHandshake,
+			RxBytes:       stat.RxBytes,
+			TxBytes:       stat.TxBytes,
+			NodeHostname:  nodeHostname,
+			ReportedAt:    now,
+		}
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	for key, byNode := range c.entries {
+		for hostID, stat := range byNode {
+			if stat.ReportedAt.Before(cutoff) {
+				delete(byNode, hostID)
+			}
+		}
+		if len(byNode) == 0 {
+			delete(c.entries, key)
+		}
+	}
+}
+
+func (c *NodePeerStatsCache) Get(key wgtunnel.Key) []nodePeerStat {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byNode := c.entries[key]
+	stats := make([]nodePeerStat, 0, len(byNode))
+	for _, stat := range byNode {
+		stats = append(stats, stat)
+	}
+	return stats
+}
+
+func (c *NodePeerStatsCache) Remove(key wgtunnel.Key) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
 
 func tunnelEndpointForRequest(info BackupTunnelInfo, r *http.Request) string {
 	endpoint := strings.TrimSpace(info.Endpoint)
@@ -120,7 +195,32 @@ func tunnelEnrollHandler(tunnel *restserver.Tunnel, peers *storage.BackupTunnelS
 	}
 }
 
-func backupTunnelStatusHandler(tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore, info BackupTunnelInfo) http.HandlerFunc {
+func mergePeerStats(server *wgtunnel.PeerStats, node []nodePeerStat, now time.Time) (last *time.Time, rx, tx int64, connected bool, via string) {
+	if server != nil {
+		rx = server.RxBytes
+		tx = server.TxBytes
+		if !server.LastHandshake.IsZero() {
+			handshake := server.LastHandshake
+			last = &handshake
+		}
+	}
+	for _, stat := range node {
+		rx += stat.RxBytes
+		tx += stat.TxBytes
+		if stat.LastHandshake.IsZero() {
+			continue
+		}
+		if last == nil || !stat.LastHandshake.Before(*last) {
+			handshake := stat.LastHandshake
+			last = &handshake
+			via = stat.NodeHostname
+		}
+	}
+	connected = last != nil && now.Sub(*last) < tunnelHandshakeConnectedWindow
+	return last, rx, tx, connected, via
+}
+
+func backupTunnelStatusHandler(tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore, info BackupTunnelInfo, nodeStats *NodePeerStatsCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resp := backupTunnelResponse{Enabled: tunnel != nil, PublicHTTP: info.PublicHTTP, Peers: []tunnelPeerView{}}
 		if tunnel == nil {
@@ -153,15 +253,11 @@ func backupTunnelStatusHandler(tunnel *restserver.Tunnel, peers *storage.BackupT
 				EnrolledAt: p.EnrolledAt,
 			}
 			if key, err := wgtunnel.KeyFromBytes(p.PublicKey); err == nil {
-				if s, ok := statsByKey[key]; ok {
-					view.RxBytes = s.RxBytes
-					view.TxBytes = s.TxBytes
-					if !s.LastHandshake.IsZero() {
-						hs := s.LastHandshake
-						view.LastHandshake = &hs
-						view.Connected = now.Sub(hs) < tunnelHandshakeConnectedWindow
-					}
+				var server *wgtunnel.PeerStats
+				if stat, ok := statsByKey[key]; ok {
+					server = &stat
 				}
+				view.LastHandshake, view.RxBytes, view.TxBytes, view.Connected, view.Via = mergePeerStats(server, nodeStats.Get(key), now)
 			}
 			resp.Peers = append(resp.Peers, view)
 		}
@@ -249,7 +345,7 @@ func agentBackupNodeConfigHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 	}
 }
 
-func agentBackupNodeUsageHandler(nodes *storage.BackupNodes) http.HandlerFunc {
+func agentBackupNodeUsageHandler(nodes *storage.BackupNodes, peerStats *NodePeerStatsCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := hostIDFromContext(r.Context())
 		if !ok {
@@ -261,7 +357,8 @@ func agentBackupNodeUsageHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		if _, err := nodes.Get(r.Context(), hostID); err != nil {
+		node, err := nodes.Get(r.Context(), hostID)
+		if err != nil {
 			writeError(w, http.StatusForbidden, "host is not a backup node")
 			return
 		}
@@ -273,6 +370,9 @@ func agentBackupNodeUsageHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, "usage update failed")
 				return
 			}
+		}
+		if len(req.Peers) > 0 {
+			peerStats.Store(hostID, node.Hostname, req.Peers)
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
@@ -398,7 +498,7 @@ func demoteBackupNodeHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 	}
 }
 
-func revokeTunnelPeerHandler(tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore) http.HandlerFunc {
+func revokeTunnelPeerHandler(tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore, nodeStats *NodePeerStatsCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if tunnel == nil {
 			writeError(w, http.StatusServiceUnavailable, "backup tunnel is not enabled on this server")
@@ -425,6 +525,9 @@ func revokeTunnelPeerHandler(tunnel *restserver.Tunnel, peers *storage.BackupTun
 		if err := tunnel.RemovePeer(peer.PublicKey); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if key, err := wgtunnel.KeyFromBytes(peer.PublicKey); err == nil {
+			nodeStats.Remove(key)
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}

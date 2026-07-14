@@ -11,9 +11,24 @@ import (
 
 const statusVersion = 1
 
+const progressVersion = 1
+
 type StatusFile struct {
 	Version int          `json:"version"`
 	Repos   []RepoStatus `json:"repos"`
+}
+
+type ProgressFile struct {
+	Version    int     `json:"version"`
+	Running    bool    `json:"running"`
+	Repo       string  `json:"repo"`
+	ReposDone  int     `json:"repos_done"`
+	ReposTotal int     `json:"repos_total"`
+	StartedAt  int64   `json:"started_at"`
+	UpdatedAt  int64   `json:"updated_at"`
+	Percent    float64 `json:"percent"`
+	BytesDone  int64   `json:"bytes_done"`
+	TotalBytes int64   `json:"total_bytes"`
 }
 
 type RepoStatus struct {
@@ -54,6 +69,34 @@ func readStatusFile(path string) (StatusFile, error) {
 
 func writeStatusAtomic(path string, status StatusFile) error {
 	status.Version = statusVersion
+	return writeJSONAtomic(path, status)
+}
+
+func progressPath(statusPath string) string {
+	return filepath.Join(filepath.Dir(statusPath), "backup-progress.json")
+}
+
+func readProgressFile(path string) (ProgressFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ProgressFile{}, err
+	}
+	var progress ProgressFile
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return ProgressFile{}, err
+	}
+	if progress.Version != progressVersion {
+		return ProgressFile{}, fmt.Errorf("unsupported progress version %d", progress.Version)
+	}
+	return progress, nil
+}
+
+func writeProgressAtomic(path string, progress ProgressFile) error {
+	progress.Version = progressVersion
+	return writeJSONAtomic(path, progress)
+}
+
+func writeJSONAtomic(path string, value any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -61,10 +104,10 @@ func writeStatusAtomic(path string, status StatusFile) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(status); err != nil {
+	if err := enc.Encode(value); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "backup-status-*.json.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}

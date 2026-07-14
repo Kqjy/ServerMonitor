@@ -127,6 +127,7 @@ export interface BackupRepoStatus {
   check_last?: string;
   check_success?: boolean;
   tunnel?: boolean;
+  next_run?: string;
   snapshots?: BackupSnapshot[];
 }
 
@@ -200,6 +201,7 @@ export interface BackupTunnelPeer {
   rx_bytes: number;
   tx_bytes: number;
   connected: boolean;
+  via?: string;
 }
 
 export interface BackupTunnelResp {

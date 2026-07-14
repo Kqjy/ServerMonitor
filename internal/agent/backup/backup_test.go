@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,6 +26,37 @@ type fakeResticResponse struct {
 type fakeResticRunner struct {
 	calls     []Command
 	responses map[string][]fakeResticResponse
+}
+
+type progressResticRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	fail    bool
+}
+
+func (r *progressResticRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
+	switch resticSubcommand(command.Args) {
+	case "backup":
+		if command.OnStdoutLine != nil {
+			command.OnStdoutLine([]byte(`{"message_type":"status","percent_done":0.42,"bytes_done":1200,"total_bytes":3000}`))
+		}
+		r.once.Do(func() { close(r.entered) })
+		select {
+		case <-ctx.Done():
+			return CommandResult{}, ctx.Err()
+		case <-r.release:
+		}
+		if r.fail {
+			return CommandResult{Stderr: []byte("failed")}, errors.New("exit status 1")
+		}
+		return CommandResult{Stdout: []byte(`{"message_type":"summary","total_duration":2.6,"data_added":123,"total_bytes_processed":456}` + "\n")}, nil
+	case "snapshots":
+		return CommandResult{Stdout: []byte(`[]`)}, nil
+	case "forget":
+		return CommandResult{}, nil
+	}
+	return CommandResult{}, errors.New("unexpected command")
 }
 
 func newFakeResticRunner() *fakeResticRunner {
@@ -463,6 +495,100 @@ not json
 	}
 	if summary != (backupSummary{DurationS: 3, AddedBytes: 30, TotalBytes: 40}) {
 		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestParseBackupProgressLine(t *testing.T) {
+	valid, ok := parseBackupProgressLine([]byte(`{"message_type":"status","percent_done":0.42,"bytes_done":1200,"total_bytes":3000}`))
+	if !ok || valid != (backupProgressUpdate{Percent: 42, BytesDone: 1200, TotalBytes: 3000}) {
+		t.Fatalf("valid progress = %#v, %v", valid, ok)
+	}
+	if _, ok := parseBackupProgressLine([]byte(`{"message_type":"summary","percent_done":1}`)); ok {
+		t.Fatal("summary line parsed as progress")
+	}
+	large := []byte(`{"message_type":"status","percent_done":1.5,"current_files":["` + strings.Repeat("x", 100000) + `"]}`)
+	oversized, ok := parseBackupProgressLine(large)
+	if !ok || oversized.Percent != 100 {
+		t.Fatalf("oversized progress = %#v, %v", oversized, ok)
+	}
+	missing, ok := parseBackupProgressLine([]byte(`{"message_type":"status","percent_done":-0.1}`))
+	if !ok || missing.Percent != 0 || missing.BytesDone != 0 || missing.TotalBytes != 0 {
+		t.Fatalf("missing totals progress = %#v, %v", missing, ok)
+	}
+}
+
+func TestRunProgressLifecycleAndHeartbeat(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &progressResticRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), cfg, Options{Runner: runner, Now: func() time.Time { return time.Unix(1, 0).UTC() }, ProgressInterval: 10 * time.Millisecond})
+		done <- err
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("backup did not start")
+	}
+	path := progressPath(cfg.StatusPath)
+	var progress ProgressFile
+	deadline := time.Now().Add(time.Second)
+	for {
+		var err error
+		progress, err = readProgressFile(path)
+		if err == nil && progress.UpdatedAt > 1 && progress.Percent == 42 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("progress was not refreshed: %#v, %v", progress, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !progress.Running || progress.Repo != "repo1" || progress.ReposDone != 0 || progress.ReposTotal != 1 || progress.StartedAt != 1 || progress.BytesDone != 1200 || progress.TotalBytes != 3000 {
+		t.Fatalf("progress = %#v", progress)
+	}
+	close(runner.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("progress file remains after success: %v", err)
+	}
+}
+
+func TestRunProgressCleanupOnRepoErrorAndEarlyCancellation(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &progressResticRunner{entered: make(chan struct{}), release: make(chan struct{}), fail: true}
+	close(runner.release)
+	if _, err := Run(context.Background(), cfg, Options{Runner: runner, ProgressInterval: time.Millisecond}); err != nil {
+		t.Fatalf("Run repo failure: %v", err)
+	}
+	if _, err := os.Stat(progressPath(cfg.StatusPath)); !os.IsNotExist(err) {
+		t.Fatalf("progress file remains after repo error: %v", err)
+	}
+
+	cfg = testConfig(t)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(cfg.StatusPath), "restic-cache"), []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("block cache dir: %v", err)
+	}
+	if _, err := Run(context.Background(), cfg, Options{Runner: newFakeResticRunner()}); err == nil {
+		t.Fatal("expected cache directory error")
+	}
+	if _, err := os.Stat(progressPath(cfg.StatusPath)); !os.IsNotExist(err) {
+		t.Fatalf("progress file remains after run error: %v", err)
+	}
+
+	cfg = testConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Run(ctx, cfg, Options{Runner: newFakeResticRunner()}); err != nil {
+		t.Fatalf("Run canceled: %v", err)
+	}
+	if _, err := os.Stat(progressPath(cfg.StatusPath)); !os.IsNotExist(err) {
+		t.Fatalf("progress file remains after cancellation: %v", err)
+	}
+	if _, err := os.Stat(cfg.StatusPath); !os.IsNotExist(err) {
+		t.Fatalf("status file written for early cancellation: %v", err)
 	}
 }
 
@@ -969,6 +1095,28 @@ func TestRunWithFakeResticExecutable(t *testing.T) {
 	}
 }
 
+func TestExecRunnerStreamsLinesAndPreservesStdout(t *testing.T) {
+	path := writeFakeResticExecutable(t)
+	var lines [][]byte
+	result, err := (ExecRunner{}).Run(context.Background(), Command{
+		Path: path,
+		Args: []string{"backup"},
+		Env:  os.Environ(),
+		OnStdoutLine: func(line []byte) {
+			lines = append(lines, append([]byte(nil), line...))
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(lines) != 2 || !bytes.Contains(lines[0], []byte(`"message_type":"status"`)) {
+		t.Fatalf("streamed lines = %q", lines)
+	}
+	if !bytes.Contains(result.Stdout, lines[0]) || !bytes.Contains(result.Stdout, lines[1]) {
+		t.Fatalf("stdout = %q, lines = %q", result.Stdout, lines)
+	}
+}
+
 func writeFakeResticExecutable(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -976,6 +1124,7 @@ func writeFakeResticExecutable(t *testing.T) string {
 		path := filepath.Join(dir, "restic.cmd")
 		body := `@echo off
 if "%1"=="backup" (
+  echo {"message_type":"status","percent_done":0.5,"bytes_done":100,"total_bytes":200}
   echo {"message_type":"summary","total_duration":4.4,"data_added":100,"total_bytes_processed":200}
   exit /b 0
 )
@@ -995,6 +1144,7 @@ exit /b 1
 	body := `#!/bin/sh
 case "$1" in
 backup)
+printf '%s\n' '{"message_type":"status","percent_done":0.5,"bytes_done":100,"total_bytes":200}'
 printf '%s\n' '{"message_type":"summary","total_duration":4.4,"data_added":100,"total_bytes_processed":200}'
 exit 0
 ;;

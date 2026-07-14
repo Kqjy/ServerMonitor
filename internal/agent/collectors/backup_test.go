@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 func testBackupCollector(path string, now time.Time) *backupCollector {
 	c := newBackupCollector(path)
 	c.now = func() time.Time { return now }
+	c.queryNextRun = func(context.Context) *time.Time { return nil }
 	return c
 }
 
@@ -22,6 +24,11 @@ func writeBackupStatus(t *testing.T, path, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write backup status: %v", err)
 	}
+}
+
+func writeBackupProgress(t *testing.T, statusPath, body string) {
+	t.Helper()
+	writeBackupStatus(t, filepath.Join(filepath.Dir(statusPath), "backup-progress.json"), body)
 }
 
 func backupPointMap(points []wire.Point) map[string]float64 {
@@ -43,6 +50,71 @@ func TestBackupCollectorMissingFile(t *testing.T) {
 	}
 	if got := c.Status().State; got != backupStateNotConfigured {
 		t.Fatalf("state = %q, want %q", got, backupStateNotConfigured)
+	}
+}
+
+func TestBackupCollectorLiveProgressWithoutStatus(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupProgress(t, path, `{"version":1,"running":true,"repo":"vps-a","started_at":1783047300,"updated_at":1783047590,"percent":42,"bytes_done":1200,"total_bytes":3000}`)
+	c := testBackupCollector(path, now)
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	got := backupPointMap(points)
+	want := map[string]float64{
+		"vps-a|backup_running":              1,
+		"vps-a|backup_run_elapsed_s":        300,
+		"vps-a|backup_progress_pct":         42,
+		"vps-a|backup_progress_bytes":       1200,
+		"vps-a|backup_progress_total_bytes": 3000,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("points = %#v, want %#v", got, want)
+	}
+}
+
+func TestBackupCollectorStaleProgressIsNotLive(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupProgress(t, path, `{"version":1,"running":true,"repo":"vps-a","started_at":1783047000,"updated_at":1783047500}`)
+	c := testBackupCollector(path, now)
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("stale progress points = %#v", points)
+	}
+}
+
+func TestBackupCollectorEmitsTerminalRunningPointOnce(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "backup-status.json")
+	progressPath := filepath.Join(filepath.Dir(path), "backup-progress.json")
+	writeBackupProgress(t, path, `{"version":1,"running":true,"repo":"vps-a","started_at":1783047300,"updated_at":1783047590}`)
+	c := testBackupCollector(path, now)
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect live: %v", err)
+	}
+	if err := os.Remove(progressPath); err != nil {
+		t.Fatalf("remove progress: %v", err)
+	}
+	terminal, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect terminal: %v", err)
+	}
+	got := backupPointMap(terminal)
+	if got["vps-a|backup_running"] != 0 || len(got) != 1 {
+		t.Fatalf("terminal points = %#v", terminal)
+	}
+	again, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect again: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("repeated terminal points = %#v", again)
 	}
 }
 
@@ -165,6 +237,7 @@ func TestBackupCollectorInventoryThrottle(t *testing.T) {
 	}
 	c := newBackupCollector(path)
 	c.now = func() time.Time { return now }
+	c.queryNextRun = func(context.Context) *time.Time { return nil }
 
 	first, err := c.CollectBackups(context.Background())
 	if err != nil {
@@ -212,6 +285,55 @@ func TestBackupCollectorInventoryThrottle(t *testing.T) {
 	}
 	if len(fifth) != 1 || fifth[0].Name != "vps-b" || fifth[0].SnapshotCount != 2 {
 		t.Fatalf("fifth backups = %#v", fifth)
+	}
+}
+
+func TestParseSystemdNextElapse(t *testing.T) {
+	want := time.UnixMicro(1783130400000000).UTC()
+	if got := parseSystemdNextElapse("1783130400000000\n"); got == nil || !got.Equal(want) {
+		t.Fatalf("parsed time = %#v, want %v", got, want)
+	}
+	for _, raw := range []string{"0", "", "  \n", "infinity", "garbage", "-5", "18446744073709551615"} {
+		if got := parseSystemdNextElapse(raw); got != nil {
+			t.Fatalf("parseSystemdNextElapse(%q) = %v, want nil", raw, got)
+		}
+	}
+}
+
+func TestParseWindowsNextRun(t *testing.T) {
+	want := time.Date(2026, 7, 15, 2, 30, 0, 0, time.UTC)
+	if got := parseWindowsNextRun("2026-07-15T02:30:00.0000000Z\r\n"); got == nil || !got.Equal(want) {
+		t.Fatalf("parsed time = %#v, want %v", got, want)
+	}
+	for _, raw := range []string{"", "garbage", "0001-01-01T00:00:00.0000000Z"} {
+		if got := parseWindowsNextRun(raw); got != nil {
+			t.Fatalf("parseWindowsNextRun(%q) = %v, want nil", raw, got)
+		}
+	}
+}
+
+func TestBackupCollectorInventoryNextRun(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, path, `{"version":1,"repos":[{"name":"vps-a"},{"name":"vps-b"}]}`)
+	c := testBackupCollector(path, now)
+	next := time.Date(2026, 7, 4, 2, 0, 0, 0, time.UTC)
+	c.queryNextRun = func(context.Context) *time.Time { return &next }
+	got, err := c.CollectBackups(context.Background())
+	if err != nil {
+		t.Fatalf("CollectBackups: %v", err)
+	}
+	if len(got) != 2 || got[0].NextRun != &next || got[1].NextRun != &next {
+		t.Fatalf("next runs = %#v", got)
+	}
+	c.lastInventoryAttached = time.Time{}
+	c.queryNextRun = func(context.Context) *time.Time { return nil }
+	got, err = c.CollectBackups(context.Background())
+	if err != nil {
+		t.Fatalf("CollectBackups nil: %v", err)
+	}
+	if len(got) != 2 || got[0].NextRun != nil || got[1].NextRun != nil {
+		t.Fatalf("nil next runs = %#v", got)
 	}
 }
 

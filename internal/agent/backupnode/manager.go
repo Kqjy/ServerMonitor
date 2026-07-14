@@ -48,6 +48,7 @@ type nodeRuntime struct {
 	registry *localRegistry
 	spec     runtimeSpec
 	peers    map[wgtunnel.Key]netip.Addr
+	pub      wgtunnel.Key
 }
 
 type runtimeSpec struct {
@@ -89,6 +90,7 @@ func (m *Manager) Run(ctx context.Context) {
 			return
 		case <-reconcile.C:
 			m.reconcile(ctx)
+			m.reportUsage(ctx)
 		case <-usage.C:
 			m.reportUsage(ctx)
 		}
@@ -214,7 +216,46 @@ func (m *Manager) startRuntime(ctx context.Context, key wgtunnel.Key, spec runti
 			m.logger.Warn("backup node http server", "err", serveErr)
 		}
 	}()
-	return &nodeRuntime{device: device, srv: srv, registry: registry, spec: spec, peers: peerMap}, nil
+	return &nodeRuntime{device: device, srv: srv, registry: registry, spec: spec, peers: peerMap, pub: key.Public()}, nil
+}
+
+func peerStatsPayload(stats []wgtunnel.PeerStats, known map[wgtunnel.Key]netip.Addr, self wgtunnel.Key) []wire.NodePeerStat {
+	peers := make([]wire.NodePeerStat, 0, len(stats)+1)
+	var maxHandshake int64
+	var totalRx int64
+	var totalTx int64
+	for _, s := range stats {
+		if _, ok := known[s.PublicKey]; !ok {
+			continue
+		}
+		if s.LastHandshake.IsZero() && s.RxBytes == 0 && s.TxBytes == 0 {
+			continue
+		}
+		handshake := int64(0)
+		if !s.LastHandshake.IsZero() {
+			handshake = s.LastHandshake.Unix()
+		}
+		peers = append(peers, wire.NodePeerStat{
+			PublicKey:         s.PublicKey.String(),
+			LastHandshakeUnix: handshake,
+			RxBytes:           s.RxBytes,
+			TxBytes:           s.TxBytes,
+		})
+		if handshake > maxHandshake {
+			maxHandshake = handshake
+		}
+		totalRx += s.RxBytes
+		totalTx += s.TxBytes
+	}
+	if len(peers) > 0 {
+		peers = append(peers, wire.NodePeerStat{
+			PublicKey:         self.String(),
+			LastHandshakeUnix: maxHandshake,
+			RxBytes:           totalRx,
+			TxBytes:           totalTx,
+		})
+	}
+	return peers
 }
 
 func buildPeers(infos []wire.NodePeerInfo) ([]wgtunnel.Peer, map[wgtunnel.Key]netip.Addr, error) {
@@ -347,14 +388,21 @@ func (m *Manager) reportUsage(ctx context.Context) {
 	m.mu.Lock()
 	rt := m.runtime
 	var entries []wire.NodeUsageEntry
+	var peers []wire.NodePeerStat
 	if rt != nil {
 		entries = rt.registry.usageSnapshot()
+		stats, err := rt.device.PeerStats()
+		if err != nil {
+			m.logger.Debug("backup node peer stats failed", "err", err)
+		} else {
+			peers = peerStatsPayload(stats, rt.peers, rt.pub)
+		}
 	}
 	m.mu.Unlock()
-	if len(entries) == 0 {
+	if len(entries) == 0 && len(peers) == 0 {
 		return
 	}
-	if err := m.doJSON(ctx, http.MethodPost, "/api/v1/agent/backup-node/usage", wire.BackupNodeUsage{Targets: entries}, nil); err != nil {
+	if err := m.doJSON(ctx, http.MethodPost, "/api/v1/agent/backup-node/usage", wire.BackupNodeUsage{Targets: entries, Peers: peers}, nil); err != nil {
 		m.logger.Debug("backup node usage report failed", "err", err)
 	}
 }

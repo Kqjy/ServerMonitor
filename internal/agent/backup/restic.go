@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -15,9 +16,10 @@ import (
 )
 
 type Command struct {
-	Path string
-	Args []string
-	Env  []string
+	Path         string
+	Args         []string
+	Env          []string
+	OnStdoutLine func([]byte)
 }
 
 type CommandResult struct {
@@ -32,10 +34,11 @@ type CommandRunner interface {
 type ExecRunner struct{}
 
 type Options struct {
-	Runner CommandRunner
-	Logger *slog.Logger
-	Now    func() time.Time
-	GOOS   string
+	Runner           CommandRunner
+	Logger           *slog.Logger
+	Now              func() time.Time
+	GOOS             string
+	ProgressInterval time.Duration
 }
 
 func (ExecRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
@@ -43,9 +46,32 @@ func (ExecRunner) Run(ctx context.Context, command Command) (CommandResult, erro
 	cmd.Env = command.Env
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	if command.OnStdoutLine == nil {
+		cmd.Stdout = &stdout
+		err := cmd.Run()
+		return CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
+	}
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return CommandResult{}, err
+	}
+	if err := cmd.Start(); err != nil {
+		return CommandResult{Stderr: stderr.Bytes()}, err
+	}
+	scanner := bufio.NewScanner(io.TeeReader(pipe, &stdout))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		command.OnStdoutLine(scanner.Bytes())
+	}
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		_, _ = io.Copy(&stdout, pipe)
+	}
+	err = cmd.Wait()
+	if err == nil {
+		err = scanErr
+	}
 	return CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
 }
 
@@ -173,10 +199,14 @@ func envWithOverrides(base []string, overrides map[string]string) []string {
 }
 
 func resticCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, opts Options) (CommandResult, error) {
-	return resticCommandAction(ctx, cfg, repo, cacheDir, args, args[0], opts)
+	return resticCommandStream(ctx, cfg, repo, cacheDir, args, args[0], opts, nil)
 }
 
 func resticCommandAction(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options) (CommandResult, error) {
+	return resticCommandStream(ctx, cfg, repo, cacheDir, args, action, opts, nil)
+}
+
+func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options, onStdoutLine func([]byte)) (CommandResult, error) {
 	if repo.tunnelErr != nil {
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, repo.tunnelErr)
 	}
@@ -188,9 +218,10 @@ func resticCommandAction(ctx context.Context, cfg Config, repo Repo, cacheDir st
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, err)
 	}
 	result, err := opts.runner().Run(ctx, Command{
-		Path: cfg.ResticPath,
-		Args: resticGlobalArgs(repo, args),
-		Env:  withResticEnv(repo, cacheDir, repoEnv),
+		Path:         cfg.ResticPath,
+		Args:         resticGlobalArgs(repo, args),
+		Env:          withResticEnv(repo, cacheDir, repoEnv),
+		OnStdoutLine: onStdoutLine,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -250,4 +281,11 @@ func (o Options) goos() string {
 		return o.GOOS
 	}
 	return runtime.GOOS
+}
+
+func (o Options) progressInterval() time.Duration {
+	if o.ProgressInterval > 0 {
+		return o.ProgressInterval
+	}
+	return 10 * time.Second
 }

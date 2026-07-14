@@ -830,20 +830,22 @@ restic -r ${publicRepoUrl} backup /etc`;
                         <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(t.created_at)}</td>
                         <td class="px-4 py-3 align-top">
                           <div class="flex items-center justify-end gap-1.5">
-                            <button
-                              type="button"
-                              onclick={() => measure(t.id)}
-                              disabled={measuring === t.id}
-                              class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50">
-                              {measuring === t.id ? 'Measuring…' : 'Measure'}
-                            </button>
+                            {#if !t.node_host_id}
+                              <button
+                                type="button"
+                                onclick={() => measure(t.id)}
+                                disabled={measuring === t.id}
+                                class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-50">
+                                {measuring === t.id ? 'Measuring…' : 'Measure'}
+                              </button>
+                            {/if}
                             <button
                               type="button"
                               onclick={() => rotate(t.id)}
                               class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
                               Rotate
                             </button>
-                            {#if t.used_bytes === 0}
+                            {#if t.used_bytes === 0 && !t.node_host_id}
                               <button
                                 type="button"
                                 onclick={() => (toDelete = t)}
@@ -946,6 +948,9 @@ restic -r ${publicRepoUrl} backup /etc`;
                               <span class="{p.connected ? 'text-emerald-300' : 'text-zinc-400'} numeric">
                                 {p.last_handshake ? timeAgo(p.last_handshake) : 'never'}
                               </span>
+                              {#if p.via}
+                                <span class="text-[10px] text-zinc-500">via {p.via}</span>
+                              {/if}
                             </div>
                           </td>
                           <td class="px-4 py-3 text-xs text-zinc-400 numeric whitespace-nowrap">↓{bytes(p.rx_bytes)} · ↑{bytes(p.tx_bytes)}</td>
@@ -966,8 +971,7 @@ restic -r ${publicRepoUrl} backup /etc`;
               {/if}
             </div>
             <p class="mt-3 text-[11px] text-zinc-600">
-              A backup host brings its tunnel up only while a backup, check or restore is running, so an idle handshake age is normal.
-              Traffic counters reset when the server restarts. Revoking a peer removes its tunnel access immediately; its repository credential is revoked separately above.
+              A backup host brings its tunnel up only while a backup, check or restore is running, so an idle handshake age is normal. Handshakes and traffic are measured at whichever endpoint stores the host's backups — this server or a storage node; node-observed stats are relayed by the node's agent about once a minute. Traffic counters reset when the server or the storage node's agent restarts. Revoking a peer removes its tunnel access immediately; its repository credential is revoked separately above.
             </p>
           {/if}
         </section>

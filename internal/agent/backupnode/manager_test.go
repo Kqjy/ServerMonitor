@@ -1,14 +1,18 @@
 package backupnode
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"servermonitor/pkg/restserver"
+	"servermonitor/pkg/wgtunnel"
 	"servermonitor/pkg/wire"
 )
 
@@ -76,5 +80,49 @@ func TestLocalRegistryQuotaReservationIsAtomic(t *testing.T) {
 	}
 	if succeeded != 1 {
 		t.Fatalf("successful reservations = %d, want 1", succeeded)
+	}
+}
+
+func TestPeerStatsPayload(t *testing.T) {
+	knownKey, err := wgtunnel.KeyFromBytes(bytes.Repeat([]byte{1}, 32))
+	if err != nil {
+		t.Fatalf("known key: %v", err)
+	}
+	zeroKey, err := wgtunnel.KeyFromBytes(bytes.Repeat([]byte{2}, 32))
+	if err != nil {
+		t.Fatalf("zero key: %v", err)
+	}
+	unknownKey, err := wgtunnel.KeyFromBytes(bytes.Repeat([]byte{3}, 32))
+	if err != nil {
+		t.Fatalf("unknown key: %v", err)
+	}
+	self, err := wgtunnel.KeyFromBytes(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatalf("self key: %v", err)
+	}
+	handshake := time.Unix(1_700_000_000, 0).UTC()
+	known := map[wgtunnel.Key]netip.Addr{
+		knownKey: netip.MustParseAddr("10.0.0.2"),
+		zeroKey:  netip.MustParseAddr("10.0.0.3"),
+	}
+	stats := []wgtunnel.PeerStats{
+		{PublicKey: knownKey, LastHandshake: handshake, RxBytes: 123, TxBytes: 456},
+		{PublicKey: zeroKey},
+		{PublicKey: unknownKey, LastHandshake: handshake, RxBytes: 999, TxBytes: 999},
+	}
+	payload := peerStatsPayload(stats, known, self)
+	if len(payload) != 2 {
+		t.Fatalf("payload length = %d, want 2", len(payload))
+	}
+	client := payload[0]
+	if client.PublicKey != knownKey.String() || client.LastHandshakeUnix != handshake.Unix() || client.RxBytes != 123 || client.TxBytes != 456 {
+		t.Fatalf("client payload = %+v", client)
+	}
+	selfStat := payload[1]
+	if selfStat.PublicKey != self.String() || selfStat.LastHandshakeUnix != handshake.Unix() || selfStat.RxBytes != 123 || selfStat.TxBytes != 456 {
+		t.Fatalf("self payload = %+v", selfStat)
+	}
+	if empty := peerStatsPayload(stats[1:], known, self); len(empty) != 0 {
+		t.Fatalf("empty payload = %+v", empty)
 	}
 }

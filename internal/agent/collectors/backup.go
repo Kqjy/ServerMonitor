@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ const (
 	backupStatusStaleAfter   = 26 * time.Hour
 	backupSnapshotLimit      = 50
 	backupInventoryInterval  = 15 * time.Minute
+	backupProgressLiveWindow = 45 * time.Second
 )
 
 type backupCollector struct {
@@ -38,6 +40,8 @@ type backupCollector struct {
 	lastStatusFingerprint    backupStatusFingerprint
 	lastStatus               backupStatusFile
 	lastStatusOK             bool
+	lastRunningRepo          string
+	queryNextRun             func(ctx context.Context) *time.Time
 }
 
 type backupStatusFingerprint struct {
@@ -50,7 +54,54 @@ var defaultBackupCollector = newBackupCollector(defaultBackupStatusPath())
 func init() { Register(defaultBackupCollector) }
 
 func newBackupCollector(path string) *backupCollector {
-	return &backupCollector{path: path, now: time.Now}
+	return &backupCollector{path: path, now: time.Now, queryNextRun: nextBackupRun}
+}
+
+func parseSystemdNextElapse(raw string) *time.Time {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "0" || s == "infinity" {
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return nil
+	}
+	t := time.UnixMicro(v).UTC()
+	return &t
+}
+
+func parseWindowsNextRun(raw string) *time.Time {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil || t.IsZero() {
+		return nil
+	}
+	t = t.UTC()
+	return &t
+}
+
+func nextBackupRun(ctx context.Context) *time.Time {
+	cmdCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	switch runtime.GOOS {
+	case "linux":
+		out, err := run(cmdCtx, "systemctl", "show", "sm-backup.timer", "--property=NextElapseUSecRealtime", "--value")
+		if err != nil {
+			return nil
+		}
+		return parseSystemdNextElapse(string(out))
+	case "windows":
+		out, err := run(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", "(Get-ScheduledTaskInfo -TaskName 'ServerMonitor Backup').NextRunTime.ToUniversalTime().ToString('o')")
+		if err != nil {
+			return nil
+		}
+		return parseWindowsNextRun(string(out))
+	default:
+		return nil
+	}
 }
 
 func SetBackupStatusPath(path string) {
@@ -110,18 +161,70 @@ func (c *backupCollector) currentTime() time.Time {
 }
 
 func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
+	now := c.currentTime()
+	out := c.backupProgressPoints(now)
 	info, status, ok := c.readBackupStatus()
 	if !ok {
-		return nil, nil
+		return out, nil
 	}
-	now := c.currentTime()
-	out := backupPoints(now, status.Repos)
+	out = append(out, backupPoints(now, status.Repos)...)
 	if age := now.Sub(info.ModTime()); age > backupStatusStaleAfter {
 		c.setState(backupStateStale, "status file age "+age.Truncate(time.Second).String())
 	} else {
 		c.setState(backupStateOK, "")
 	}
 	return out, nil
+}
+
+type backupProgressFile struct {
+	Version    int     `json:"version"`
+	Running    bool    `json:"running"`
+	Repo       string  `json:"repo"`
+	StartedAt  int64   `json:"started_at"`
+	UpdatedAt  int64   `json:"updated_at"`
+	Percent    float64 `json:"percent"`
+	BytesDone  int64   `json:"bytes_done"`
+	TotalBytes int64   `json:"total_bytes"`
+}
+
+func (c *backupCollector) backupProgressPoints(now time.Time) []wire.Point {
+	path := filepath.Join(filepath.Dir(c.currentPath()), "backup-progress.json")
+	data, err := os.ReadFile(path)
+	var progress backupProgressFile
+	live := err == nil && json.Unmarshal(data, &progress) == nil && progress.Version == 1 && progress.Running && strings.TrimSpace(progress.Repo) != "" && now.Unix()-progress.UpdatedAt < int64(backupProgressLiveWindow/time.Second)
+	previous := c.swapRunningRepo(progress.Repo, live)
+	out := make([]wire.Point, 0, 6)
+	if previous != "" && (!live || previous != progress.Repo) {
+		out = append(out, point(now, metrics.BackupRunning, map[string]string{"repo": previous}, 0))
+	}
+	if !live {
+		return out
+	}
+	labels := map[string]string{"repo": progress.Repo}
+	elapsed := now.Unix() - progress.StartedAt
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	out = append(out,
+		point(now, metrics.BackupRunning, labels, 1),
+		point(now, metrics.BackupRunElapsedS, labels, float64(elapsed)),
+		point(now, metrics.BackupProgressPct, labels, progress.Percent),
+		point(now, metrics.BackupProgressBytes, labels, float64(progress.BytesDone)),
+		point(now, metrics.BackupProgressTotalBytes, labels, float64(progress.TotalBytes)),
+	)
+	return out
+}
+
+func (c *backupCollector) swapRunningRepo(repo string, live bool) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	previous := c.lastRunningRepo
+	if live {
+		c.lastRunningRepo = repo
+	} else {
+		c.lastRunningRepo = ""
+	}
+	return previous
 }
 
 func (c *backupCollector) CollectBackups(ctx context.Context) ([]wire.BackupRepoStatus, error) {
@@ -134,9 +237,12 @@ func (c *backupCollector) CollectBackups(ctx context.Context) ([]wire.BackupRepo
 	if !c.shouldAttachInventory(now, fingerprint) {
 		return nil, nil
 	}
+	next := c.queryNextRun(ctx)
 	out := make([]wire.BackupRepoStatus, 0, len(status.Repos))
 	for _, repo := range status.Repos {
-		out = append(out, backupRepoStatus(repo))
+		rs := backupRepoStatus(repo)
+		rs.NextRun = next
+		out = append(out, rs)
 	}
 	return out, nil
 }

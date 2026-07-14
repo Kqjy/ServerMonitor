@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -181,8 +182,16 @@ func loadOrCreateTunnelKey(path string) (wgtunnel.Key, bool, error) {
 	if err != nil {
 		return wgtunnel.Key{}, false, err
 	}
-	if err := os.WriteFile(path, []byte(key.String()+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(key.String()+"\n"), 0o440); err != nil {
 		return wgtunnel.Key{}, false, fmt.Errorf("write tunnel key: %w", err)
+	}
+	if err := os.Chmod(path, 0o440); err != nil {
+		return wgtunnel.Key{}, false, fmt.Errorf("set tunnel key mode: %w", err)
+	}
+	if dirInfo, statErr := os.Stat(filepath.Dir(path)); statErr == nil {
+		if err := preserveOwner(path, dirInfo); err != nil {
+			return wgtunnel.Key{}, false, fmt.Errorf("set tunnel key ownership: %w", err)
+		}
 	}
 	return key, true, nil
 }
@@ -298,9 +307,20 @@ func writeTunnelSettings(configPath string, settings TunnelSettings) error {
 	}
 	tmp := configPath + ".tmp"
 	if err := os.WriteFile(tmp, buf.Bytes(), mode); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write backup config: %w", err)
 	}
-	if err := os.Rename(tmp, configPath); err != nil {
+	if err := os.Chmod(tmp, mode); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("set backup config mode: %w", err)
+	}
+	if err == nil {
+		if err := preserveOwner(tmp, info); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("preserve backup config ownership: %w", err)
+		}
+	}
+	if err := replaceFile(tmp, configPath); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace backup config: %w", err)
 	}

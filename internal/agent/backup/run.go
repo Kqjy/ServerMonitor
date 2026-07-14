@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
@@ -30,6 +31,49 @@ type RunResult struct {
 type backupSummary struct {
 	DurationS  int64
 	AddedBytes int64
+	TotalBytes int64
+}
+
+type backupProgress struct {
+	mu   sync.Mutex
+	file ProgressFile
+}
+
+func (p *backupProgress) snapshot(now time.Time) ProgressFile {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := p.file
+	out.UpdatedAt = now.UTC().Unix()
+	return out
+}
+
+func (p *backupProgress) startRepo(repo string, done int) {
+	p.mu.Lock()
+	p.file.Repo = repo
+	p.file.ReposDone = done
+	p.file.Percent = 0
+	p.file.BytesDone = 0
+	p.file.TotalBytes = 0
+	p.mu.Unlock()
+}
+
+func (p *backupProgress) finishRepo(done int) {
+	p.mu.Lock()
+	p.file.ReposDone = done
+	p.mu.Unlock()
+}
+
+func (p *backupProgress) update(update backupProgressUpdate) {
+	p.mu.Lock()
+	p.file.Percent = update.Percent
+	p.file.BytesDone = update.BytesDone
+	p.file.TotalBytes = update.TotalBytes
+	p.mu.Unlock()
+}
+
+type backupProgressUpdate struct {
+	Percent    float64
+	BytesDone  int64
 	TotalBytes int64
 }
 
@@ -64,6 +108,44 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 		return RunResult{LockSkipped: true}, nil
 	}
 	defer release()
+	progressFilePath := progressPath(cfg.StatusPath)
+	started := opts.now()
+	progress := &backupProgress{file: ProgressFile{
+		Version:    progressVersion,
+		Running:    true,
+		ReposTotal: len(cfg.Repos),
+		StartedAt:  started.Unix(),
+		UpdatedAt:  started.Unix(),
+	}}
+	if err := writeProgressAtomic(progressFilePath, progress.snapshot(started)); err != nil {
+		return RunResult{}, fmt.Errorf("write backup progress: %w", err)
+	}
+	defer os.Remove(progressFilePath)
+	heartbeatDone := make(chan struct{})
+	heartbeatStopped := make(chan struct{})
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(opts.progressInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatDone:
+				return
+			case now := <-ticker.C:
+				if err := writeProgressAtomic(progressFilePath, progress.snapshot(now)); err != nil {
+					logger.Warn("could not update backup progress", "path", progressFilePath, "err", err)
+				}
+			}
+		}
+	}()
+	var stopHeartbeatOnce sync.Once
+	stopHeartbeat := func() {
+		stopHeartbeatOnce.Do(func() {
+			close(heartbeatDone)
+			<-heartbeatStopped
+		})
+	}
+	defer stopHeartbeat()
 
 	cfg, session := PrepareTunnel(cfg, opts)
 	if session != nil {
@@ -83,12 +165,18 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 	}
 
 	updates := make([]RepoStatus, 0, len(cfg.Repos))
-	for _, repo := range cfg.Repos {
+	for i, repo := range cfg.Repos {
 		if ctx.Err() != nil {
 			break
 		}
-		updates = append(updates, runRepo(ctx, cfg, repo, cacheDir, opts))
+		progress.startRepo(repo.Name, i)
+		if err := writeProgressAtomic(progressFilePath, progress.snapshot(opts.now())); err != nil {
+			return RunResult{Repos: updates}, fmt.Errorf("write backup progress: %w", err)
+		}
+		updates = append(updates, runRepo(ctx, cfg, repo, cacheDir, opts, progress))
+		progress.finishRepo(i + 1)
 	}
+	stopHeartbeat()
 	if len(updates) > 0 {
 		if err := writeStatusAtomic(cfg.StatusPath, mergeStatus(existing, updates)); err != nil {
 			return RunResult{Repos: updates}, fmt.Errorf("write backup status: %w", err)
@@ -109,7 +197,7 @@ func (r RunResult) AnySucceeded() bool {
 	return false
 }
 
-func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) RepoStatus {
+func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) RepoStatus {
 	logger := opts.logger()
 	start := utcSecond(opts.now())
 	status := RepoStatus{
@@ -120,7 +208,7 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	}
 	logger.Info("backup repo started", "repo", repo.Name)
 
-	summary, err := runBackupCommand(ctx, cfg, repo, cacheDir, opts)
+	summary, err := runBackupCommand(ctx, cfg, repo, cacheDir, opts, progress)
 	if err != nil {
 		return finishRepoStatus(status, opts, err, logger)
 	}
@@ -158,12 +246,33 @@ func finishRepoStatus(status RepoStatus, opts Options, err error, logger *slog.L
 	return status
 }
 
-func runBackupCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) (backupSummary, error) {
-	result, err := resticCommand(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos()), opts)
+func runBackupCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) (backupSummary, error) {
+	result, err := resticCommandStream(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos()), "backup", opts, func(line []byte) {
+		if update, ok := parseBackupProgressLine(line); ok && progress != nil {
+			progress.update(update)
+		}
+	})
 	if err != nil {
 		return backupSummary{}, err
 	}
 	return parseBackupSummary(result.Stdout)
+}
+
+func parseBackupProgressLine(line []byte) (backupProgressUpdate, bool) {
+	var message struct {
+		MessageType string  `json:"message_type"`
+		PercentDone float64 `json:"percent_done"`
+		BytesDone   int64   `json:"bytes_done"`
+		TotalBytes  int64   `json:"total_bytes"`
+	}
+	if err := json.Unmarshal(line, &message); err != nil || message.MessageType != "status" {
+		return backupProgressUpdate{}, false
+	}
+	return backupProgressUpdate{
+		Percent:    math.Max(0, math.Min(100, message.PercentDone*100)),
+		BytesDone:  message.BytesDone,
+		TotalBytes: message.TotalBytes,
+	}, true
 }
 
 func runSnapshotsCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) ([]Snapshot, error) {

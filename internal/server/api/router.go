@@ -54,6 +54,7 @@ type Deps struct {
 
 func New(d Deps) *Router {
 	r := chi.NewRouter()
+	nodePeerStats := NewNodePeerStatsCache()
 	r.Use(middleware.RequestID)
 	r.Use(requestLogger(d.Logger))
 	r.Use(middleware.Recoverer)
@@ -87,7 +88,7 @@ func New(d Deps) *Router {
 			r.Post("/agent/tunnel", tunnelEnrollHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
 			r.Get("/agent/tunnel/nodes", agentTunnelNodesHandler(d.BackupNodes))
 			r.Get("/agent/backup-node", agentBackupNodeConfigHandler(d.BackupNodes))
-			r.Post("/agent/backup-node/usage", agentBackupNodeUsageHandler(d.BackupNodes))
+			r.Post("/agent/backup-node/usage", agentBackupNodeUsageHandler(d.BackupNodes, nodePeerStats))
 		})
 
 		r.Group(func(r chi.Router) {
@@ -142,8 +143,8 @@ func New(d Deps) *Router {
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
 					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer))
-					r.Get("/backup-tunnel", backupTunnelStatusHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
-					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers))
+					r.Get("/backup-tunnel", backupTunnelStatusHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo, nodePeerStats))
+					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers, nodePeerStats))
 					r.Get("/backup-nodes", listBackupNodesHandler(d.BackupNodes))
 					r.Post("/backup-nodes", promoteBackupNodeHandler(d.BackupNodes, d.Hosts))
 					r.Delete("/backup-nodes/{hostID}", demoteBackupNodeHandler(d.BackupNodes))
