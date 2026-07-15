@@ -39,6 +39,9 @@ func main() {
 		case "register":
 			registerCmd(os.Args[2:])
 			return
+		case "sync-privileged":
+			syncPrivilegedCmd(os.Args[2:])
+			return
 		case "backup":
 			backupCmd(os.Args[2:])
 			return
@@ -416,6 +419,27 @@ func waitScheduler(s *backupsched.Scheduler, timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
+	}
+}
+
+func syncPrivilegedCmd(args []string) {
+	fs := flag.NewFlagSet("sync-privileged", flag.ExitOnError)
+	source := fs.String("source", "", "resident self-updating agent binary")
+	signature := fs.String("signature", "", "server signature attestation for the resident binary")
+	pubkeyFile := fs.String("pubkey-file", "", "installer-pinned server Ed25519 public key")
+	_ = fs.Parse(args)
+	if *source == "" || *signature == "" || *pubkeyFile == "" {
+		fmt.Fprintln(os.Stderr, "usage: sm-agent sync-privileged --source PATH --signature PATH --pubkey-file PATH")
+		os.Exit(2)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	updated, err := upgrade.SyncPrivileged(context.Background(), *source, *signature, *pubkeyFile, logger)
+	if err != nil {
+		logger.Error("privileged backup agent synchronization failed", "err", err)
+		os.Exit(1)
+	}
+	if !updated {
+		logger.Debug("privileged backup agent already current or no signed resident update is staged")
 	}
 }
 

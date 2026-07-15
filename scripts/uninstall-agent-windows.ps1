@@ -14,6 +14,11 @@ function Assert-Elevated {
 }
 Assert-Elevated
 
+$syncTask = Get-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -ErrorAction SilentlyContinue
+if ($syncTask) {
+    Unregister-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -Confirm:$false
+}
+
 function Get-VirtualServiceSid {
     param([Parameter(Mandatory=$true)][string]$Name)
     $out = & sc.exe showsid $Name 2>&1 | Out-String

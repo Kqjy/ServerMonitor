@@ -1,6 +1,8 @@
 .git
 .gitignore
+.gocache/
 bin/
+internal/server/agentdist/binaries/
 *.exe
 web/node_modules
 web/.svelte-kit

@@ -13,6 +13,7 @@ func envFrom(m map[string]string) func(string) string {
 }
 
 func TestRenderBackupTOMLIsValid(t *testing.T) {
+	t.Setenv("SM_BACKUP_STATUS_PATH", "/tmp/backup-status.json")
 	getenv := envFrom(map[string]string{
 		"SM_BACKUP_REPOS":                "rest:https://sv/backup/web01,s3:https://s3/bucket",
 		"SM_BACKUP_REPO_NAMES":           "web01",
@@ -28,6 +29,7 @@ func TestRenderBackupTOMLIsValid(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	for _, want := range []string{
+		`status_path = "/tmp/backup-status.json"`,
 		`prune_mode = "external"`,
 		"[[repo]]\nname = \"web01\"\nurl = \"rest:https://sv/backup/web01\"",
 		"name = \"repo2\"\nurl = \"s3:https://s3/bucket\"",

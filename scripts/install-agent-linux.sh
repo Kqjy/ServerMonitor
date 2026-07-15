@@ -144,6 +144,92 @@ refresh_agent_binaries() {
   fi
 }
 
+pin_agent_signing_pubkey() {
+  local pin=/etc/servermonitor-privileged/agent-signing.pub
+  local configured existing
+  install -o root -g root -m 0700 -d /etc/servermonitor-privileged
+  configured="$(awk -F'"' '/^[[:space:]]*server_pubkey[[:space:]]*=/ { print $2; exit }' /etc/servermonitor/agent.toml)"
+  if [ -f "$pin" ]; then
+    existing="$(tr -d '[:space:]' < "$pin")"
+    if [ -n "$configured" ] && [ "$configured" != "$existing" ]; then
+      echo "warning: agent.toml has a different server_pubkey; keeping the existing root-owned update pin at $pin. Re-register explicitly if the server signing key was intentionally rotated." >&2
+    fi
+    chown root:root "$pin"
+    chmod 0400 "$pin"
+    return 0
+  fi
+  if ! [[ "$configured" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "warning: agent.toml has no valid server_pubkey; privileged backup-agent auto-sync is disabled until the agent is re-registered and this installer is rerun" >&2
+    return 0
+  fi
+  printf '%s\n' "$configured" > "$pin"
+  chown root:root "$pin"
+  chmod 0400 "$pin"
+}
+
+write_privileged_sync_units() {
+  local pin=/etc/servermonitor-privileged/agent-signing.pub
+  [ -s "$pin" ] || return 0
+  cat > /etc/systemd/system/sm-agent-privileged-sync.service <<'UNIT'
+[Unit]
+Description=Synchronize ServerMonitor's signed privileged backup agent copy
+After=sm-agent.service
+ConditionPathExists=/opt/servermonitor/sm-agent.sig
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sm-agent sync-privileged --source /opt/servermonitor/sm-agent --signature /opt/servermonitor/sm-agent.sig --pubkey-file /etc/servermonitor-privileged/agent-signing.pub
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+UNIT
+  chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.service
+
+  cat > /etc/systemd/system/sm-agent-privileged-sync.path <<'UNIT'
+[Unit]
+Description=Watch for a signed ServerMonitor resident-agent update
+
+[Path]
+PathChanged=/opt/servermonitor/sm-agent.sig
+Unit=sm-agent-privileged-sync.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.path
+
+  cat > /etc/systemd/system/sm-agent-privileged-sync.timer <<'UNIT'
+[Unit]
+Description=Fallback reconciliation for ServerMonitor's privileged agent copy
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=sm-agent-privileged-sync.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+  chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.timer
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server)            SERVER_URL="$2"; shift 2 ;;
@@ -954,6 +1040,9 @@ chown sm-agent:sm-agent /etc/servermonitor/agent.toml
 chmod 0600 /etc/servermonitor/agent.toml
 fi
 
+pin_agent_signing_pubkey
+write_privileged_sync_units
+
 CAPS=""
 [ "$ENABLE_PORT_OWNERS" = "1" ] && CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
 [ "$ENABLE_SMART" = "1" ]       && CAPS="${CAPS:+$CAPS }CAP_SYS_RAWIO"
@@ -1015,6 +1104,10 @@ chmod 0644 /etc/systemd/system/sm-agent.service
 
 systemctl daemon-reload
 systemctl enable sm-agent.service >/dev/null 2>&1 || true
+if [ -s /etc/servermonitor-privileged/agent-signing.pub ]; then
+  systemctl enable --now sm-agent-privileged-sync.path >/dev/null 2>&1 || true
+  systemctl enable --now sm-agent-privileged-sync.timer >/dev/null 2>&1 || true
+fi
 systemctl restart sm-agent.service
 systemctl status --no-pager sm-agent.service || true
 

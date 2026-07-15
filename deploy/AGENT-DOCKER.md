@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.6 .
-docker push registry.example.com/servermonitor-agent:0.3.6
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.7 .
+docker push registry.example.com/servermonitor-agent:0.3.7
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.6
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.7
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -135,9 +135,11 @@ SM_BACKUP_TIME=02:30
 
 Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `TZ` (so `SM_BACKUP_TIME` is interpreted in your zone). Repos must be **remote** (`rest:`/`s3:`/`b2:`/`sftp:`); `tunnel:` repositories are host-install only for now.
 
-**What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume **mounted twice** (`/var/lib/servermonitor` and `/host/var/lib/servermonitor`).
+**What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume mounted at `/var/lib/servermonitor`, `/tmp`, and `/host/tmp`.
 
-**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. Each backup runs restic **chrooted into `/host`**, so snapshots record host-native paths (`/etc`, not `/host/etc`) and are interchangeable with a host-installed agent's snapshots. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot).
+**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. The `/tmp` + `/host/tmp` aliases give restic the same state paths before and after it chroots into `/host`; using the already-existing host `/tmp` mountpoint also avoids runc having to create a directory beneath the read-only `/host` bind. Each backup therefore records host-native paths (`/etc`, not `/host/etc`) and is interchangeable with a host-installed agent's snapshots. Host `/tmp` is hidden from this container and cannot be selected as a container-managed backup path. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot).
+
+**Coolify/runc migration from 0.3.5–0.3.6.** Those recipes nested the state volume at `/host/var/lib/servermonitor`. On a fresh host where that directory did not already exist, runc tried to create the mountpoint after `/host` had become read-only and the container failed during initialization with `create mountpoint ... mkdirat`. Use the 0.3.7 Compose recipe as a unit: it keeps the existing named volume (and therefore the identity/key) but replaces that failing nested target with the already-existing `/host/tmp` target and its matching `/tmp` alias. Simply deleting the old nested mount lets the process start but breaks chrooted backups.
 
 **Recovery kit — do this once, keep it offline:**
 
@@ -150,7 +152,7 @@ It prints the repository password. **`docker compose down -v` destroys the volum
 
 **Restore is staging-only.** `sm-agent backup restore …` restores into `/var/lib/servermonitor/restore/<snapshot>/` inside the volume; copy it onto the host with `docker cp`. In-place restore is refused from a container (restoring to `/` would hit the container, and `/host` is read-only); restore in place from the host runbook instead. See [BACKUPS.md](BACKUPS.md).
 
-**Security notes.** Backups add **no new host-read power** — the resident agent already holds `CAP_DAC_READ_SEARCH` over `/host`. The real root-equivalence is the **Docker socket**; put a read-only socket proxy in front (see the socket note above) when backups are on. Keep `prune_mode = external` (the default) so a compromised agent can add snapshots but not delete history against an append-only endpoint. On rootless Docker or SELinux-enforcing hosts, verify `chroot` + the nested rw-over-ro `/host` mount work before relying on it.
+**Security notes.** Backups add **no new host-read power** — the resident agent already holds `CAP_DAC_READ_SEARCH` over `/host`. The real root-equivalence is the **Docker socket**; put a read-only socket proxy in front (see the socket note above) when backups are on. Keep `prune_mode = external` (the default) so a compromised agent can add snapshots but not delete history against an append-only endpoint. On rootless Docker or SELinux-enforcing hosts, verify `chroot` + the nested rw-over-ro `/host/tmp` mount work before relying on it.
 
 ### Port / process owner attribution
 

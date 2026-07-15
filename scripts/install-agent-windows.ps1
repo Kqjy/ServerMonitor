@@ -125,6 +125,35 @@ function Lock-Acl {
     Set-Acl -Path $Path -AclObject $acl
 }
 
+function Install-AgentSigningPin {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath,
+        [Parameter(Mandatory=$true)][string]$PinPath,
+        [string]$DownloadedPubkey = ''
+    )
+    $configured = $DownloadedPubkey
+    if (-not $configured -and (Test-Path -LiteralPath $ConfigPath)) {
+        $match = [regex]::Match([System.IO.File]::ReadAllText($ConfigPath), '(?m)^server_pubkey\s*=\s*"([0-9a-fA-F]{64})"')
+        if ($match.Success) { $configured = $match.Groups[1].Value }
+    }
+    if (Test-Path -LiteralPath $PinPath) {
+        $existing = ([System.IO.File]::ReadAllText($PinPath)).Trim()
+        if ($configured -and $configured -ne $existing) {
+            Write-Warning "the server reports a different agent signing key; keeping the existing SYSTEM-owned update pin at $PinPath. Re-register explicitly if the signing key was intentionally rotated."
+        }
+        Lock-Acl -Path $PinPath -ServiceAccess None
+        return $true
+    }
+    if ($configured -notmatch '^[0-9a-fA-F]{64}$') {
+        Write-Warning 'no valid server signing key is configured; privileged backup-agent auto-sync is disabled until the agent is re-registered and this installer is rerun'
+        return $false
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($PinPath, $configured + "`n", $utf8NoBom)
+    Lock-Acl -Path $PinPath -ServiceAccess None
+    return $true
+}
+
 function Escape-Toml {
     param([string]$Value)
     return ($Value -replace '\\', '\\') -replace '"', '\"'
@@ -338,6 +367,21 @@ function Register-BackupCheckTask {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName 'ServerMonitor Backup Check' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+function Register-PrivilegedAgentSyncTask {
+    param(
+        [Parameter(Mandatory=$true)][string]$AgentExe,
+        [Parameter(Mandatory=$true)][string]$ResidentExe,
+        [Parameter(Mandatory=$true)][string]$PubkeyPath
+    )
+    $signature = $ResidentExe + '.sig'
+    $arguments = 'sync-privileged --source "{0}" --signature "{1}" --pubkey-file "{2}"' -f $ResidentExe, $signature, $PubkeyPath
+    $action = New-ScheduledTaskAction -Execute $AgentExe -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 
 function Write-RecoveryKit {
@@ -657,6 +701,9 @@ if (-not $Reconfigure) {
 
 if (Test-Path -Path $cfgPath) { Lock-Acl -Path $cfgPath -ServiceAccess Modify }
 
+$signingPin = Join-Path $installDir 'agent-signing.pub'
+$haveSigningPin = Install-AgentSigningPin -ConfigPath $cfgPath -PinPath $signingPin
+
 $spoolPath = Join-Path $configDir 'spool.db'
 if (Test-Path -Path $spoolPath) { Lock-Acl -Path $spoolPath -ServiceAccess Modify }
 
@@ -717,6 +764,10 @@ if ($AdminService) {
 
 Start-Service -Name 'sm-agent'
 Get-Service -Name 'sm-agent'
+
+if ($haveSigningPin) {
+    Register-PrivilegedAgentSyncTask -AgentExe $exe -ResidentExe $runtimeExe -PubkeyPath $signingPin
+}
 
 Invoke-BackupProvisioning -AgentExe $exe
 

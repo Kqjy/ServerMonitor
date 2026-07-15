@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='a06aa6cfaed205c680f330cf789d826eabe3d5d522f7a5654b2ddbeed5f3fa9a'
+CANONICAL_INSTALLER_SHA256='de0b4c2e1ba330ce398899c85c38c09821f67cfcd9f52c77653385dbc6c3d727'
 TOKEN="${SM_TOKEN:-}"
+DOWNLOADED_SERVER_PUBKEY=""
 INTERVAL="${SM_INTERVAL:-10}"
 INSECURE="${SM_INSECURE:-0}"
 PERSIST_INSECURE="${SM_PERSIST_INSECURE:-0}"
@@ -64,6 +65,14 @@ agent_token_from_config() {
     awk -F'"' '/^token[[:space:]]*=/ { print $2; exit }' /etc/servermonitor/agent.toml
 }
 
+capture_downloaded_server_pubkey() {
+    local headers="$1" value
+    value="$(awk -F':[[:space:]]*' 'tolower($1) == "x-agent-pubkey" { gsub("\r", "", $2); print $2; exit }' "$headers")"
+    if [[ "$value" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        DOWNLOADED_SERVER_PUBKEY="$value"
+    fi
+}
+
 refresh_agent_binaries() {
     if [ "$RECONFIGURE" != "1" ]; then
         install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
@@ -84,13 +93,14 @@ refresh_agent_binaries() {
     curl_opts=(-fsSL)
     [ "$INSECURE" = "1" ] && curl_opts+=(-k)
     grep -Eq '^[[:space:]]*insecure_skip_verify[[:space:]]*=[[:space:]]*true' /etc/servermonitor/agent.toml && curl_opts+=(-k)
-    if ! curl "${curl_opts[@]}" --config - -o "$TMP/sm-agent" "$SERVER_URL/api/v1/agent/binary?platform=$platform" <<CURLCFG
+    if ! curl "${curl_opts[@]}" --config - -D "$TMP/agent.headers" -o "$TMP/sm-agent" "$SERVER_URL/api/v1/agent/binary?platform=$platform" <<CURLCFG
 header = "X-Agent-Token: $token"
 CURLCFG
     then
         printf 'warning: could not download the current sm-agent from %s; keeping the current binaries\n' "$SERVER_URL" >&2
         return 0
     fi
+    capture_downloaded_server_pubkey "$TMP/agent.headers"
     chmod 0755 "$TMP/sm-agent"
     new_version="$(agent_binary_version "$TMP/sm-agent")"
     old_version="$(agent_binary_version /usr/local/bin/sm-agent)"
@@ -103,6 +113,95 @@ CURLCFG
         install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
         printf 'refreshed sm-agent binaries (v%s -> v%s)\n' "$old_version" "$new_version"
     fi
+}
+
+pin_agent_signing_pubkey() {
+    local pin=/etc/servermonitor-privileged/agent-signing.pub
+    local configured existing
+    install -o root -g root -m 0700 -d /etc/servermonitor-privileged
+    configured="$DOWNLOADED_SERVER_PUBKEY"
+    if [ -z "$configured" ]; then
+        configured="$(awk -F'"' '/^[[:space:]]*server_pubkey[[:space:]]*=/ { print $2; exit }' /etc/servermonitor/agent.toml)"
+    fi
+    if [ -f "$pin" ]; then
+        existing="$(tr -d '[:space:]' < "$pin")"
+        if [ -n "$configured" ] && [ "$configured" != "$existing" ]; then
+            printf 'warning: the server reports a different agent signing key; keeping the existing root-owned update pin at %s. Re-register explicitly if the signing key was intentionally rotated.\n' "$pin" >&2
+        fi
+        chown root:root "$pin"
+        chmod 0400 "$pin"
+        return 0
+    fi
+    if ! [[ "$configured" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        printf 'warning: no valid server signing key was returned; privileged backup-agent auto-sync is disabled until the agent is re-registered and this installer is rerun\n' >&2
+        return 0
+    fi
+    printf '%s\n' "$configured" > "$pin"
+    chown root:root "$pin"
+    chmod 0400 "$pin"
+}
+
+write_privileged_sync_units() {
+    local pin=/etc/servermonitor-privileged/agent-signing.pub
+    [ -s "$pin" ] || return 0
+    cat > /etc/systemd/system/sm-agent-privileged-sync.service <<'UNIT'
+[Unit]
+Description=Synchronize ServerMonitor's signed privileged backup agent copy
+After=sm-agent.service
+ConditionPathExists=/opt/servermonitor/sm-agent.sig
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sm-agent sync-privileged --source /opt/servermonitor/sm-agent --signature /opt/servermonitor/sm-agent.sig --pubkey-file /etc/servermonitor-privileged/agent-signing.pub
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+UNIT
+    chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.service
+
+    cat > /etc/systemd/system/sm-agent-privileged-sync.path <<'UNIT'
+[Unit]
+Description=Watch for a signed ServerMonitor resident-agent update
+
+[Path]
+PathChanged=/opt/servermonitor/sm-agent.sig
+Unit=sm-agent-privileged-sync.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.path
+
+    cat > /etc/systemd/system/sm-agent-privileged-sync.timer <<'UNIT'
+[Unit]
+Description=Fallback reconciliation for ServerMonitor's privileged agent copy
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+Unit=sm-agent-privileged-sync.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+    chmod 0644 /etc/systemd/system/sm-agent-privileged-sync.timer
 }
 
 has_nvme_device() {
@@ -826,9 +925,10 @@ CURL_OPTS=(-fsSL)
 [ "$INSECURE" = "1" ] && CURL_OPTS+=(-k)
 
 printf 'downloading %s agent for %s ...\n' "$SERVER_URL" "$PLATFORM"
-curl "${CURL_OPTS[@]}" --config - -o "$TMP/sm-agent" "$SERVER_URL/api/v1/agent/binary?platform=$PLATFORM" <<CURLCFG
+curl "${CURL_OPTS[@]}" --config - -D "$TMP/agent.headers" -o "$TMP/sm-agent" "$SERVER_URL/api/v1/agent/binary?platform=$PLATFORM" <<CURLCFG
 header = "X-Agent-Token: $TOKEN"
 CURLCFG
+capture_downloaded_server_pubkey "$TMP/agent.headers"
 fi
 
 id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group --comment 'ServerMonitor agent' sm-agent
@@ -864,6 +964,7 @@ TMP_CFG="$(mktemp /etc/servermonitor/agent.toml.XXXXXX)"
 cat >"$TMP_CFG" <<EOF
 server_url = "$SERVER_URL"
 token      = "$TOKEN"
+server_pubkey = "$DOWNLOADED_SERVER_PUBKEY"
 interval_s = $INTERVAL
 spool_path = "/var/lib/servermonitor/spool.db"
 insecure_skip_verify = $INSECURE_LINE
@@ -872,6 +973,9 @@ chmod 0600 "$TMP_CFG"
 chown sm-agent:sm-agent "$TMP_CFG"
 mv -f "$TMP_CFG" /etc/servermonitor/agent.toml
 fi
+
+pin_agent_signing_pubkey
+write_privileged_sync_units
 
 CAPS=""
 [ "$ENABLE_PORT_OWNERS" = "1" ] && CAPS="CAP_DAC_READ_SEARCH CAP_SYS_PTRACE"
@@ -934,6 +1038,10 @@ chmod 0644 /etc/systemd/system/sm-agent.service
 
 systemctl daemon-reload
 systemctl enable sm-agent.service >/dev/null 2>&1 || true
+if [ -s /etc/servermonitor-privileged/agent-signing.pub ]; then
+    systemctl enable --now sm-agent-privileged-sync.path >/dev/null 2>&1 || true
+    systemctl enable --now sm-agent-privileged-sync.timer >/dev/null 2>&1 || true
+fi
 systemctl restart sm-agent.service
 
 if [ "$ENABLE_BACKUP" = "1" ]; then

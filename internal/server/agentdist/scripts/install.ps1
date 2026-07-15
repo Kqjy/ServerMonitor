@@ -38,7 +38,8 @@ if ($env:SM_BACKUP_S3_PATH_STYLE -eq '1') { $BackupS3PathStyle = $true }
 
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
-$CanonicalInstallerSha256 = '6a85b77640f69acd16b5c2578ac3c9dd11ddd4a51631d8fd6014644982a747e3'
+$DownloadedServerPubkey = ''
+$CanonicalInstallerSha256 = 'b54e447d6a22a7398005350cee3da75d01bc07810d2fa429c9821b24d2890c55'
 $ResticVersion = '0.19.0'
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -156,6 +157,47 @@ function Lock-Acl {
     }
     $acl.SetOwner($adminSid)
     Set-Acl -Path $Path -AclObject $acl
+}
+
+function Get-AgentSigningPubkey {
+    param([Parameter(Mandatory=$true)][string]$AgentToken)
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Method Head -Uri "$ServerUrl/api/v1/agent/binary?platform=windows-amd64" -Headers @{ 'X-Agent-Token' = $AgentToken }
+        $value = [string]$response.Headers['X-Agent-Pubkey']
+        if ($value -match '^[0-9a-fA-F]{64}$') { return $value }
+    } catch {
+        Write-Warning ("could not read the server agent-signing key: {0}" -f $_.Exception.Message)
+    }
+    return ''
+}
+
+function Install-AgentSigningPin {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath,
+        [Parameter(Mandatory=$true)][string]$PinPath,
+        [string]$DownloadedPubkey = ''
+    )
+    $configured = $DownloadedPubkey
+    if (-not $configured -and (Test-Path -LiteralPath $ConfigPath)) {
+        $match = [regex]::Match([System.IO.File]::ReadAllText($ConfigPath), '(?m)^server_pubkey\s*=\s*"([0-9a-fA-F]{64})"')
+        if ($match.Success) { $configured = $match.Groups[1].Value }
+    }
+    if (Test-Path -LiteralPath $PinPath) {
+        $existing = ([System.IO.File]::ReadAllText($PinPath)).Trim()
+        if ($configured -and $configured -ne $existing) {
+            Write-Warning "the server reports a different agent signing key; keeping the existing SYSTEM-owned update pin at $PinPath. Re-register explicitly if the signing key was intentionally rotated."
+        }
+        Lock-Acl -Path $PinPath -ServiceAccess None
+        return $true
+    }
+    if ($configured -notmatch '^[0-9a-fA-F]{64}$') {
+        Write-Warning 'no valid server signing key was returned; privileged backup-agent auto-sync is disabled until the agent is re-registered and this installer is rerun'
+        return $false
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($PinPath, $configured + "`n", $utf8NoBom)
+    Lock-Acl -Path $PinPath -ServiceAccess None
+    return $true
 }
 
 function Escape-Toml {
@@ -371,6 +413,21 @@ function Register-BackupCheckTask {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName 'ServerMonitor Backup Check' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+function Register-PrivilegedAgentSyncTask {
+    param(
+        [Parameter(Mandatory=$true)][string]$AgentExe,
+        [Parameter(Mandatory=$true)][string]$ResidentExe,
+        [Parameter(Mandatory=$true)][string]$PubkeyPath
+    )
+    $signature = $ResidentExe + '.sig'
+    $arguments = 'sync-privileged --source "{0}" --signature "{1}" --pubkey-file "{2}"' -f $ResidentExe, $signature, $PubkeyPath
+    $action = New-ScheduledTaskAction -Execute $AgentExe -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 
 function Write-RecoveryKit {
@@ -670,6 +727,7 @@ if ($Reconfigure) {
         $refreshTmp = Join-Path $env:TEMP ('sm-agent-' + [System.IO.Path]::GetRandomFileName())
         try {
             Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=windows-amd64" -Headers @{ 'X-Agent-Token' = $tokenMatch.Groups[1].Value } -OutFile $refreshTmp
+            $DownloadedServerPubkey = Get-AgentSigningPubkey -AgentToken $tokenMatch.Groups[1].Value
             $newBinaryVersion = (& $refreshTmp --version | Out-String).Trim()
             if (Test-Path -LiteralPath $exe) { $oldBinaryVersion = (& $exe --version | Out-String).Trim() }
             if ($newBinaryVersion -and ($newBinaryVersion -ne $oldBinaryVersion)) { $script:refreshBinaries = $true }
@@ -687,6 +745,7 @@ if (-not $Reconfigure) {
 
     Write-Host "downloading $ServerUrl agent for $platform ..."
     Invoke-WebRequest -UseBasicParsing -Uri "$ServerUrl/api/v1/agent/binary?platform=$platform" -Headers @{ 'X-Agent-Token' = $Token } -OutFile $exe
+    $DownloadedServerPubkey = Get-AgentSigningPubkey -AgentToken $Token
     Copy-Item -Force -Path $exe -Destination $runtimeExe
     Lock-Acl -Path $exe        -ServiceAccess Read
     Lock-Acl -Path $runtimeExe -ServiceAccess Modify
@@ -697,6 +756,7 @@ if (-not $Reconfigure) {
     $cfg = @"
 server_url = "$ServerUrl"
 token      = "$Token"
+server_pubkey = "$DownloadedServerPubkey"
 interval_s = $IntervalS
 spool_path = "$($spoolPath -replace '\\', '\\')"
 insecure_skip_verify = $insecureLine
@@ -709,6 +769,9 @@ insecure_skip_verify = $insecureLine
     Move-Item -Force -LiteralPath $tmpCfg -Destination $cfgPath
     Lock-Acl -Path $cfgPath -ServiceAccess Modify
 }
+
+$signingPin = Join-Path $installDir 'agent-signing.pub'
+$haveSigningPin = Install-AgentSigningPin -ConfigPath $cfgPath -PinPath $signingPin -DownloadedPubkey $DownloadedServerPubkey
 
 if (-not $AdminService) {
     foreach ($g in @('docker-users','Performance Monitor Users')) {
@@ -771,6 +834,10 @@ if ($AdminService) {
 if ($EnableSmart) { Install-Smartmontools }
 
 Start-Service -Name 'sm-agent'
+
+if ($haveSigningPin) {
+    Register-PrivilegedAgentSyncTask -AgentExe $exe -ResidentExe $runtimeExe -PubkeyPath $signingPin
+}
 
 Invoke-BackupProvisioning -AgentExe $exe
 

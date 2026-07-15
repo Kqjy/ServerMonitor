@@ -82,6 +82,7 @@ func downloadAgentHandler(hosts *storage.Hosts, signer *agentsig.Signer) http.Ha
 		w.Header().Set("Cache-Control", "no-store")
 		if signer != nil {
 			w.Header().Set(agentsig.SignatureHeader, signer.SignDigest(digest))
+			w.Header().Set("X-Agent-Pubkey", signer.PublicKeyHex())
 		}
 		_, _ = io.Copy(w, f)
 	}

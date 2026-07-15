@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"servermonitor/pkg/agentsig"
+	"servermonitor/pkg/version"
 )
 
 const downloadTimeout = 5 * time.Minute
@@ -164,11 +167,190 @@ func Run(ctx context.Context, opts Options) error {
 		_ = os.Remove(newPath)
 		return err
 	}
+	if err := writeSignatureAtomic(selfPath+".sig", sigHeader); err != nil {
+		opts.Logger.Warn("agent upgraded but could not write the privileged-sync attestation",
+			"err", err,
+			"path", selfPath+".sig",
+			"hint", "the resident agent is current, but the privileged backup copy will need an installer rerun if it reports stale")
+	}
 
 	opts.Logger.Info("agent upgrade staged",
 		"path", selfPath,
 		"bytes", n,
 		"hint", "exiting non-zero so the service manager restarts with the new binary")
+	return nil
+}
+
+// SyncPrivileged promotes a resident agent binary into the root-owned agent
+// location used by backup/restore jobs. The resident binary and its signature
+// file are deliberately treated as attacker-controlled: the bytes are copied
+// to a private staging file, hashed there, and independently verified against
+// the installer-pinned server key before the privileged binary is replaced.
+func SyncPrivileged(ctx context.Context, sourcePath, signaturePath, pubkeyPath string, logger *slog.Logger) (bool, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	selfPath, err := os.Executable()
+	if err != nil {
+		return false, fmt.Errorf("locate privileged agent: %w", err)
+	}
+	selfPath, err = filepath.EvalSymlinks(selfPath)
+	if err != nil {
+		return false, fmt.Errorf("resolve privileged agent: %w", err)
+	}
+	if err := verifyDirSafe(filepath.Dir(selfPath)); err != nil {
+		return false, err
+	}
+	if err := verifyRootOwnedPath(filepath.Dir(selfPath)); err != nil {
+		return false, fmt.Errorf("privileged agent install path: %w", err)
+	}
+	if err := verifyPinnedKeyFile(pubkeyPath); err != nil {
+		return false, err
+	}
+	pubkey, err := os.ReadFile(pubkeyPath)
+	if err != nil {
+		return false, fmt.Errorf("read pinned server pubkey: %w", err)
+	}
+	sig, err := os.ReadFile(signaturePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read resident upgrade attestation: %w", err)
+	}
+	if len(sig) > 4096 {
+		return false, fmt.Errorf("resident upgrade attestation is unexpectedly large (%d bytes)", len(sig))
+	}
+
+	newPath := stagedPath(selfPath)
+	_ = os.Remove(newPath)
+	digest, n, err := copyStagedBinary(sourcePath, newPath)
+	if err != nil {
+		_ = os.Remove(newPath)
+		return false, err
+	}
+	if err := agentsig.Verify(strings.TrimSpace(string(pubkey)), strings.TrimSpace(string(sig)), digest); err != nil {
+		_ = os.Remove(newPath)
+		return false, fmt.Errorf("verify resident agent signature: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(newPath, 0o500); err != nil {
+			_ = os.Remove(newPath)
+			return false, fmt.Errorf("chmod staged privileged agent: %w", err)
+		}
+	}
+	if err := verifyStagedBinary(newPath, digest); err != nil {
+		_ = os.Remove(newPath)
+		return false, err
+	}
+	stagedVersion, err := stagedAgentVersion(ctx, newPath)
+	if err != nil {
+		_ = os.Remove(newPath)
+		return false, err
+	}
+	if !version.IsNewer(stagedVersion, version.Version) {
+		_ = os.Remove(newPath)
+		return false, nil
+	}
+	if err := swap(selfPath, newPath); err != nil {
+		_ = os.Remove(newPath)
+		return false, err
+	}
+	logger.Info("privileged backup agent synchronized",
+		"from", version.Version,
+		"to", stagedVersion,
+		"bytes", n,
+		"source", sourcePath,
+		"target", selfPath)
+	return true, nil
+}
+
+func copyStagedBinary(sourcePath, stagedPath string) ([]byte, int64, error) {
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open resident agent: %w", err)
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o700)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create staged privileged agent: %w", err)
+	}
+	digester := agentsig.NewDigest()
+	n, copyErr := io.Copy(io.MultiWriter(dst, digester), io.LimitReader(src, maxAgentBinaryBytes+1))
+	syncErr := dst.Sync()
+	closeErr := dst.Close()
+	if copyErr != nil {
+		return nil, n, fmt.Errorf("copy resident agent: %w", copyErr)
+	}
+	if syncErr != nil {
+		return nil, n, fmt.Errorf("sync staged privileged agent: %w", syncErr)
+	}
+	if closeErr != nil {
+		return nil, n, fmt.Errorf("close staged privileged agent: %w", closeErr)
+	}
+	if n > maxAgentBinaryBytes {
+		return nil, n, fmt.Errorf("resident agent exceeds %d bytes", maxAgentBinaryBytes)
+	}
+	if n < 1024 {
+		return nil, n, fmt.Errorf("resident agent is suspiciously small (%d bytes)", n)
+	}
+	return digester.Sum(nil), n, nil
+}
+
+func stagedAgentVersion(ctx context.Context, path string) (string, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cmdCtx, path, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("run staged agent --version: %w", err)
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) != 2 || fields[0] != "sm-agent" || fields[1] == "" {
+		return "", fmt.Errorf("staged agent returned an invalid version string %q", strings.TrimSpace(string(out)))
+	}
+	return fields[1], nil
+}
+
+func stagedPath(selfPath string) string {
+	if runtime.GOOS == "windows" && strings.EqualFold(filepath.Ext(selfPath), ".exe") {
+		return strings.TrimSuffix(selfPath, filepath.Ext(selfPath)) + ".new.exe"
+	}
+	return selfPath + ".new"
+}
+
+func writeSignatureAtomic(path, signature string) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.TrimSpace(signature)+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := replaceFileAtomic(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func verifyPinnedKeyFile(path string) error {
+	if err := verifyRootOwnedPath(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("pinned server pubkey directory: %w", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat pinned server pubkey: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("pinned server pubkey %q is not a regular file", path)
+	}
+	if !fileOwnedByRoot(info) {
+		return fmt.Errorf("pinned server pubkey %q is not owned by root/SYSTEM", path)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("pinned server pubkey %q is group- or world-writable (mode %#o)", path, info.Mode().Perm())
+	}
 	return nil
 }
 

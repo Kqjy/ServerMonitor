@@ -1,6 +1,6 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.3.6}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.3.7}
     build:
       context: ..
       dockerfile: deploy/agent.Dockerfile
@@ -29,7 +29,8 @@ services:
       SM_EXTERNALLY_MANAGED: "true"
       TZ: ${TZ:-UTC}
       SM_ENABLE_BACKUP: ${SM_ENABLE_BACKUP:-}
-      SM_BACKUP_CONFIG: /var/lib/servermonitor/backup/backup.toml
+      SM_BACKUP_CONFIG: /tmp/backup/backup.toml
+      SM_BACKUP_STATUS_PATH: /tmp/backup-status.json
       SM_BACKUP_REPOS: ${SM_BACKUP_REPOS:-}
       SM_BACKUP_REPO_NAMES: ${SM_BACKUP_REPO_NAMES:-}
       SM_BACKUP_PATHS: ${SM_BACKUP_PATHS:-}
@@ -42,8 +43,6 @@ services:
       SM_BACKUP_S3_ACCESS_KEY_ID: ${SM_BACKUP_S3_ACCESS_KEY_ID:-}
       SM_BACKUP_S3_SECRET_ACCESS_KEY: ${SM_BACKUP_S3_SECRET_ACCESS_KEY:-}
       SM_BACKUP_S3_SESSION_TOKEN: ${SM_BACKUP_S3_SESSION_TOKEN:-}
-    tmpfs:
-      - /tmp
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - type: bind
@@ -53,7 +52,8 @@ services:
         bind:
           propagation: rslave
       - sm-agent-state:/var/lib/servermonitor
-      - sm-agent-state:/host/var/lib/servermonitor
+      - sm-agent-state:/tmp
+      - sm-agent-state:/host/tmp
 
 volumes:
   sm-agent-state:

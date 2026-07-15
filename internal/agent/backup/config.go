@@ -203,6 +203,9 @@ func DefaultConfigPath() string {
 }
 
 func DefaultStatusPath() string {
+	if v := strings.TrimSpace(os.Getenv("SM_BACKUP_STATUS_PATH")); v != "" {
+		return v
+	}
 	if runtime.GOOS == "windows" {
 		if pd := strings.TrimSpace(os.Getenv("ProgramData")); pd != "" {
 			return filepath.Join(pd, "ServerMonitor", "backup-status.json")

@@ -206,6 +206,13 @@ password_file = " /etc/servermonitor/backup.key "
 	}
 }
 
+func TestDefaultStatusPathHonorsEnvironment(t *testing.T) {
+	t.Setenv("SM_BACKUP_STATUS_PATH", "/tmp/servermonitor-backup-status.json")
+	if got := DefaultStatusPath(); got != "/tmp/servermonitor-backup-status.json" {
+		t.Fatalf("DefaultStatusPath = %q", got)
+	}
+}
+
 func TestLoadConfigRepoRetentionOverrides(t *testing.T) {
 	configPath := writeConfigFile(t, `
 paths = ["/etc"]

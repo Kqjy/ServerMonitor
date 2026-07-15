@@ -36,14 +36,20 @@ done
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
 echo "stopping and removing sm-agent.service ..."
+systemctl stop sm-agent-privileged-sync.path sm-agent-privileged-sync.timer 2>/dev/null || true
+systemctl disable sm-agent-privileged-sync.path sm-agent-privileged-sync.timer 2>/dev/null || true
 systemctl stop sm-agent.service 2>/dev/null || true
 systemctl disable sm-agent.service 2>/dev/null || true
-rm -f /etc/systemd/system/sm-agent.service
+rm -f /etc/systemd/system/sm-agent.service \
+  /etc/systemd/system/sm-agent-privileged-sync.service \
+  /etc/systemd/system/sm-agent-privileged-sync.path \
+  /etc/systemd/system/sm-agent-privileged-sync.timer
 systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed sm-agent.service 2>/dev/null || true
 
 rm -f /usr/local/bin/sm-agent
 rm -rf /opt/servermonitor
+rm -rf /etc/servermonitor-privileged
 rm -f /etc/servermonitor/deregistered
 
 if [ "$KEEP_DATA" = "1" ]; then

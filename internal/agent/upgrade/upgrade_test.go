@@ -101,6 +101,39 @@ func TestVerifyStagedBinaryMissingFile(t *testing.T) {
 	}
 }
 
+func TestWriteSignatureAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sm-agent.sig")
+	if err := writeSignatureAtomic(path, "  ed25519:abc123  "); err != nil {
+		t.Fatalf("writeSignatureAtomic: %v", err)
+	}
+	if err := writeSignatureAtomic(path, "ed25519:def456"); err != nil {
+		t.Fatalf("replace signature: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read signature: %v", err)
+	}
+	if string(got) != "ed25519:def456\n" {
+		t.Fatalf("signature contents = %q", got)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temporary signature file was left behind: %v", err)
+	}
+}
+
+func TestCopyStagedBinaryRejectsSuspiciouslySmallSource(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "resident")
+	staged := filepath.Join(dir, "privileged.new")
+	if err := os.WriteFile(source, bytes.Repeat([]byte{'x'}, 100), 0o700); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	_, _, err := copyStagedBinary(source, staged)
+	if err == nil || !strings.Contains(err.Error(), "suspiciously small") {
+		t.Fatalf("copyStagedBinary error = %v", err)
+	}
+}
+
 func TestManagedEnvTruthy(t *testing.T) {
 	t.Setenv("SM_EXTERNALLY_MANAGED", "true")
 	managed, reason := Managed()
