@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.8 .
-docker push registry.example.com/servermonitor-agent:0.3.8
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.9 .
+docker push registry.example.com/servermonitor-agent:0.3.9
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.8
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.9
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -135,11 +135,16 @@ SM_BACKUP_TIME=02:30
 
 Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
 
-**Tunnel repositories.** Set `SM_BACKUP_REPOS=tunnel:NAME` for storage on the monitoring server or `SM_BACKUP_REPOS=tunnel:NODE/NAME` for a promoted storage node. Enrollment is automatic at boot over the agent-token channel and needs only outbound UDP to the server or node WireGuard endpoint; WireGuard runs in userspace, so it needs no new capabilities or kernel module. The create-once `tunnel.key` lives in the state volume. `docker compose down -v` destroys it, which does not affect backup data because a fresh key enrolls again, but the `backup.key` recovery warning below still applies. During a run, restic uses a transient loopback proxy; with `network_mode: host` this is the host loopback, the same exposure class as a host install, and it exists only for the duration of the run.
+**Tunnel repositories.** Set `SM_BACKUP_REPOS=tunnel:NAME` for storage on the monitoring server or `SM_BACKUP_REPOS=tunnel:NODE/NAME` for a promoted storage node, and set `SM_BACKUP_REPO_NAMES` to the repository's logical name. A `tunnel:` repository authenticates with the **same minted upload credential** as a `rest:` repository: `SM_BACKUP_REST_USERNAME` and `SM_BACKUP_REST_PASSWORD` must both be set. The tunnel replaces the public network path; it does not replace endpoint authentication. Enrollment is automatic at boot over the agent-token channel and needs only outbound UDP to the server or node WireGuard endpoint; WireGuard runs in userspace, so it needs no new capabilities or kernel module. The create-once `tunnel.key` lives in the state volume. `docker compose down -v` destroys it, which does not affect backup data because a fresh key enrolls again, but the `backup.key` recovery warning below still applies. During a run, restic uses a transient loopback proxy; with `network_mode: host` this is the host loopback, the same exposure class as a host install, and it exists only for the duration of the run.
 
 **What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume mounted at `/var/lib/servermonitor`, `/tmp`, and `/host/tmp`.
 
-**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. The `/tmp` + `/host/tmp` aliases give restic the same state paths before and after it chroots into `/host`; using the already-existing host `/tmp` mountpoint also avoids runc having to create a directory beneath the read-only `/host` bind. Each backup therefore records host-native paths (`/etc`, not `/host/etc`) and is interchangeable with a host-installed agent's snapshots. Host `/tmp` is hidden from this container and cannot be selected as a container-managed backup path. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot).
+**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. The `/tmp` + `/host/tmp` aliases give restic the same state paths before and after it chroots into `/host`; using the already-existing host `/tmp` mountpoint also avoids runc having to create a directory beneath the read-only `/host` bind. Each backup therefore records host-native paths (`/etc`, not `/host/etc`) and is interchangeable with a host-installed agent's snapshots. Host `/tmp` is hidden from this container and cannot be selected as a container-managed backup path. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot). To run the first backup immediately instead of waiting for `SM_BACKUP_TIME`:
+
+```bash
+docker compose -f deploy/docker-compose.agent.yml exec sm-agent \
+  /usr/local/bin/sm-agent backup run
+```
 
 **Coolify/runc migration from 0.3.5–0.3.6.** Those recipes nested the state volume at `/host/var/lib/servermonitor`. On a fresh host where that directory did not already exist, runc tried to create the mountpoint after `/host` had become read-only and the container failed during initialization with `create mountpoint ... mkdirat`. Use the 0.3.7 Compose recipe as a unit: it keeps the existing named volume (and therefore the identity/key) but replaces that failing nested target with the already-existing `/host/tmp` target and its matching `/tmp` alias. Simply deleting the old nested mount lets the process start but breaks chrooted backups.
 

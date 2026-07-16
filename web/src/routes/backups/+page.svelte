@@ -9,9 +9,10 @@
     type BackupTunnelResp,
     type BackupTunnelPeer,
     type BackupNode,
+    type BackupRepoStatus,
     type Host
   } from '$lib/api';
-  import { bytes, timeAgo } from '$lib/format';
+  import { bytes, timeAgo, timeUntil } from '$lib/format';
   import { subscribeHosts, type LivePoint } from '$lib/sse';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
@@ -61,6 +62,7 @@
   let toDelete = $state<BackupTarget | null>(null);
 
   let firstBlobSeen = $state(false);
+  let linkedRepoStatus = $state<BackupRepoStatus | null>(null);
   let poll: ReturnType<typeof setInterval> | null = null;
   let hostsTimer: ReturnType<typeof setInterval> | null = null;
   let liveTimer: ReturnType<typeof setInterval> | null = null;
@@ -211,6 +213,7 @@
     credential = null;
     createError = null;
     firstBlobSeen = false;
+    linkedRepoStatus = null;
     snippetTab = 'linux';
     view = 'new';
     void loadHosts().then(() => {
@@ -264,6 +267,15 @@
         const t = resp.targets.find((x) => x.id === credential!.id);
         if (t && t.used_bytes > 0) firstBlobSeen = true;
       } catch {}
+      if (newHostId != null && credential) {
+        const name = credential.name;
+        try {
+          const resp = await api.backups(newHostId);
+          if (credential?.name === name) {
+            linkedRepoStatus = resp.repos.find((r) => r.repo === name)?.status ?? null;
+          }
+        } catch {}
+      }
     }, 2500);
   }
 
@@ -466,19 +478,16 @@
 
   const dockerSnippet = $derived.by(() => {
     if (!credential) return '';
-    const lines = [
+    return [
       'SM_ENABLE_BACKUP=1',
-      `SM_BACKUP_REPOS="${repoSpec}"`
-    ];
-    if (repoSpec.startsWith('rest:')) {
-      lines.push(`SM_BACKUP_REST_USERNAME="${credential.name}"`);
-      lines.push(`SM_BACKUP_REST_PASSWORD="${credential.password}"`);
-    }
-    lines.push(
+      `SM_BACKUP_REPOS="${repoSpec}"`,
+      `SM_BACKUP_REPO_NAMES="${credential.name}"`,
+      `SM_BACKUP_REST_USERNAME="${credential.name}"`,
+      `SM_BACKUP_REST_PASSWORD="${credential.password}"`,
+      'SM_BACKUP_PRUNE_MODE=external',
       'SM_BACKUP_TIME=02:30',
       'TZ=UTC'
-    );
-    return lines.join('\n');
+    ].join('\n');
   });
 
   const dockerRedeployCommand = 'docker compose -f deploy/docker-compose.agent.yml --env-file .env.agent up -d';
@@ -529,9 +538,57 @@ restic -r ${publicRepoUrl} backup /etc`;
           : resticSnippet
   );
 
+  const runNowCommand = $derived(
+    snippetTab === 'windows'
+      ? "Start-ScheduledTask 'ServerMonitor Backup'"
+      : snippetTab === 'docker'
+        ? 'docker compose -f deploy/docker-compose.agent.yml exec sm-agent /usr/local/bin/sm-agent backup run'
+        : 'sudo systemctl start sm-backup.service'
+  );
+
+  function absTime(iso?: string): string {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? '' : d.toLocaleString();
+  }
+
+  const wizardRepoCreatedAt = $derived.by(() => {
+    if (!credential) return null;
+    const id = credential.id;
+    return data?.targets.find((x) => x.id === id)?.created_at ?? null;
+  });
+
+  function sinceCreation(iso?: string): boolean {
+    if (!iso) return false;
+    if (!wizardRepoCreatedAt) return true;
+    return new Date(iso).getTime() >= new Date(wizardRepoCreatedAt).getTime();
+  }
+
+  type WizardStage = 'waiting' | 'scheduled' | 'running' | 'failed' | 'uploaded' | 'received';
+  const wizardStage = $derived.by<WizardStage>(() => {
+    if (firstBlobSeen) return 'received';
+    if (newHostId != null && credential) {
+      const entry = live[newHostId]?.[credential.name];
+      if (entry && entry.running && liveNow - entry.lastSeen < 30_000) return 'running';
+    }
+    if (linkedRepoStatus) {
+      const s = linkedRepoStatus;
+      if (!s.success && s.error && sinceCreation(s.last_finished)) return 'failed';
+      if ((s.success || s.last_success) && sinceCreation(s.last_success ?? s.last_finished)) return 'uploaded';
+      return 'scheduled';
+    }
+    return 'waiting';
+  });
+
   onMount(async () => {
     await load();
-    hostsTimer = setInterval(() => void loadHosts(), 30_000);
+    hostsTimer = setInterval(() => {
+      void loadHosts();
+      void api
+        .backupNodes()
+        .then((resp) => (nodes = resp?.nodes ?? nodes))
+        .catch(() => {});
+    }, 30_000);
     liveUnsub = subscribeHosts(['backup_running'], receiveLive);
     liveTimer = setInterval(() => (liveNow = Date.now()), 5_000);
     const sp = $page.url.searchParams;
@@ -550,7 +607,7 @@ restic -r ${publicRepoUrl} backup /etc`;
 </script>
 
 {#snippet howBackupsContent()}
-  <p class="mt-1.5 text-xs text-zinc-400 leading-relaxed max-w-3xl">
+  <p class="mt-1.5 text-xs text-zinc-400 leading-relaxed">
     Monitored hosts back up their own files with restic — encrypted on the host, so the destination only ever sees
     ciphertext. A destination can be <span class="text-zinc-200">this server</span> or an
     <span class="text-zinc-200">external</span> rest-server / S3 endpoint. Enable a host's backups at install with
@@ -686,7 +743,7 @@ restic -r ${publicRepoUrl} backup /etc`;
   <div class="flex items-start justify-between gap-3 flex-wrap">
     <div>
       <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Backups</h1>
-      <p class="text-xs sm:text-sm text-zinc-500 mt-1 max-w-2xl">
+      <p class="text-xs sm:text-sm text-zinc-500 mt-1">
         Where your fleet backs up, and this server's role as an append-only backup destination.
       </p>
     </div>
@@ -727,7 +784,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                 <option value="server">This server</option>
               {/if}
               {#each nodes as n (n.host_id)}
-                <option value={n.host_id} disabled={!n.enrolled}>Node · {n.hostname}{n.enrolled ? '' : ' (coming online…)'}</option>
+                <option value={n.host_id} disabled={!n.enrolled}>Node · {n.hostname}{n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
               {/each}
             </select>
             <p class="mt-1.5 text-[11px] text-zinc-600">Storage nodes receive backups over per-host WireGuard tunnels; nothing is exposed to the internet.</p>
@@ -833,7 +890,9 @@ restic -r ${publicRepoUrl} backup /etc`;
               {:else if snippetTab === 'windows'}
                 Run in an elevated PowerShell on the target host. Replace <span class="font-mono">&lt;ADMIN_TOKEN&gt;</span> with your server admin token.
               {:else if snippetTab === 'docker'}
-                First add these lines to <span class="font-mono">.env.agent</span>, then run the redeploy command below.
+                Add all of these lines to <span class="font-mono">.env.agent</span>, then run the redeploy command below. This is the complete set for this repository — the two
+                <span class="font-mono">SM_BACKUP_REST_*</span> lines are the upload credential above and are required even for <span class="font-mono">tunnel:</span> repositories.
+                The encryption key is generated inside the agent's state volume, so there is nothing else to configure.
               {:else if snippetTab === 'existing'}
                 Already-monitored host with backups enabled? Add this repo to its backup config, then re-run the installer to apply.
               {:else if tunnelActive && !tunnel?.public_http}
@@ -867,35 +926,81 @@ restic -r ${publicRepoUrl} backup /etc`;
                   <pre class="text-[11px] font-mono bg-zinc-950 border border-zinc-800 rounded-md p-2.5 overflow-x-auto whitespace-pre text-zinc-300 select-text">{dockerRedeployCommand}</pre>
                   <button type="button" onclick={() => copy(dockerRedeployCommand, 'docker-redeploy')} class="absolute top-2 right-2 text-[11px] px-2 py-0.5 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300">{copied === 'docker-redeploy' ? 'copied' : 'copy'}</button>
                 </div>
-                <p class="text-[11px] text-zinc-500">See <span class="font-mono text-zinc-400">deploy/AGENT-DOCKER.md</span> → Managed backups for the complete recipe.</p>
+                <p class="text-[11px] text-zinc-500">
+                  Backs up <span class="font-mono">/etc /home /root /var/lib</span> by default (override with <span class="font-mono">SM_BACKUP_PATHS</span>); the daily run happens at
+                  <span class="font-mono">SM_BACKUP_TIME</span> interpreted in <span class="font-mono">TZ</span>. See <span class="font-mono text-zinc-400">deploy/AGENT-DOCKER.md</span> → Managed backups
+                  for the complete recipe, including the one-time recovery kit that protects the generated encryption key.
+                </p>
               {/if}
             {/if}
           </div>
         </div>
 
-        <div class="rounded-xl border {firstBlobSeen ? 'border-emerald-900/40 bg-emerald-950/20' : 'border-zinc-800 bg-zinc-900/40'} p-4 sm:p-5">
-          <div class="flex flex-wrap items-center gap-3">
-            <span class="h-2 w-2 rounded-full {firstBlobSeen ? 'bg-emerald-400' : 'bg-amber-400'} animate-pulse shrink-0"></span>
+        {#snippet runNowBlock()}
+          <div class="relative mt-2">
+            <pre class="text-[11px] font-mono bg-zinc-950 border border-zinc-800 rounded-md p-2.5 pr-16 overflow-x-auto whitespace-pre text-zinc-300 select-text">{runNowCommand}</pre>
+            <button type="button" onclick={() => copy(runNowCommand, 'runnow')} class="absolute top-2 right-2 text-[11px] px-2 py-0.5 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300">{copied === 'runnow' ? 'copied' : 'copy'}</button>
+          </div>
+        {/snippet}
+        {#snippet hostBackupsLink()}
+          {#if newHostId != null}
+            <a href="/hosts/{newHostId}?tab=backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">{linkedHostname} → Backups</a>
+          {:else}
+            <span class="text-zinc-300">Hosts → (host) → Backups</span>
+          {/if}
+        {/snippet}
+        <div class="rounded-xl border {wizardStage === 'received' || wizardStage === 'uploaded' ? 'border-emerald-900/40 bg-emerald-950/20' : wizardStage === 'failed' ? 'border-rose-900/50 bg-rose-950/20' : 'border-zinc-800 bg-zinc-900/40'} p-4 sm:p-5">
+          <div class="flex flex-wrap items-start gap-3">
+            <span class="mt-1.5 h-2 w-2 rounded-full shrink-0 {wizardStage === 'received' || wizardStage === 'uploaded' ? 'bg-emerald-400' : wizardStage === 'running' ? 'bg-emerald-400 animate-pulse' : wizardStage === 'failed' ? 'bg-rose-400' : wizardStage === 'scheduled' ? 'bg-sky-400 animate-pulse' : 'bg-amber-400 animate-pulse'}"></span>
             <div class="flex-1 min-w-0">
-              {#if firstBlobSeen}
+              {#if wizardStage === 'received'}
                 <div class="text-sm font-medium text-emerald-100">Receiving backups — first data arrived</div>
                 <div class="text-xs text-zinc-400 mt-0.5">
-                  This repository is live.
-                  {#if newHostId != null}
-                    Watch it under <a href="/hosts/{newHostId}?tab=backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">{linkedHostname} → Backups</a>.
-                  {:else}
-                    The host's status appears under its <span class="text-zinc-300">Backups</span> tab.
-                  {/if}
+                  This repository is live. Watch it under {@render hostBackupsLink()}.
                 </div>
+              {:else if wizardStage === 'uploaded'}
+                <div class="text-sm font-medium text-emerald-100">First backup completed</div>
+                <div class="text-xs text-zinc-400 mt-0.5">
+                  <span class="font-mono">{credential.name}</span> received its first snapshot — the stored size updates within a minute. Watch it under {@render hostBackupsLink()}.
+                </div>
+              {:else if wizardStage === 'running'}
+                <div class="text-sm font-medium text-emerald-100">Backing up now</div>
+                <div class="text-xs text-zinc-400 mt-0.5">
+                  {linkedHostname || 'The host'} is uploading to <span class="font-mono">{credential.name}</span> — this turns green as soon as the first data lands.
+                </div>
+              {:else if wizardStage === 'failed'}
+                <div class="text-sm font-medium text-rose-200">First backup failed{#if linkedHostname}&nbsp;on <span class="font-mono">{linkedHostname}</span>{/if}</div>
+                {#if linkedRepoStatus?.error}
+                  <div class="text-xs text-rose-300/90 mt-0.5 break-words font-mono">{linkedRepoStatus.error}</div>
+                {/if}
+                <div class="text-xs text-zinc-500 mt-1">
+                  The usual cause is a missing line from the snippet above — both <span class="font-mono">SM_BACKUP_REST_*</span> credential lines must be present. Fix the config, apply it, then run again:
+                </div>
+                {@render runNowBlock()}
+              {:else if wizardStage === 'scheduled'}
+                <div class="text-sm font-medium text-sky-200">{linkedHostname || 'Host'} is configured — first backup scheduled</div>
+                <div class="text-xs text-zinc-400 mt-0.5">
+                  {#if linkedRepoStatus?.next_run}
+                    Next run <span class="numeric text-zinc-200">{absTime(linkedRepoStatus.next_run)}</span> <span class="text-zinc-500">({timeUntil(linkedRepoStatus.next_run)})</span>.
+                  {:else}
+                    The host picked up the configuration and will back up at its scheduled time.
+                  {/if}
+                  Turns green when the first data arrives — or run one now on the host:
+                </div>
+                {@render runNowBlock()}
               {:else}
                 <div class="text-sm text-zinc-200">Waiting for the first upload from <span class="font-mono">{credential.name}</span>…</div>
                 <div class="text-xs text-zinc-500 mt-0.5">
-                  Turns green once the host runs its first backup. After that, its status appears under
                   {#if newHostId != null}
-                    <a href="/hosts/{newHostId}?tab=backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Hosts → {linkedHostname} → Backups</a>.
+                    A host applies the install or redeploy within a minute, and its schedule then shows up here.
                   {:else}
-                    <span class="text-zinc-300">Hosts → (host) → Backups</span>.
+                    A host applies the install or redeploy within a minute.
                   {/if}
+                  Backups run at the scheduled time (<span class="font-mono">02:30</span> in the snippets), so a freshly configured host stays in this state until its first run — or trigger one now on the host:
+                </div>
+                {@render runNowBlock()}
+                <div class="text-xs text-zinc-500 mt-2">
+                  Turns green once the first backup lands; after that, status lives under {@render hostBackupsLink()}.
                 </div>
               {/if}
             </div>
@@ -911,7 +1016,7 @@ restic -r ${publicRepoUrl} backup /etc`;
 
         <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
           <h2 class="text-sm font-medium text-zinc-100">This server isn't a backup destination yet</h2>
-          <p class="mt-1 text-xs text-zinc-500 max-w-3xl">
+          <p class="mt-1 text-xs text-zinc-500">
             That's optional — hosts can back up to any restic endpoint. Pick a path:
           </p>
           <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1166,7 +1271,7 @@ restic -r ${publicRepoUrl} backup /etc`;
             {/if}
           </div>
 
-          <p class="mt-3 max-w-prose text-[11px] text-zinc-600">
+          <p class="mt-3 text-[11px] text-zinc-600">
             Revoking a credential stops new uploads but never deletes stored backups — this endpoint is append-only, including for admins.
             Remove blobs directly on the storage backend if you need to reclaim space. Empty repositories that never received an upload can be deleted outright.
           </p>
@@ -1287,7 +1392,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                 </div>
               {/if}
             </div>
-            <p class="mt-3 max-w-prose text-[11px] text-zinc-600">
+            <p class="mt-3 text-[11px] text-zinc-600">
               A backup host brings its tunnel up only while a backup, check or restore is running, so an idle handshake age is normal. Handshakes and traffic are measured at whichever endpoint stores the host's backups — this server or a storage node; node-observed stats are relayed by the node's agent about once a minute. Traffic counters reset when the server or the storage node's agent restarts. Revoking a peer removes its tunnel access immediately; its repository credential is revoked separately above.
             </p>
           {/if}
@@ -1471,13 +1576,18 @@ restic -r ${publicRepoUrl} backup /etc`;
                           <td class="px-4 py-3 text-xs font-mono text-zinc-300">{n.endpoint}<span class="text-zinc-600">:{n.udp_port}/udp</span></td>
                           <td class="px-4 py-3">
                             <div class="flex items-center gap-2 text-xs">
-                              <span class="h-1.5 w-1.5 rounded-full {n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                              {#if n.enrolled}
+                              <span class="h-1.5 w-1.5 rounded-full {n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                              {#if n.node_state === 'error'}
+                                <span class="text-rose-300">endpoint failed</span>
+                              {:else if n.enrolled}
                                 <span class="text-emerald-300 font-mono">{n.tunnel_ip}</span>
                               {:else}
                                 <span class="text-amber-300">coming online…</span>
                               {/if}
                             </div>
+                            {#if n.node_state === 'error' && n.node_error}
+                              <div class="mt-1 max-w-[280px] truncate font-mono text-[11px] text-rose-300/80" title={n.node_error}>{n.node_error}</div>
+                            {/if}
                           </td>
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{n.target_count}</td>
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{bytes(n.used_bytes)}</td>
@@ -1529,20 +1639,25 @@ restic -r ${publicRepoUrl} backup /etc`;
                         {/if}
                       </div>
                       <div class="flex items-center gap-2 text-xs">
-                        <span class="h-1.5 w-1.5 rounded-full {n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                        {#if n.enrolled}
+                        <span class="h-1.5 w-1.5 rounded-full {n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                        {#if n.node_state === 'error'}
+                          <span class="text-rose-300">endpoint failed</span>
+                        {:else if n.enrolled}
                           <span class="font-mono text-emerald-300">{n.tunnel_ip}</span>
                         {:else}
                           <span class="text-amber-300">coming online…</span>
                         {/if}
                       </div>
+                      {#if n.node_state === 'error' && n.node_error}
+                        <div class="truncate font-mono text-[11px] text-rose-300/80" title={n.node_error}>{n.node_error}</div>
+                      {/if}
                       <div class="text-[11px] text-zinc-500 numeric">{n.target_count} {n.target_count === 1 ? 'repository' : 'repositories'} · {bytes(n.used_bytes)} stored</div>
                     </div>
                   {/each}
                 </div>
               {/if}
             </div>
-            <p class="mt-3 max-w-prose text-[11px] text-zinc-600">
+            <p class="mt-3 text-[11px] text-zinc-600">
               A node stores only ciphertext and never holds repo passwords, so it cannot read or prune what it stores. Demoting requires its repositories to be deleted or revoked first; stored data stays on the node's disk.
             </p>
           {/if}

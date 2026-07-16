@@ -3,6 +3,8 @@
 .gocache/
 bin/
 internal/server/agentdist/binaries/
+internal/server/web/dist/_app/
+internal/server/web/dist/favicon.svg
 *.exe
 web/node_modules
 web/.svelte-kit

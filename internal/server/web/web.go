@@ -3,10 +3,13 @@ package web
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -15,6 +18,8 @@ import (
 var distFS embed.FS
 
 var ErrUnbuiltDist = errors.New("web/dist looks unbuilt: run `npm --prefix web run build` before `go build ./cmd/server`")
+
+var indexAssetPattern = regexp.MustCompile(`(?:href|src)=["']/?(_app/immutable/[^"'?#]+)`)
 
 func Handler() (http.Handler, error) {
 	sub, err := fs.Sub(distFS, "dist")
@@ -50,6 +55,11 @@ func Handler() (http.Handler, error) {
 		}
 		if f, err := sub.Open(path); err == nil {
 			_ = f.Close()
+			if path == "_app/version.json" {
+				w.Header().Set("Cache-Control", "no-cache")
+			} else if strings.HasPrefix(path, "_app/immutable/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -58,22 +68,33 @@ func Handler() (http.Handler, error) {
 }
 
 func verifyBuilt(sub fs.FS) error {
+	index, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		return fmt.Errorf("%w: read index.html: %v", ErrUnbuiltDist, err)
+	}
+	refs := indexAssetPattern.FindAllSubmatch(index, -1)
 	hasJS := false
-	walkErr := fs.WalkDir(sub, "_app/immutable", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
+	for _, ref := range refs {
+		path := string(ref[1])
 		if strings.HasSuffix(path, ".js") {
 			hasJS = true
-			return fs.SkipAll
 		}
-		return nil
-	})
-	if walkErr != nil || !hasJS {
-		return ErrUnbuiltDist
+		if _, err := fs.Stat(sub, path); err != nil {
+			return fmt.Errorf("%w: index references missing asset %s", ErrUnbuiltDist, path)
+		}
+	}
+	if !hasJS {
+		return fmt.Errorf("%w: index has no JavaScript entry", ErrUnbuiltDist)
+	}
+	manifest, err := fs.ReadFile(sub, "_app/version.json")
+	if err != nil {
+		return fmt.Errorf("%w: read version manifest: %v", ErrUnbuiltDist, err)
+	}
+	var parsed struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(manifest, &parsed); err != nil || strings.TrimSpace(parsed.Version) == "" {
+		return fmt.Errorf("%w: invalid version manifest", ErrUnbuiltDist)
 	}
 	return nil
 }

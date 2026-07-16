@@ -38,8 +38,10 @@ type Manager struct {
 	logger    *slog.Logger
 	client    *http.Client
 
-	mu      sync.Mutex
-	runtime *nodeRuntime
+	mu             sync.Mutex
+	runtime        *nodeRuntime
+	roleActive     bool
+	lastStartError string
 }
 
 type nodeRuntime struct {
@@ -83,6 +85,7 @@ func (m *Manager) Run(ctx context.Context) {
 	defer reconcile.Stop()
 	defer usage.Stop()
 	m.reconcile(ctx)
+	m.reportUsage(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -104,11 +107,19 @@ func (m *Manager) reconcile(ctx context.Context) {
 		return
 	}
 	if !cfg.Enabled {
-		if m.stop() {
+		m.mu.Lock()
+		m.roleActive = false
+		m.lastStartError = ""
+		stopped := m.stopLocked()
+		m.mu.Unlock()
+		if stopped {
 			m.logger.Info("backup node role disabled; storage endpoint stopped")
 		}
 		return
 	}
+	m.mu.Lock()
+	m.roleActive = true
+	m.mu.Unlock()
 
 	key, err := m.ensureKey()
 	if err != nil {
@@ -141,13 +152,16 @@ func (m *Manager) reconcile(ctx context.Context) {
 		if len(added) > 0 {
 			store, storeErr := restserver.NewDiskStore(spec.storeDir)
 			if storeErr != nil {
+				m.lastStartError = storeErr.Error()
 				m.logger.Error("backup node usage measurement failed", "err", storeErr)
 				return
 			}
 			if measureErr := measureTargetUsage(ctx, store, m.runtime.registry, added); measureErr != nil {
+				m.lastStartError = measureErr.Error()
 				m.logger.Error("backup node usage measurement failed", "err", measureErr)
 				return
 			}
+			m.lastStartError = ""
 		}
 		m.reconcilePeersLocked(cfg.Peers)
 		return
@@ -156,10 +170,12 @@ func (m *Manager) reconcile(ctx context.Context) {
 	m.stopLocked()
 	rt, err := m.startRuntime(ctx, key, spec, cfg)
 	if err != nil {
+		m.lastStartError = err.Error()
 		m.logger.Error("backup node start failed", "err", err)
 		return
 	}
 	m.runtime = rt
+	m.lastStartError = ""
 	m.logger.Info("backup node storage endpoint running",
 		"udp_port", spec.udpPort,
 		"tunnel_ip", spec.tunnelIP,
@@ -387,6 +403,9 @@ func (m *Manager) enroll(ctx context.Context, pub wgtunnel.Key) (wire.TunnelEnro
 func (m *Manager) reportUsage(ctx context.Context) {
 	m.mu.Lock()
 	rt := m.runtime
+	roleActive := m.roleActive
+	lastStartError := m.lastStartError
+	running := rt != nil
 	var entries []wire.NodeUsageEntry
 	var peers []wire.NodePeerStat
 	if rt != nil {
@@ -399,10 +418,15 @@ func (m *Manager) reportUsage(ctx context.Context) {
 		}
 	}
 	m.mu.Unlock()
-	if len(entries) == 0 && len(peers) == 0 {
+	if !roleActive && len(entries) == 0 && len(peers) == 0 {
 		return
 	}
-	if err := m.doJSON(ctx, http.MethodPost, "/api/v1/agent/backup-node/usage", wire.BackupNodeUsage{Targets: entries, Peers: peers}, nil); err != nil {
+	if err := m.doJSON(ctx, http.MethodPost, "/api/v1/agent/backup-node/usage", wire.BackupNodeUsage{
+		Targets: entries,
+		Peers:   peers,
+		Running: &running,
+		Error:   lastStartError,
+	}, nil); err != nil {
 		m.logger.Debug("backup node usage report failed", "err", err)
 	}
 }
@@ -479,6 +503,9 @@ func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) []wire.Nod
 			existing.hash = hash
 			existing.quota = t.QuotaBytes
 			existing.revoked = t.Revoked
+			if !existing.ready {
+				added = append(added, t)
+			}
 			continue
 		}
 		id := r.nextID

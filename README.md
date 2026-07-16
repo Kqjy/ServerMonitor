@@ -199,6 +199,7 @@ $env:DATABASE_URL = "postgres://servermonitor:dev@localhost:5432/servermonitor?s
 $env:ADMIN_TOKEN  = "dev-admin-token"
 
 cd web ; npm install ; npm run build ; cd ..
+go run ./scripts/buildagents
 go build -o bin/server.exe ./cmd/server
 go build -o bin/agent.exe  ./cmd/agent
 

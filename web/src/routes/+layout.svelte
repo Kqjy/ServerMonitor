@@ -1,7 +1,8 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/stores';
-  import { goto } from '$app/navigation';
+  import { beforeNavigate, goto } from '$app/navigation';
+  import { updated } from '$app/state';
   import { auth } from '$lib/auth.svelte';
 
   let { children } = $props();
@@ -9,6 +10,12 @@
   const isPublic = $derived(
     $page.url.pathname === '/login' || $page.url.pathname === '/setup'
   );
+
+  beforeNavigate(({ willUnload, to }) => {
+    if (updated.current && !willUnload && to?.url) {
+      location.href = to.url.href;
+    }
+  });
 
   $effect(() => {
     if (auth.status === 'needs-setup' && $page.url.pathname !== '/setup') {
@@ -20,6 +27,13 @@
     }
   });
 </script>
+
+{#if updated.current}
+  <div class="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-amber-800/60 bg-amber-950 px-4 py-2 text-xs text-amber-100" role="status">
+    <span>A newer ServerMonitor version is ready.</span>
+    <button type="button" onclick={() => location.reload()} class="rounded border border-amber-600/70 px-2 py-1 font-medium hover:bg-amber-900">Reload now</button>
+  </div>
+{/if}
 
 {#if isPublic}
   {@render children?.()}

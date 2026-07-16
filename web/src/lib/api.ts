@@ -178,6 +178,9 @@ export interface BackupNode {
   store_dir?: string;
   tunnel_ip?: string;
   enrolled: boolean;
+  node_state?: string;
+  node_error?: string;
+  reported_at?: string;
   target_count: number;
   used_bytes: number;
   created_at: string;

@@ -5,6 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"sync"
@@ -124,5 +128,89 @@ func TestPeerStatsPayload(t *testing.T) {
 	}
 	if empty := peerStatsPayload(stats[1:], known, self); len(empty) != 0 {
 		t.Fatalf("empty payload = %+v", empty)
+	}
+}
+
+func TestRunReportsStartFailureAndRecovery(t *testing.T) {
+	udp, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("bind collision socket: %v", err)
+	}
+	port := udp.LocalAddr().(*net.UDPAddr).Port
+	storeDir := t.TempDir()
+	payloads := make(chan wire.BackupNodeUsage, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agent/backup-node":
+			_ = json.NewEncoder(w).Encode(wire.BackupNodeConfig{
+				Enabled:  true,
+				UDPPort:  port,
+				StoreDir: storeDir,
+			})
+		case "/api/v1/agent/tunnel":
+			_ = json.NewEncoder(w).Encode(wire.TunnelEnrollResponse{TunnelIP: "10.83.0.2"})
+		case "/api/v1/agent/backup-node/usage":
+			var payload wire.BackupNodeUsage
+			if decodeErr := json.NewDecoder(r.Body).Decode(&payload); decodeErr != nil {
+				http.Error(w, decodeErr.Error(), http.StatusBadRequest)
+				return
+			}
+			payloads <- payload
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	manager := New(server.URL, "token", false, t.TempDir(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+
+	var failed wire.BackupNodeUsage
+	select {
+	case failed = <-payloads:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("timed out waiting for failed health report")
+	}
+	if failed.Running == nil || *failed.Running {
+		t.Fatalf("failed running = %v, want false", failed.Running)
+	}
+	if failed.Error == "" {
+		t.Fatal("failed error is empty")
+	}
+
+	if err := udp.Close(); err != nil {
+		t.Fatalf("release collision socket: %v", err)
+	}
+	manager.reconcile(ctx)
+	manager.reportUsage(ctx)
+
+	var recovered wire.BackupNodeUsage
+	select {
+	case recovered = <-payloads:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("timed out waiting for recovered health report")
+	}
+	if recovered.Running == nil || !*recovered.Running {
+		t.Fatalf("recovered running = %v, want true", recovered.Running)
+	}
+	if recovered.Error != "" {
+		t.Fatalf("recovered error = %q, want empty", recovered.Error)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manager did not stop")
 	}
 }

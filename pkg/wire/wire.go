@@ -140,6 +140,8 @@ type NodePeerStat struct {
 type BackupNodeUsage struct {
 	Targets []NodeUsageEntry `json:"targets"`
 	Peers   []NodePeerStat   `json:"peers,omitempty"`
+	Running *bool            `json:"running,omitempty"`
+	Error   string           `json:"error,omitempty"`
 }
 
 type CollectorStatus struct {

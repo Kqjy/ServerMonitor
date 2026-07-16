@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,35 @@ type backupTunnelResponse struct {
 }
 
 const tunnelHandshakeConnectedWindow = 3 * time.Minute
+const nodeHealthFreshWindow = 5 * time.Minute
+
+type nodeHealth struct {
+	Running bool
+	Error   string
+	At      time.Time
+}
+
+type NodeHealthCache struct {
+	mu      sync.Mutex
+	entries map[int64]nodeHealth
+}
+
+func NewNodeHealthCache() *NodeHealthCache {
+	return &NodeHealthCache{entries: map[int64]nodeHealth{}}
+}
+
+func (c *NodeHealthCache) Store(hostID int64, running bool, err string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[hostID] = nodeHealth{Running: running, Error: err, At: time.Now()}
+}
+
+func (c *NodeHealthCache) Get(hostID int64) (nodeHealth, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	health, ok := c.entries[hostID]
+	return health, ok
+}
 
 type nodePeerStat struct {
 	LastHandshake time.Time
@@ -345,7 +375,12 @@ func agentBackupNodeConfigHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 	}
 }
 
-func agentBackupNodeUsageHandler(nodes *storage.BackupNodes, peerStats *NodePeerStatsCache) http.HandlerFunc {
+type backupNodeUsageStore interface {
+	Get(context.Context, int64) (storage.BackupNode, error)
+	SetTargetUsage(context.Context, int64, string, int64) error
+}
+
+func agentBackupNodeUsageHandler(nodes backupNodeUsageStore, peerStats *NodePeerStatsCache, health *NodeHealthCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := hostIDFromContext(r.Context())
 		if !ok {
@@ -361,6 +396,9 @@ func agentBackupNodeUsageHandler(nodes *storage.BackupNodes, peerStats *NodePeer
 		if err != nil {
 			writeError(w, http.StatusForbidden, "host is not a backup node")
 			return
+		}
+		if req.Running != nil {
+			health.Store(hostID, *req.Running, req.Error)
 		}
 		for _, t := range req.Targets {
 			if !validBackupTargetName(t.Name) {
@@ -379,19 +417,26 @@ func agentBackupNodeUsageHandler(nodes *storage.BackupNodes, peerStats *NodePeer
 }
 
 type backupNodeView struct {
-	HostID      int64     `json:"host_id"`
-	Hostname    string    `json:"hostname"`
-	UDPPort     int       `json:"udp_port"`
-	Endpoint    string    `json:"endpoint"`
-	StoreDir    string    `json:"store_dir,omitempty"`
-	TunnelIP    string    `json:"tunnel_ip,omitempty"`
-	Enrolled    bool      `json:"enrolled"`
-	TargetCount int       `json:"target_count"`
-	UsedBytes   int64     `json:"used_bytes"`
-	CreatedAt   time.Time `json:"created_at"`
+	HostID      int64      `json:"host_id"`
+	Hostname    string     `json:"hostname"`
+	UDPPort     int        `json:"udp_port"`
+	Endpoint    string     `json:"endpoint"`
+	StoreDir    string     `json:"store_dir,omitempty"`
+	TunnelIP    string     `json:"tunnel_ip,omitempty"`
+	Enrolled    bool       `json:"enrolled"`
+	TargetCount int        `json:"target_count"`
+	UsedBytes   int64      `json:"used_bytes"`
+	CreatedAt   time.Time  `json:"created_at"`
+	NodeState   string     `json:"node_state,omitempty"`
+	NodeError   string     `json:"node_error,omitempty"`
+	ReportedAt  *time.Time `json:"reported_at,omitempty"`
 }
 
-func listBackupNodesHandler(nodes *storage.BackupNodes) http.HandlerFunc {
+type backupNodeListStore interface {
+	List(context.Context) ([]storage.BackupNode, error)
+}
+
+func listBackupNodesHandler(nodes backupNodeListStore, health *NodeHealthCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rows, err := nodes.List(r.Context())
 		if err != nil {
@@ -399,6 +444,7 @@ func listBackupNodesHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 			return
 		}
 		out := []backupNodeView{}
+		now := time.Now()
 		for _, node := range rows {
 			view := backupNodeView{
 				HostID:      node.HostID,
@@ -413,6 +459,15 @@ func listBackupNodesHandler(nodes *storage.BackupNodes) http.HandlerFunc {
 			}
 			if node.TunnelIP != nil {
 				view.TunnelIP = node.TunnelIP.String()
+			}
+			if status, ok := health.Get(node.HostID); ok && !status.At.Before(now.Add(-nodeHealthFreshWindow)) {
+				view.NodeState = "error"
+				if status.Running && status.Error == "" {
+					view.NodeState = "running"
+				}
+				view.NodeError = status.Error
+				reportedAt := status.At
+				view.ReportedAt = &reportedAt
 			}
 			out = append(out, view)
 		}

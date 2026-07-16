@@ -191,7 +191,7 @@ func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, hav
 			fmt.Fprintf(&b, "url = %q\n", url)
 		}
 		fmt.Fprintf(&b, "password_file = %q\n", keyPath)
-		if tunnelName == "" && haveCreds && isCredentialRepo(url) {
+		if haveCreds && (tunnelName != "" || isCredentialRepo(url)) {
 			fmt.Fprintf(&b, "env_file = %q\n", credsPath)
 		}
 		if strings.HasPrefix(url, "s3:") {

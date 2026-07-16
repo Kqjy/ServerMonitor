@@ -99,8 +99,11 @@ func TestRenderBackupTOMLTunnelRepositories(t *testing.T) {
 					t.Fatalf("rendered toml missing %q\n%s", want, rendered)
 				}
 			}
-			if strings.Contains(rendered, "url =") || strings.Contains(rendered, "env_file =") {
-				t.Fatalf("tunnel repository rendered url or env_file\n%s", rendered)
+			if strings.Contains(rendered, "url =") {
+				t.Fatalf("tunnel repository rendered url\n%s", rendered)
+			}
+			if !strings.Contains(rendered, "env_file = ") {
+				t.Fatalf("tunnel repository missing credentials file\n%s", rendered)
 			}
 		})
 	}
@@ -139,8 +142,8 @@ func TestRenderBackupTOMLMixedRemoteAndTunnelRepositories(t *testing.T) {
 			t.Fatalf("rendered toml missing %q\n%s", want, rendered)
 		}
 	}
-	if strings.Count(rendered, "env_file =") != 1 {
-		t.Fatalf("credentials should apply only to the rest repository\n%s", rendered)
+	if strings.Count(rendered, "env_file =") != 2 {
+		t.Fatalf("credentials should apply to both rest and tunnel repositories\n%s", rendered)
 	}
 }
 
