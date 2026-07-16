@@ -854,13 +854,83 @@ func TestRunLockReleaseKeepsReplacementOwner(t *testing.T) {
 	}
 }
 
-func TestSnapshotsParseCountInventoryAndIDTruncation(t *testing.T) {
+func TestParseSnapshotsRestic019Summary(t *testing.T) {
+	data := []byte(`[
+		{
+			"id": "b83f11b518b7937c941b1daabb9e67c251bb844c3c1d5627ff9138d7cf4a95df",
+			"time": "2026-07-15T03:14:15.9265357Z",
+			"paths": ["/etc", "/var/lib/servermonitor"],
+			"summary": {
+				"backup_start": "2026-07-15T03:14:15.9265357Z",
+				"backup_end": "2026-07-15T03:14:23.1265357Z",
+				"data_added": 1234567,
+				"total_files_processed": 4321,
+				"total_bytes_processed": 987654321
+			}
+		},
+		{
+			"id": "4b52136d96a19741556ee9e0a2648b01ab1b0858aa90291b6a16a0297aa19520",
+			"time": "2022-01-02T01:02:03Z",
+			"paths": ["/etc"],
+			"summary": {
+				"data_added": 7654321,
+				"total_files_processed": 1234,
+				"total_bytes_processed": 123456789
+			}
+		},
+		{
+			"id": "ddbfadf00d8ad68f04a47cf95d9e46e0d74fb1c93b15d9ef37b15fe9b977a12e",
+			"time": "2021-01-02T01:02:03Z",
+			"paths": ["/srv"]
+		}
+	]`)
+	snapshots, err := ParseSnapshots(data)
+	if err != nil {
+		t.Fatalf("ParseSnapshots: %v", err)
+	}
+	if len(snapshots) != 3 {
+		t.Fatalf("snapshot count = %d, want 3", len(snapshots))
+	}
+	withSummary := snapshots[0]
+	if withSummary.ID != "b83f11b5" {
+		t.Fatalf("truncated id = %q", withSummary.ID)
+	}
+	if withSummary.SizeBytes == nil || *withSummary.SizeBytes != 987654321 {
+		t.Fatalf("size bytes = %v", withSummary.SizeBytes)
+	}
+	if withSummary.AddedBytes == nil || *withSummary.AddedBytes != 1234567 {
+		t.Fatalf("added bytes = %v", withSummary.AddedBytes)
+	}
+	if withSummary.FileCount == nil || *withSummary.FileCount != 4321 {
+		t.Fatalf("file count = %v", withSummary.FileCount)
+	}
+	if withSummary.DurationS == nil || *withSummary.DurationS != 7.2 {
+		t.Fatalf("duration seconds = %v", withSummary.DurationS)
+	}
+	withoutTimes := snapshots[1]
+	if withoutTimes.SizeBytes == nil || *withoutTimes.SizeBytes != 123456789 || withoutTimes.AddedBytes == nil || *withoutTimes.AddedBytes != 7654321 || withoutTimes.FileCount == nil || *withoutTimes.FileCount != 1234 || withoutTimes.DurationS != nil {
+		t.Fatalf("snapshot without backup times = size %v, added %v, files %v, duration %v", withoutTimes.SizeBytes, withoutTimes.AddedBytes, withoutTimes.FileCount, withoutTimes.DurationS)
+	}
+	withoutSummary := snapshots[2]
+	if withoutSummary.SizeBytes != nil || withoutSummary.AddedBytes != nil || withoutSummary.FileCount != nil || withoutSummary.DurationS != nil {
+		t.Fatalf("legacy snapshot summary = size %v, added %v, files %v, duration %v", withoutSummary.SizeBytes, withoutSummary.AddedBytes, withoutSummary.FileCount, withoutSummary.DurationS)
+	}
+}
+
+func TestSnapshotInventoryPreservesSummaryAndClamps(t *testing.T) {
 	var raw []map[string]any
 	for i := 0; i < 55; i++ {
 		raw = append(raw, map[string]any{
 			"id":    fmt.Sprintf("%08dabcdef", i),
 			"time":  "2026-07-03T02:00:00Z",
 			"paths": []string{"/etc"},
+			"summary": map[string]any{
+				"total_bytes_processed": int64(1000 + i),
+				"data_added":            int64(2000 + i),
+				"total_files_processed": int64(3000 + i),
+				"backup_start":          "2026-07-03T02:00:00Z",
+				"backup_end":            "2026-07-03T02:00:09Z",
+			},
 		})
 	}
 	data, err := json.Marshal(raw)
@@ -883,6 +953,18 @@ func TestSnapshotsParseCountInventoryAndIDTruncation(t *testing.T) {
 	}
 	if inventory[0].ID != "00000005" || inventory[49].ID != "00000054" {
 		t.Fatalf("inventory range = %q..%q", inventory[0].ID, inventory[49].ID)
+	}
+	if inventory[0].SizeBytes == nil || *inventory[0].SizeBytes != 1005 {
+		t.Fatalf("inventory size bytes = %v", inventory[0].SizeBytes)
+	}
+	if inventory[0].AddedBytes == nil || *inventory[0].AddedBytes != 2005 {
+		t.Fatalf("inventory added bytes = %v", inventory[0].AddedBytes)
+	}
+	if inventory[0].FileCount == nil || *inventory[0].FileCount != 3005 {
+		t.Fatalf("inventory file count = %v", inventory[0].FileCount)
+	}
+	if inventory[0].DurationS == nil || *inventory[0].DurationS != 9 {
+		t.Fatalf("inventory duration seconds = %v", inventory[0].DurationS)
 	}
 }
 

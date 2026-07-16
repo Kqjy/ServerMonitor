@@ -158,7 +158,7 @@ A host running only the [Dockerized agent](AGENT-DOCKER.md) can back **itself** 
 
 - **No systemd.** The schedule (daily backup + weekly check) runs inside the agent and is caught up on boot; there is no `sm-backup` timer/unit.
 - **Chrooted backups.** The backup runs restic chrooted into `/host`, so snapshots record host-native paths and interoperate with host-installed snapshots — provided the recipe keeps `uts: host`, `cap_add: SYS_CHROOT`, and the state-volume aliases at `/tmp` and `/host/tmp`. The alias hides host `/tmp`, which therefore is not a supported container-managed backup path.
-- **Remote repos only** (`rest:`/`s3:`/`b2:`/`sftp:`) — `tunnel:` is host-install only for now.
+- **Supported repositories:** `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, and `tunnel:`. `sftp:` is not supported because the agent image does not include SSH.
 - **`prune_mode` defaults to `external`** (a container should not hold deletion authority over history).
 - **Restore is staging-only**; in-place is refused (copy the staged restore out with `docker cp`).
 - **Recovery kit on demand:** `docker compose … exec sm-agent /usr/local/bin/sm-agent backup recovery-kit`. The key lives only in the `sm-agent-state` volume — `docker compose down -v` destroys it, so keep the kit offline.

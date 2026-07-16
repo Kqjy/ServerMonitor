@@ -48,9 +48,13 @@ type Port struct {
 }
 
 type BackupSnapshot struct {
-	ID    string    `json:"id"`
-	Time  time.Time `json:"time,omitempty"`
-	Paths []string  `json:"paths,omitempty"`
+	ID         string    `json:"id"`
+	Time       time.Time `json:"time,omitempty"`
+	Paths      []string  `json:"paths,omitempty"`
+	SizeBytes  *int64    `json:"size_bytes,omitempty"`
+	AddedBytes *int64    `json:"added_bytes,omitempty"`
+	FileCount  *int64    `json:"file_count,omitempty"`
+	DurationS  *float64  `json:"duration_s,omitempty"`
 }
 
 type BackupRepoStatus struct {

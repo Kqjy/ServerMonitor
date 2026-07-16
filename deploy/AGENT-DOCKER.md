@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.7 .
-docker push registry.example.com/servermonitor-agent:0.3.7
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.8 .
+docker push registry.example.com/servermonitor-agent:0.3.8
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.7
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.8
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -133,7 +133,9 @@ SM_BACKUP_REST_PASSWORD=<the minted credential>
 SM_BACKUP_TIME=02:30
 ```
 
-Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `TZ` (so `SM_BACKUP_TIME` is interpreted in your zone). Repos must be **remote** (`rest:`/`s3:`/`b2:`/`sftp:`); `tunnel:` repositories are host-install only for now.
+Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
+
+**Tunnel repositories.** Set `SM_BACKUP_REPOS=tunnel:NAME` for storage on the monitoring server or `SM_BACKUP_REPOS=tunnel:NODE/NAME` for a promoted storage node. Enrollment is automatic at boot over the agent-token channel and needs only outbound UDP to the server or node WireGuard endpoint; WireGuard runs in userspace, so it needs no new capabilities or kernel module. The create-once `tunnel.key` lives in the state volume. `docker compose down -v` destroys it, which does not affect backup data because a fresh key enrolls again, but the `backup.key` recovery warning below still applies. During a run, restic uses a transient loopback proxy; with `network_mode: host` this is the host loopback, the same exposure class as a host install, and it exists only for the duration of the run.
 
 **What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume mounted at `/var/lib/servermonitor`, `/tmp`, and `/host/tmp`.
 

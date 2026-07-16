@@ -72,6 +72,43 @@ func writeStatusAtomic(path string, status StatusFile) error {
 	return writeJSONAtomic(path, status)
 }
 
+func RecordTunnelEnrollmentFailure(configPath string, enrollmentErr error, now time.Time) error {
+	raw, err := readRawConfig(configPath)
+	if err != nil {
+		return err
+	}
+	statusPath := filepath.Clean(raw.StatusPath)
+	if raw.StatusPath == "" {
+		statusPath = DefaultStatusPath()
+	}
+	existing, err := readStatusFile(statusPath)
+	if err != nil {
+		return fmt.Errorf("read backup status: %w", err)
+	}
+	finished := utcSecond(now)
+	updates := []RepoStatus{}
+	for _, repo := range raw.Repos {
+		if repo.TunnelName == "" {
+			continue
+		}
+		updates = append(updates, RepoStatus{
+			Name:         repo.Name,
+			Engine:       "restic",
+			LastFinished: &finished,
+			Success:      false,
+			Error:        fmt.Sprintf("tunnel enrollment failed: %v", enrollmentErr),
+			Tunnel:       true,
+		})
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	if err := writeStatusAtomic(statusPath, mergeStatus(existing, updates)); err != nil {
+		return fmt.Errorf("write backup status: %w", err)
+	}
+	return nil
+}
+
 func progressPath(statusPath string) string {
 	return filepath.Join(filepath.Dir(statusPath), "backup-progress.json")
 }

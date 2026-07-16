@@ -39,12 +39,45 @@ type EnrollResult struct {
 	Warning         string
 }
 
+func EnsureTunnelEnrolled(ctx context.Context, configPath string, opts EnrollOptions) error {
+	if strings.TrimSpace(configPath) == "" {
+		configPath = DefaultConfigPath()
+	}
+	needServer, nodeHosts, err := tunnelRepoDemand(configPath)
+	if err != nil {
+		return err
+	}
+	if !needServer && len(nodeHosts) == 0 {
+		return nil
+	}
+	raw, err := readRawConfig(configPath)
+	if err != nil {
+		return err
+	}
+	settings := trimmedTunnel(raw.Tunnel)
+	if settings != nil && settings.validate(needServer) == nil {
+		complete := true
+		for _, host := range nodeHosts {
+			if settings.Node(host) == nil {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return nil
+		}
+	}
+	opts.ConfigPath = configPath
+	_, err = TunnelEnroll(ctx, opts)
+	return err
+}
+
 func TunnelEnroll(ctx context.Context, opts EnrollOptions) (EnrollResult, error) {
 	if strings.TrimSpace(opts.ConfigPath) == "" {
 		opts.ConfigPath = DefaultConfigPath()
 	}
 	if strings.TrimSpace(opts.ServerURL) == "" || strings.TrimSpace(opts.Token) == "" {
-		return EnrollResult{}, fmt.Errorf("server url and agent token are required (is agent.toml present?)")
+		return EnrollResult{}, fmt.Errorf("server url and agent token are required; set SM_SERVER_URL and SM_TOKEN or provide agent.toml")
 	}
 	keyPath := strings.TrimSpace(opts.KeyPath)
 	if keyPath == "" {
@@ -106,13 +139,9 @@ func TunnelEnroll(ctx context.Context, opts EnrollOptions) (EnrollResult, error)
 }
 
 func tunnelRepoDemand(configPath string) (bool, []string, error) {
-	data, err := os.ReadFile(configPath)
+	raw, err := readRawConfig(configPath)
 	if err != nil {
-		return false, nil, fmt.Errorf("read backup config %s: %w", configPath, err)
-	}
-	var raw rawConfig
-	if err := toml.Unmarshal(data, &raw); err != nil {
-		return false, nil, fmt.Errorf("parse backup config %s: %w", configPath, err)
+		return false, nil, err
 	}
 	needServer := false
 	seen := map[string]bool{}
@@ -132,6 +161,18 @@ func tunnelRepoDemand(configPath string) (bool, []string, error) {
 		}
 	}
 	return needServer, hosts, nil
+}
+
+func readRawConfig(configPath string) (rawConfig, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return rawConfig{}, fmt.Errorf("read backup config %s: %w", configPath, err)
+	}
+	var raw rawConfig
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return rawConfig{}, fmt.Errorf("parse backup config %s: %w", configPath, err)
+	}
+	return raw, nil
 }
 
 func resolveNodes(ctx context.Context, opts EnrollOptions, hosts []string) ([]TunnelNodeSettings, error) {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,7 @@ import (
 	gopsnet "github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/process"
 
+	agentbackup "servermonitor/internal/agent/backup"
 	"servermonitor/pkg/metrics"
 	"servermonitor/pkg/wire"
 )
@@ -127,7 +130,7 @@ func (c *connCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	c.mu.Unlock()
 
 	if logHint {
-		slog.Warn("listening-port owner attribution failed", "collector", "connections", "detail", msg)
+		logPortOwnerHint(msg)
 	}
 
 	return []wire.Point{
@@ -192,4 +195,39 @@ func portOwnerHint(resolved, total int) string {
 		return base + " — agent likely lacks CAP_SYS_PTRACE or is AppArmor/LSM-confined"
 	}
 	return base + " — agent lacks privilege to read listening-socket owners"
+}
+
+func logPortOwnerHint(detail string) {
+	if runtime.GOOS != "linux" {
+		slog.Warn("listening-port owner attribution failed", "collector", "connections", "detail", detail)
+		return
+	}
+	status, err := os.ReadFile("/proc/self/status")
+	dacReadSearch, sysPtrace, decoded := decodePortOwnerCapabilities(string(status))
+	if err == nil && decoded && !dacReadSearch && !sysPtrace {
+		slog.Info("port-owner attribution is off (opt-in: --enable-port-owners / SM_ENABLE_PORT_OWNERS)", "collector", "connections", "detail", detail)
+		return
+	}
+	if err == nil && decoded {
+		detail += " — port-owner capabilities are present; check AppArmor/LSM confinement"
+	}
+	if agentbackup.IsContainerized() {
+		detail += " — see deploy/AGENT-DOCKER.md § Port / process owner attribution"
+	}
+	slog.Warn("listening-port owner attribution failed", "collector", "connections", "detail", detail)
+}
+
+func decodePortOwnerCapabilities(status string) (bool, bool, bool) {
+	for _, line := range strings.Split(status, "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found || strings.TrimSpace(key) != "CapEff" {
+			continue
+		}
+		bits, err := strconv.ParseUint(strings.TrimSpace(value), 16, 64)
+		if err != nil {
+			return false, false, false
+		}
+		return bits&(1<<2) != 0, bits&(1<<19) != 0, true
+	}
+	return false, false, false
 }

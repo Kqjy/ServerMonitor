@@ -216,6 +216,14 @@ func DefaultStatusPath() string {
 }
 
 func Load(path string) (Config, error) {
+	return loadConfig(path, false)
+}
+
+func LoadForScheduling(path string) (Config, error) {
+	return loadConfig(path, true)
+}
+
+func loadConfig(path string, allowUnenrolledTunnel bool) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		path = DefaultConfigPath()
 	}
@@ -245,7 +253,7 @@ func Load(path string) (Config, error) {
 	if cfg.PruneMode == "" {
 		cfg.PruneMode = "host"
 	}
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(allowUnenrolledTunnel); err != nil {
 		return Config{}, fmt.Errorf("validate backup config %s: %w", path, err)
 	}
 	return cfg, nil
@@ -267,6 +275,10 @@ func parseSchedule(raw *rawSchedule) *ScheduleSettings {
 }
 
 func (c Config) Validate() error {
+	return c.validate(false)
+}
+
+func (c Config) validate(allowUnenrolledTunnel bool) error {
 	if strings.TrimSpace(c.StatusPath) == "" {
 		return fmt.Errorf("status_path is required")
 	}
@@ -304,7 +316,7 @@ func (c Config) Validate() error {
 		if hasURL && strings.HasPrefix(strings.ToLower(strings.TrimSpace(repo.URL)), "tunnel:") {
 			return fmt.Errorf("repo[%s]: url uses the tunnel: scheme, which is not a restic backend; tunnel repositories must use tunnel_name (and tunnel_node for a node), then run: sm-agent backup tunnel-enroll (or reinstall with a current installer)", repo.Name)
 		}
-		if hasTunnel && c.Tunnel == nil {
+		if hasTunnel && c.Tunnel == nil && !allowUnenrolledTunnel {
 			return fmt.Errorf("repo[%s].tunnel_name requires a [tunnel] section (run: sm-agent backup tunnel-enroll)", repo.Name)
 		}
 		if strings.TrimSpace(repo.PasswordFile) == "" {
@@ -322,7 +334,7 @@ func (c Config) Validate() error {
 		if repo.TunnelNode != "" && !hasTunnel {
 			return fmt.Errorf("repo[%s].tunnel_node requires tunnel_name", repo.Name)
 		}
-		if repo.TunnelNode != "" && c.Tunnel != nil && c.Tunnel.Node(repo.TunnelNode) == nil {
+		if repo.TunnelNode != "" && c.Tunnel != nil && c.Tunnel.Node(repo.TunnelNode) == nil && !allowUnenrolledTunnel {
 			return fmt.Errorf("repo[%s].tunnel_node %q has no [[tunnel.node]] entry (re-run: sm-agent backup tunnel-enroll)", repo.Name, repo.TunnelNode)
 		}
 		if err := validateRetention(effectiveRetention(c.Retention, repo.Retention)); err != nil {
@@ -333,7 +345,7 @@ func (c Config) Validate() error {
 		}
 		seen[repo.Name] = true
 	}
-	if c.Tunnel != nil {
+	if c.Tunnel != nil && !allowUnenrolledTunnel {
 		if err := c.Tunnel.validate(c.needsServerTunnel()); err != nil {
 			return err
 		}

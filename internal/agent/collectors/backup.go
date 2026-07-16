@@ -107,14 +107,29 @@ func parseAgentVersion(raw string) (string, bool) {
 
 func parseSystemdNextElapse(raw string) *time.Time {
 	s := strings.TrimSpace(raw)
-	if s == "" || s == "0" || s == "infinity" {
+	if s == "" || s == "n/a" || s == "0" || s == "infinity" {
 		return nil
+	}
+	if strings.HasPrefix(s, "@") {
+		v, err := strconv.ParseInt(strings.TrimPrefix(s, "@"), 10, 64)
+		if err != nil || v <= 0 {
+			return nil
+		}
+		t := time.Unix(v, 0).UTC()
+		return &t
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v <= 0 {
+	if err == nil {
+		if v <= 0 {
+			return nil
+		}
+		t := time.UnixMicro(v).UTC()
+		return &t
+	}
+	t, err := time.ParseInLocation("Mon 2006-01-02 15:04:05 MST", s, time.Local)
+	if err != nil {
 		return nil
 	}
-	t := time.UnixMicro(v).UTC()
 	return &t
 }
 
@@ -136,7 +151,10 @@ func nextBackupRun(ctx context.Context) *time.Time {
 	defer cancel()
 	switch runtime.GOOS {
 	case "linux":
-		out, err := run(cmdCtx, "systemctl", "show", "sm-backup.timer", "--property=NextElapseUSecRealtime", "--value")
+		out, err := run(cmdCtx, "systemctl", "show", "sm-backup.timer", "--property=NextElapseUSecRealtime", "--value", "--timestamp=unix")
+		if err != nil {
+			out, err = run(cmdCtx, "systemctl", "show", "sm-backup.timer", "--property=NextElapseUSecRealtime", "--value")
+		}
 		if err != nil {
 			return nil
 		}
@@ -242,8 +260,12 @@ func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	}
 	info, status, ok := c.readBackupStatus()
 	if !ok {
-		if len(c.scheduledReposCopy()) > 0 {
+		if c.Status().State != backupStateError && len(c.scheduledReposCopy()) > 0 {
 			c.setState(backupStateScheduled, "")
+		}
+		state := c.Status().State
+		if staleAgent && (state == backupStateNotConfigured || state == backupStateScheduled) {
+			c.setState(backupStateStaleAgent, staleAgentMsg)
 		}
 		return out, nil
 	}

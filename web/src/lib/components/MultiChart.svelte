@@ -1,3 +1,16 @@
+<script module lang="ts">
+  export const chartPalette = [
+    'oklch(0.78 0.16 162)',
+    'oklch(0.7 0.18 240)',
+    'oklch(0.83 0.18 85)',
+    'oklch(0.7 0.21 22)',
+    'oklch(0.75 0.18 305)',
+    'oklch(0.78 0.16 195)',
+    'oklch(0.75 0.18 50)',
+    'oklch(0.77 0.18 130)'
+  ];
+</script>
+
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import uPlot from 'uplot';
@@ -49,17 +62,6 @@
     onZoom?: (fromMs: number, toMs: number) => void;
     onResetZoom?: () => void;
   } = $props();
-
-  const palette = [
-    'oklch(0.78 0.16 162)',
-    'oklch(0.7 0.18 240)',
-    'oklch(0.83 0.18 85)',
-    'oklch(0.7 0.21 22)',
-    'oklch(0.75 0.18 305)',
-    'oklch(0.78 0.16 195)',
-    'oklch(0.75 0.18 50)',
-    'oklch(0.77 0.18 130)'
-  ];
 
   let host: HTMLDivElement;
   let plot: uPlot | null = null;
@@ -193,7 +195,7 @@
       series: [
         { label: 'time' },
         ...series.map((s, i) => {
-          const c = s.color ?? palette[i % palette.length];
+          const c = s.color ?? chartPalette[i % chartPalette.length];
           return {
             label: s.label,
             show: !hidden.has(s.label),
@@ -339,7 +341,7 @@
           aria-pressed={!off}
           title={off ? 'Show series' : 'Hide series'}
           class="inline-flex items-center gap-1.5 transition-opacity {off ? 'opacity-40 hover:opacity-70' : 'text-zinc-400 hover:text-zinc-200'}">
-          <span class="inline-block h-1.5 w-3 rounded-sm" style="background: {s.color ?? palette[i % palette.length]}"></span>
+          <span class="inline-block h-1.5 w-3 rounded-sm" style="background: {s.color ?? chartPalette[i % chartPalette.length]}"></span>
           <span class:line-through={off}>{s.label}</span>
         </button>
       {/each}

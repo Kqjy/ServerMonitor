@@ -1,6 +1,6 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.3.7}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.3.8}
     build:
       context: ..
       dockerfile: deploy/agent.Dockerfile
@@ -43,6 +43,10 @@ services:
       SM_BACKUP_S3_ACCESS_KEY_ID: ${SM_BACKUP_S3_ACCESS_KEY_ID:-}
       SM_BACKUP_S3_SECRET_ACCESS_KEY: ${SM_BACKUP_S3_SECRET_ACCESS_KEY:-}
       SM_BACKUP_S3_SESSION_TOKEN: ${SM_BACKUP_S3_SESSION_TOKEN:-}
+      SM_BACKUP_SCHEDULE: ${SM_BACKUP_SCHEDULE:-}
+      SM_BACKUP_CHECK_TIME: ${SM_BACKUP_CHECK_TIME:-}
+      SM_BACKUP_CHECK_WEEKDAY: ${SM_BACKUP_CHECK_WEEKDAY:-}
+      SM_BACKUP_CHECK_READ_DATA_SUBSET: ${SM_BACKUP_CHECK_READ_DATA_SUBSET:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - type: bind

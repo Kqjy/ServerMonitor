@@ -310,14 +310,27 @@ func maybeStartBackupScheduler(ctx context.Context, logger *slog.Logger) *backup
 	if !agentbackup.IsContainerized() || !backupEnabledEnv(os.Getenv) {
 		return nil
 	}
-	if res, err := agentbackup.Provision(os.Getenv); err != nil {
+	res, err := agentbackup.Provision(os.Getenv)
+	if err != nil {
 		logger.Error("backup provisioning failed; scheduled backups disabled this boot", "err", err)
 		return nil
-	} else if res.KeyGenerated {
+	}
+	if res.KeyGenerated {
 		logger.Info("generated backup encryption key (kept forever; export it with: sm-agent backup recovery-kit)")
 	}
-	configPath := agentbackup.DefaultConfigPath()
-	cfg, err := agentbackup.Load(configPath)
+	configPath := res.ConfigPath
+	enrollOpts := agentbackup.EnrollOptions{
+		ConfigPath: configPath,
+		ServerURL:  os.Getenv("SM_SERVER_URL"),
+		Token:      os.Getenv("SM_TOKEN"),
+		KeyPath:    filepath.Join(filepath.Dir(configPath), "tunnel.key"),
+	}
+	if res.TunnelRepos {
+		if err := agentbackup.EnsureTunnelEnrolled(ctx, configPath, enrollOpts); err != nil {
+			logger.Error("automatic backup tunnel enrollment failed; scheduled runs will retry", "err", err)
+		}
+	}
+	cfg, err := agentbackup.LoadForScheduling(configPath)
 	if err != nil {
 		logger.Error("could not load backup config after provisioning; scheduled backups disabled", "err", err)
 		return nil
@@ -329,6 +342,14 @@ func maybeStartBackupScheduler(ctx context.Context, logger *slog.Logger) *backup
 	sched := backupsched.New(schedulerConfig(cfg.Schedule), backupsched.Options{
 		StatePath: filepath.Join(filepath.Dir(cfg.StatusPath), "backup-schedule.json"),
 		RunBackup: func(ctx context.Context) error {
+			if cfg.HasTunnelRepos() {
+				if err := agentbackup.EnsureTunnelEnrolled(ctx, configPath, enrollOpts); err != nil {
+					if statusErr := agentbackup.RecordTunnelEnrollmentFailure(configPath, err, time.Now()); statusErr != nil {
+						logger.Warn("could not record tunnel enrollment failure in backup status", "err", statusErr)
+					}
+					return fmt.Errorf("tunnel enrollment failed: %w", err)
+				}
+			}
 			if _, err := agentbackup.InitFromConfigPath(ctx, configPath, agentbackup.BaseOptions(logger)); err != nil {
 				return err
 			}
@@ -336,6 +357,11 @@ func maybeStartBackupScheduler(ctx context.Context, logger *slog.Logger) *backup
 			return err
 		},
 		RunCheck: func(ctx context.Context) error {
+			if cfg.HasTunnelRepos() {
+				if err := agentbackup.EnsureTunnelEnrolled(ctx, configPath, enrollOpts); err != nil {
+					return fmt.Errorf("tunnel enrollment failed: %w", err)
+				}
+			}
 			_, err := agentbackup.CheckFromConfigPath(ctx, configPath, agentbackup.CheckOptions{ReadDataSubset: cfg.Schedule.CheckReadDataSubset}, agentbackup.BaseOptions(logger))
 			return err
 		},

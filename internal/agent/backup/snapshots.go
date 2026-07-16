@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,9 +16,13 @@ import (
 const snapshotInventoryLimit = 50
 
 type Snapshot struct {
-	ID    string    `json:"id"`
-	Time  time.Time `json:"time,omitempty"`
-	Paths []string  `json:"paths,omitempty"`
+	ID         string    `json:"id"`
+	Time       time.Time `json:"time,omitempty"`
+	Paths      []string  `json:"paths,omitempty"`
+	SizeBytes  *int64    `json:"size_bytes,omitempty"`
+	AddedBytes *int64    `json:"added_bytes,omitempty"`
+	FileCount  *int64    `json:"file_count,omitempty"`
+	DurationS  *float64  `json:"duration_s,omitempty"`
 }
 
 type SnapshotRepoResult struct {
@@ -119,9 +124,9 @@ func (r SnapshotListResult) WriteTable(w io.Writer) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	multiRepo := len(r.Repos) != 1
 	if multiRepo {
-		fmt.Fprintln(tw, "REPO\tID\tTIME\tPATHS")
+		fmt.Fprintln(tw, "REPO\tID\tTIME\tSIZE\tFILES\tPATHS")
 	} else {
-		fmt.Fprintln(tw, "ID\tTIME\tPATHS")
+		fmt.Fprintln(tw, "ID\tTIME\tSIZE\tFILES\tPATHS")
 	}
 	for _, repo := range r.Repos {
 		if repo.Error != "" {
@@ -132,11 +137,19 @@ func (r SnapshotListResult) WriteTable(w io.Writer) error {
 			if !snapshot.Time.IsZero() {
 				when = snapshot.Time.UTC().Format(time.RFC3339)
 			}
+			size := ""
+			if snapshot.SizeBytes != nil {
+				size = strconv.FormatInt(*snapshot.SizeBytes, 10)
+			}
+			files := ""
+			if snapshot.FileCount != nil {
+				files = strconv.FormatInt(*snapshot.FileCount, 10)
+			}
 			paths := strings.Join(snapshot.Paths, ",")
 			if multiRepo {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", repo.Name, snapshot.ID, when, paths)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", repo.Name, snapshot.ID, when, size, files, paths)
 			} else {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", snapshot.ID, when, paths)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", snapshot.ID, when, size, files, paths)
 			}
 		}
 	}
@@ -145,20 +158,37 @@ func (r SnapshotListResult) WriteTable(w io.Writer) error {
 
 func ParseSnapshots(data []byte) ([]Snapshot, error) {
 	var raw []struct {
-		ID    string    `json:"id"`
-		Time  time.Time `json:"time"`
-		Paths []string  `json:"paths"`
+		ID      string    `json:"id"`
+		Time    time.Time `json:"time"`
+		Paths   []string  `json:"paths"`
+		Summary *struct {
+			TotalBytesProcessed int64     `json:"total_bytes_processed"`
+			DataAdded           int64     `json:"data_added"`
+			TotalFilesProcessed int64     `json:"total_files_processed"`
+			BackupStart         time.Time `json:"backup_start"`
+			BackupEnd           time.Time `json:"backup_end"`
+		} `json:"summary"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 	out := make([]Snapshot, 0, len(raw))
 	for _, snapshot := range raw {
-		out = append(out, Snapshot{
+		parsed := Snapshot{
 			ID:    truncateSnapshotID(snapshot.ID),
 			Time:  snapshot.Time.UTC(),
 			Paths: append([]string(nil), snapshot.Paths...),
-		})
+		}
+		if snapshot.Summary != nil {
+			parsed.SizeBytes = &snapshot.Summary.TotalBytesProcessed
+			parsed.AddedBytes = &snapshot.Summary.DataAdded
+			parsed.FileCount = &snapshot.Summary.TotalFilesProcessed
+			if !snapshot.Summary.BackupStart.IsZero() && !snapshot.Summary.BackupEnd.IsZero() && !snapshot.Summary.BackupEnd.Before(snapshot.Summary.BackupStart) {
+				durationS := snapshot.Summary.BackupEnd.Sub(snapshot.Summary.BackupStart).Seconds()
+				parsed.DurationS = &durationS
+			}
+		}
+		out = append(out, parsed)
 	}
 	return out, nil
 }
@@ -171,9 +201,13 @@ func snapshotInventory(snapshots []Snapshot) []Snapshot {
 	out := make([]Snapshot, 0, len(snapshots)-start)
 	for _, snapshot := range snapshots[start:] {
 		out = append(out, Snapshot{
-			ID:    truncateSnapshotID(snapshot.ID),
-			Time:  snapshot.Time.UTC(),
-			Paths: append([]string(nil), snapshot.Paths...),
+			ID:         truncateSnapshotID(snapshot.ID),
+			Time:       snapshot.Time.UTC(),
+			Paths:      append([]string(nil), snapshot.Paths...),
+			SizeBytes:  snapshot.SizeBytes,
+			AddedBytes: snapshot.AddedBytes,
+			FileCount:  snapshot.FileCount,
+			DurationS:  snapshot.DurationS,
 		})
 	}
 	return out

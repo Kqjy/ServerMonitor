@@ -2,18 +2,17 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import {
     api,
-    type SeriesEntry,
     type CollectorStatus,
     type BackupRepoRow,
     type BackupSnapshot,
     type BackupTargetsResp,
     type BackupNode
   } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
+  import { type Range } from '$lib/time';
   import { bytes, timeAgo, timeUntil } from '$lib/format';
   import { TableSort } from '$lib/sort.svelte';
-  import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
-  import DownloadCsv from '$lib/components/DownloadCsv.svelte';
+  import { chartPalette } from '$lib/components/MultiChart.svelte';
+  import BackupBarChart, { type BarEvent } from '$lib/components/BackupBarChart.svelte';
   import { subscribeHost, type LivePoint } from '$lib/sse';
 
   let {
@@ -101,22 +100,9 @@
   let backupsGen = 0;
   let backupsAC: AbortController | null = null;
 
-  let addedHistory = $state<SeriesEntry[]>([]);
-  let durationHistory = $state<SeriesEntry[]>([]);
-  let fromMs = $state(0);
-  let toMs = $state(0);
-  let chartZoom = $state<ChartZoom>(null);
-  let loadedStep = 0;
-  let zoomFetched = false;
-  let chartsLoading = $state(true);
-  let masking = $state(false);
-  let chartsError = $state<string | null>(null);
-  let chartsGen = 0;
-  let chartsAC: AbortController | null = null;
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let backupsTimer: ReturnType<typeof setInterval> | null = null;
   let liveTimer: ReturnType<typeof setInterval> | null = null;
   let liveUnsub: (() => void) | null = null;
-  let prevRange: Range | null = null;
 
   type LiveBackup = {
     running: boolean;
@@ -144,7 +130,6 @@
 
   function refreshAfterRun() {
     void loadBackups();
-    void loadCharts();
   }
 
   function receiveLive(points: LivePoint[]) {
@@ -185,13 +170,6 @@
   const snapSort = new TableSort<'time' | 'id'>('time');
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function toSeries(entries: SeriesEntry[]): Series[] {
-    return entries.map((e) => ({
-      label: e.labels.repo ?? Object.values(e.labels).join(' '),
-      points: e.points
-    }));
-  }
 
   function ageS(iso?: string): number | null {
     if (!iso) return null;
@@ -269,6 +247,62 @@
       .sort((a, b) => a.repo.localeCompare(b.repo))
   );
 
+  let hiddenRepos = $state(new Set<string>());
+  const repoNames = $derived(views.map((view) => view.repo));
+  const repoColors = $derived.by<Record<string, string>>(() =>
+    Object.fromEntries(repoNames.map((repo, index) => [repo, chartPalette[index % chartPalette.length]]))
+  );
+
+  function repoColor(repo: string): string {
+    return repoColors[repo] ?? chartPalette[0];
+  }
+
+  function snapshotEvents(kind: 'added' | 'duration'): BarEvent[] {
+    const events: BarEvent[] = [];
+    for (const view of views) {
+      for (const snapshot of view.snapshots) {
+        if (!snapshot.time) continue;
+        const timeMs = new Date(snapshot.time).getTime();
+        if (!Number.isFinite(timeMs)) continue;
+        events.push({
+          repo: view.repo,
+          timeMs,
+          value: kind === 'added' ? snapshot.added_bytes ?? null : snapshot.duration_s ?? null
+        });
+      }
+    }
+    return events
+      .sort((a, b) => a.timeMs - b.timeMs || a.repo.localeCompare(b.repo))
+      .slice(-40);
+  }
+
+  const addedEvents = $derived.by(() => snapshotEvents('added'));
+  const durationEvents = $derived.by(() => snapshotEvents('duration'));
+  const visibleAddedEvents = $derived(addedEvents.filter((event) => !hiddenRepos.has(event.repo)));
+  const visibleDurationEvents = $derived(durationEvents.filter((event) => !hiddenRepos.has(event.repo)));
+
+  function toggleRepo(repo: string) {
+    const next = new Set(hiddenRepos);
+    if (next.has(repo)) next.delete(repo);
+    else next.add(repo);
+    hiddenRepos = next;
+  }
+
+  function csvCell(value: string): string {
+    return `"${value.replaceAll('"', '""')}"`;
+  }
+
+  function downloadEvents(events: BarEvent[], filename: string) {
+    const rows = events.map((event) => [csvCell(event.repo), new Date(event.timeMs).toISOString(), event.value ?? ''].join(','));
+    const blob = new Blob([['repo,time,value', ...rows].join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   const notBackingUp = $derived(!backupsLoading && views.length === 0 && runningRepos.length === 0);
   const hideBackupDetail = $derived(notBackingUp && (isStorageNode || externallyManaged));
 
@@ -322,61 +356,6 @@
     }
   }
 
-  async function loadCharts() {
-    const gen = ++chartsGen;
-    chartsAC?.abort();
-    const ac = new AbortController();
-    chartsAC = ac;
-    const zoomed = chartZoom;
-    let from: string;
-    let to: string | undefined;
-    if (zoomed) {
-      from = new Date(zoomed.fromMs).toISOString();
-      to = new Date(zoomed.toMs).toISOString();
-    } else {
-      const b = rangeBoundsMs(range);
-      from = rangeToFrom(range);
-      to = rangeToTo(range);
-      fromMs = b.fromMs;
-      toMs = b.toMs;
-    }
-    try {
-      const [added, duration] = await Promise.all([
-        api.seriesMulti({ host: hostId, metric: 'backup_added_bytes', from, to, splitBy: 'repo', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'backup_duration_s', from, to, splitBy: 'repo', signal: ac.signal })
-      ]);
-      if (gen !== chartsGen) return;
-      loadedStep = added.step_sec;
-      zoomFetched = zoomed !== null;
-      addedHistory = added.series;
-      durationHistory = duration.series;
-      chartsError = null;
-      chartsLoading = false;
-      masking = false;
-    } catch (e) {
-      if (gen !== chartsGen || (e as { name?: string })?.name === 'AbortError') return;
-      chartsError = (e as Error).message;
-      chartsLoading = false;
-      masking = false;
-    }
-  }
-
-  $effect(() => {
-    const current = range;
-    if (prevRange !== null && !rangeEquals(current, prevRange)) {
-      chartZoom = null;
-      chartsLoading = true;
-      addedHistory = [];
-      durationHistory = [];
-    }
-    prevRange = current;
-  });
-
-  $effect(() => {
-    void range;
-    untrack(() => loadCharts());
-  });
-
   $effect(() => {
     const names = views.map((v) => v.repo);
     untrack(() => {
@@ -393,9 +372,7 @@
     loadEndpoint();
     loadNodeRole();
     loadServerInfo();
-    timer = setInterval(() => {
-      if (chartZoom === null) loadCharts();
-    }, 10_000);
+    backupsTimer = setInterval(() => loadBackups(), 60_000);
     liveUnsub = subscribeHost(hostId, ['backup_running', 'backup_run_elapsed_s', 'backup_progress_pct', 'backup_progress_bytes', 'backup_progress_total_bytes'], receiveLive);
     liveTimer = setInterval(() => {
       const now = Date.now();
@@ -413,36 +390,12 @@
     }, 1000);
   });
   onDestroy(() => {
-    if (timer) clearInterval(timer);
+    if (backupsTimer) clearInterval(backupsTimer);
     if (liveTimer) clearInterval(liveTimer);
     liveUnsub?.();
     if (copyTimer) clearTimeout(copyTimer);
-    chartsAC?.abort();
     backupsAC?.abort();
   });
-
-  const isZoomed = $derived(chartZoom !== null);
-  const hasCharts = $derived(addedHistory.length + durationHistory.length > 0);
-
-  function handleZoom(f: number, t: number) {
-    chartZoom = { fromMs: f, toMs: t };
-    fromMs = f;
-    toMs = t;
-    if (loadedStep > 0 && chooseStepSec(t - f, sampleIntervalS) < loadedStep) {
-      masking = true;
-      loadCharts();
-    }
-  }
-  function handleReset() {
-    chartZoom = null;
-    const b = rangeBoundsMs(range);
-    fromMs = b.fromMs;
-    toMs = b.toMs;
-    if (zoomFetched) {
-      masking = true;
-      loadCharts();
-    }
-  }
 
   const activeRepo = $derived(views.find((v) => v.repo === selectedRepo) ?? null);
   const activeSnapshots = $derived(activeRepo?.snapshots ?? []);
@@ -589,9 +542,9 @@
         {:else}
           <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
           <p class="mt-1 text-sm text-zinc-500 max-w-xl">
-            {backupStatus?.state === 'not_configured' || !backupStatus
-              ? 'Its agent reports no backup job. Enable backups to protect this host and see restore-ready snapshots here.'
-              : 'The agent reports backups are enabled but no repository status has arrived yet — the first run may not have finished.'}
+            {backupStatus?.state === 'scheduled'
+              ? 'The agent reports backups are enabled but no repository status has arrived yet — the first run may not have finished.'
+              : 'Its agent reports no backup job. Enable backups to protect this host and see restore-ready snapshots here.'}
           </p>
         {/if}
 
@@ -630,8 +583,8 @@
             <tr>
               <th class="text-left font-medium px-4 sm:px-5 py-2.5">Repository</th>
               <th class="text-left font-medium px-3 py-2.5">Last backup</th>
-              <th class="text-left font-medium px-3 py-2.5">Last check</th>
-              <th class="text-right font-medium px-3 py-2.5">Size</th>
+              <th class="hidden sm:table-cell text-left font-medium px-3 py-2.5">Last check</th>
+              <th class="hidden sm:table-cell text-right font-medium px-3 py-2.5">Size</th>
               <th class="text-right font-medium px-4 sm:px-5 py-2.5">Snapshots</th>
             </tr>
           </thead>
@@ -648,21 +601,21 @@
                 </td>
                 <td class="px-3 py-2.5">
                   {#if isRunning(v.repo)}
-                    <div class="flex items-center gap-2 text-emerald-300"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span>backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span></div>
+                    <div class="flex items-center gap-2 text-emerald-300"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span class="whitespace-nowrap">backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span></div>
                   {:else}
                     <div class="flex items-center gap-2">
-                      <span class="numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : v.pending ? 'not yet' : 'never'}</span>
+                      <span class="numeric whitespace-nowrap {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : v.pending ? 'not yet' : 'never'}</span>
                       {#if v.pending}<span class="text-[10px] uppercase tracking-wider text-zinc-500">scheduled</span>{:else if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
                     </div>
                   {/if}
                 </td>
-                <td class="px-3 py-2.5">
+                <td class="hidden sm:table-cell px-3 py-2.5">
                   <div class="flex items-center gap-2">
                     <span class="numeric {toneText[v.checkTone]}">{v.checkLastIso ? timeAgo(v.checkLastIso) : 'never'}</span>
                     {#if v.checkSuccess === false}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
                   </div>
                 </td>
-                <td class="px-3 py-2.5 text-right numeric text-zinc-300">{optionalBytes(v.totalBytes)}</td>
+                <td class="hidden sm:table-cell px-3 py-2.5 text-right numeric text-zinc-300">{optionalBytes(v.totalBytes)}</td>
                 <td class="px-4 sm:px-5 py-2.5 text-right numeric text-zinc-300">{optionalCount(v.snapshotCount)}</td>
               </tr>
             {/each}
@@ -697,7 +650,7 @@
             <div class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Last success</div>
-                <div class="mt-0.5 numeric {toneText[v.backupTone]}">{optionalDuration(v.lastSuccessAgeS)}{v.lastSuccessAgeS !== null ? ' ago' : ''}</div>
+                <div class="mt-0.5 numeric {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : 'n/a'}</div>
               </div>
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Last run</div>
@@ -741,44 +694,67 @@
     {/if}
   </section>
 
-  {#if !hideBackupDetail}
-  {#if chartsError}
-    <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
-      Failed to load backup history: {chartsError}
-    </div>
-  {/if}
-
-  {#if chartsLoading}
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      {#each Array(2) as _, i (i)}
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-          <header class="px-5 py-3 border-b border-zinc-800"><div class="h-3 w-28 rounded shimmer"></div></header>
-          <div class="px-3 py-3"><div class="h-[220px] rounded-md shimmer opacity-60"></div></div>
-        </div>
-      {/each}
-    </div>
-  {:else if hasCharts || !chartsError}
+  {#if !hideBackupDetail && views.length > 0}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-        <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
-          <div class="text-xs uppercase tracking-wider text-zinc-500">Backup added bytes</div>
-          <DownloadCsv host={hostId} metric="backup_added_bytes" splitBy="repo" {range} />
+        <header class="flex items-center justify-between px-4 sm:px-5 py-3 border-b border-zinc-800">
+          <div class="text-xs uppercase tracking-wider text-zinc-500">Data added per snapshot</div>
+          <button
+            type="button"
+            onclick={() => downloadEvents(visibleAddedEvents, `backup-added-${hostId}.csv`)}
+            title="Download snapshot data added as CSV"
+            aria-label="Download CSV"
+            class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors text-[10px] uppercase tracking-wider">
+            <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v12" />
+              <path d="m7 10 5 5 5-5" />
+              <path d="M5 21h14" />
+            </svg>
+            <span>CSV</span>
+          </button>
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(addedHistory)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="B" format={(v, e = 0) => bytes(v, 1 + e)} />
+          <BackupBarChart events={visibleAddedEvents} format={(v, e = 0) => bytes(v, 1 + e)} {repoColor} tickUnit="bytes" emptyText="No snapshots yet" />
         </div>
       </section>
       <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-        <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
-          <div class="text-xs uppercase tracking-wider text-zinc-500">Backup duration</div>
-          <DownloadCsv host={hostId} metric="backup_duration_s" splitBy="repo" {range} />
+        <header class="flex items-center justify-between px-4 sm:px-5 py-3 border-b border-zinc-800">
+          <div class="text-xs uppercase tracking-wider text-zinc-500">Duration per snapshot</div>
+          <button
+            type="button"
+            onclick={() => downloadEvents(visibleDurationEvents, `backup-duration-${hostId}.csv`)}
+            title="Download snapshot durations as CSV"
+            aria-label="Download CSV"
+            class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors text-[10px] uppercase tracking-wider">
+            <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v12" />
+              <path d="m7 10 5 5 5-5" />
+              <path d="M5 21h14" />
+            </svg>
+            <span>CSV</span>
+          </button>
         </header>
         <div class="px-3 py-3">
-          <MultiChart series={toSeries(durationHistory)} {fromMs} {toMs} zoomed={isZoomed} {masking} onZoom={handleZoom} onResetZoom={handleReset} unit="s" format={durationText} />
+          <BackupBarChart events={visibleDurationEvents} format={durationText} {repoColor} tickUnit="seconds" emptyText="No duration reported yet" />
         </div>
       </section>
     </div>
-  {/if}
+    {#if repoNames.length > 1}
+      <div class="flex flex-wrap justify-center gap-x-3 gap-y-1 text-[11px] numeric">
+        {#each repoNames as repo (repo)}
+          {@const off = hiddenRepos.has(repo)}
+          <button
+            type="button"
+            onclick={() => toggleRepo(repo)}
+            aria-pressed={!off}
+            title={off ? 'Show repository' : 'Hide repository'}
+            class="inline-flex items-center gap-1.5 transition-opacity {off ? 'opacity-40 hover:opacity-70' : 'text-zinc-400 hover:text-zinc-200'}">
+            <span class="inline-block h-1.5 w-3 rounded-sm" style="background: {repoColor(repo)}"></span>
+            <span class:line-through={off}>{repo}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
   {/if}
 
   {#if !backupsLoading && !backupsError && views.length > 0}
@@ -815,7 +791,10 @@
                 <th class="text-left font-medium px-3 py-2.5" aria-sort={snapSort.ariaSort('time')}>
                   <button type="button" onclick={() => snapSort.toggle('time')} class="uppercase tracking-wider hover:text-zinc-300">Time{snapSort.indicator('time')}</button>
                 </th>
-                <th class="text-left font-medium px-4 sm:px-5 py-2.5">Paths</th>
+                <th class="text-right font-medium px-3 py-2.5">Size</th>
+                <th class="text-right font-medium px-3 py-2.5">Added</th>
+                <th class="hidden sm:table-cell text-right font-medium px-3 py-2.5">Files</th>
+                <th class="hidden sm:table-cell text-left font-medium px-4 sm:px-5 py-2.5">Paths</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-zinc-800/70">
@@ -826,9 +805,12 @@
                   <td class="px-4 sm:px-5 py-2 font-mono text-zinc-100">{s.id}</td>
                   <td class="px-3 py-2 text-zinc-300">
                     <span class="numeric">{absTime(s.time)}</span>
-                    <span class="ml-2 text-xs text-zinc-500 numeric">{s.time ? timeAgo(s.time) : ''}</span>
+                    <span class="ml-2 hidden text-xs text-zinc-500 numeric sm:inline">{s.time ? timeAgo(s.time) : ''}</span>
                   </td>
-                  <td class="px-4 sm:px-5 py-2 text-xs text-zinc-400 font-mono truncate max-w-md" title={(s.paths ?? []).join('\n')}>{(s.paths ?? []).join(', ') || '—'}</td>
+                  <td class="px-3 py-2 text-right numeric text-zinc-300">{s.size_bytes == null ? '—' : bytes(s.size_bytes)}</td>
+                  <td class="px-3 py-2 text-right numeric text-zinc-300">{s.added_bytes == null ? '—' : bytes(s.added_bytes)}</td>
+                  <td class="hidden sm:table-cell px-3 py-2 text-right numeric text-zinc-300">{s.file_count == null ? '—' : optionalCount(s.file_count)}</td>
+                  <td class="hidden sm:table-cell px-4 sm:px-5 py-2 text-xs text-zinc-400 font-mono truncate max-w-md" title={(s.paths ?? []).join('\n')}>{(s.paths ?? []).join(', ') || '—'}</td>
                 </tr>
               {/each}
             </tbody>

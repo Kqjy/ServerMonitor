@@ -15,6 +15,7 @@ type ProvisionResult struct {
 	ConfigPath   string
 	KeyGenerated bool
 	Rewrote      bool
+	TunnelRepos  bool
 }
 
 func Provision(getenv func(string) string) (ProvisionResult, error) {
@@ -42,6 +43,10 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 	repos := splitCSV(getenv("SM_BACKUP_REPOS"))
 	if len(repos) == 0 {
 		if _, statErr := os.Stat(configPath); statErr == nil {
+			needServer, nodes, demandErr := tunnelRepoDemand(configPath)
+			if demandErr == nil {
+				res.TunnelRepos = needServer || len(nodes) > 0
+			}
 			return res, nil
 		}
 		return res, fmt.Errorf("SM_BACKUP_REPOS is required to provision backups, or provide an operator-managed backup.toml at %s", configPath)
@@ -61,6 +66,12 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 		return res, err
 	}
 	res.Rewrote = true
+	for _, repo := range repos {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(repo)), "tunnel:") {
+			res.TunnelRepos = true
+			break
+		}
+	}
 	return res, nil
 }
 
@@ -147,24 +158,40 @@ func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, hav
 		if url == "" {
 			continue
 		}
+		tunnelNode := ""
+		tunnelName := ""
 		if strings.HasPrefix(strings.ToLower(url), "tunnel:") {
-			return "", fmt.Errorf("tunnel repositories are not yet supported from the containerized agent (planned for a later release); point at a rest:/s3:/b2: endpoint, or use the host install")
-		}
-		if !hasRemoteScheme(url) {
-			return "", fmt.Errorf("repository %q is not a supported backend for the containerized agent; use a native restic remote (rest:/s3:/b2:/gs:/azure:/swift:). sftp:/rclone: need helper binaries absent from the image, and a local path would resolve to the host during backup but the container during snapshots", url)
+			var err error
+			tunnelNode, tunnelName, err = parseTunnelRepository(url)
+			if err != nil {
+				return "", err
+			}
+		} else if !hasRemoteScheme(url) {
+			return "", fmt.Errorf("repository %q is not a supported backend for the containerized agent; use rest:/s3:/b2:/gs:/azure:/swift: or tunnel:NAME/tunnel:NODE/NAME. sftp:/rclone: need helper binaries absent from the image, and a local path would resolve to the host during backup but the container during snapshots", url)
 		}
 		name := ""
 		if i < len(names) {
 			name = strings.TrimSpace(names[i])
 		}
 		if name == "" {
-			name = fmt.Sprintf("repo%d", i+1)
+			if tunnelName != "" {
+				name = tunnelName
+			} else {
+				name = fmt.Sprintf("repo%d", i+1)
+			}
 		}
 		b.WriteString("\n[[repo]]\n")
 		fmt.Fprintf(&b, "name = %q\n", name)
-		fmt.Fprintf(&b, "url = %q\n", url)
+		if tunnelName != "" {
+			fmt.Fprintf(&b, "tunnel_name = %q\n", tunnelName)
+			if tunnelNode != "" {
+				fmt.Fprintf(&b, "tunnel_node = %q\n", tunnelNode)
+			}
+		} else {
+			fmt.Fprintf(&b, "url = %q\n", url)
+		}
 		fmt.Fprintf(&b, "password_file = %q\n", keyPath)
-		if haveCreds && isCredentialRepo(url) {
+		if tunnelName == "" && haveCreds && isCredentialRepo(url) {
 			fmt.Fprintf(&b, "env_file = %q\n", credsPath)
 		}
 		if strings.HasPrefix(url, "s3:") {
@@ -177,6 +204,34 @@ func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, hav
 		}
 	}
 	return b.String(), nil
+}
+
+func parseTunnelRepository(spec string) (string, string, error) {
+	remainder := strings.TrimSpace(spec[len("tunnel:"):])
+	if remainder == "" {
+		return "", "", fmt.Errorf("tunnel repository %q is missing a repository name; use tunnel:NAME or tunnel:NODE/NAME", spec)
+	}
+	if strings.Count(remainder, "/") > 1 {
+		return "", "", fmt.Errorf("tunnel repository %q has too many path separators; use tunnel:NAME or tunnel:NODE/NAME", spec)
+	}
+	node := ""
+	name := remainder
+	if strings.Contains(remainder, "/") {
+		node, name, _ = strings.Cut(remainder, "/")
+		if node == "" {
+			return "", "", fmt.Errorf("tunnel repository %q is missing the node name before /; use tunnel:NODE/NAME", spec)
+		}
+		if name == "" {
+			return "", "", fmt.Errorf("tunnel repository %q is missing the repository name after /; use tunnel:NODE/NAME", spec)
+		}
+	}
+	if !tunnelRepoNameRE.MatchString(name) {
+		return "", "", fmt.Errorf("tunnel repository %q has an invalid repository name %q; it must match %s", spec, name, tunnelRepoNameRE)
+	}
+	if node != "" && !tunnelRepoNameRE.MatchString(node) {
+		return "", "", fmt.Errorf("tunnel repository %q has an invalid node name %q; it must match %s", spec, node, tunnelRepoNameRE)
+	}
+	return node, name, nil
 }
 
 func writeScheduleTOML(b *strings.Builder, getenv func(string) string) {

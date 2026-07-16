@@ -12,13 +12,14 @@ func TestConvertBackupsMarshalsPayloadAndRepoSet(t *testing.T) {
 	updatedAt := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
 	started := time.Date(2026, 7, 3, 2, 0, 0, 0, time.UTC)
 	success := false
+	snapshotDurationS := 9.5
 	snapshots := make([]wire.BackupSnapshot, 51)
 	for i := range snapshots {
 		snapshots[i] = wire.BackupSnapshot{ID: "snap"}
 	}
 	rows, repos, err := ConvertBackups(42, []wire.BackupRepoStatus{
 		{Name: "zeta", Engine: "restic", Success: true, DurationS: 9},
-		{Name: "alpha", Engine: "borg", LastStarted: &started, CheckSuccess: &success, Snapshots: []wire.BackupSnapshot{{ID: "snap-a", Time: started, Paths: []string{"/srv"}}}},
+		{Name: "alpha", Engine: "borg", LastStarted: &started, CheckSuccess: &success, Snapshots: []wire.BackupSnapshot{{ID: "snap-a", Time: started, Paths: []string{"/srv"}, DurationS: &snapshotDurationS}}},
 		{Name: "   ", Engine: "ignored"},
 		{Name: " zeta ", Engine: "restic", Success: false, Error: "last wins", Snapshots: snapshots},
 	}, updatedAt)
@@ -40,6 +41,9 @@ func TestConvertBackupsMarshalsPayloadAndRepoSet(t *testing.T) {
 	}
 	if alpha.Name != "alpha" || alpha.Engine != "borg" || alpha.CheckSuccess == nil || *alpha.CheckSuccess || len(alpha.Snapshots) != 1 {
 		t.Fatalf("alpha payload = %#v", alpha)
+	}
+	if alpha.Snapshots[0].DurationS == nil || *alpha.Snapshots[0].DurationS != snapshotDurationS {
+		t.Fatalf("alpha snapshot duration = %v", alpha.Snapshots[0].DurationS)
 	}
 	var zeta wire.BackupRepoStatus
 	if err := json.Unmarshal(rows[1].Payload, &zeta); err != nil {

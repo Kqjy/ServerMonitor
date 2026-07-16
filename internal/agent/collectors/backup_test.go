@@ -166,7 +166,6 @@ func TestBackupCollectorDriftDoesNotOverrideStatus(t *testing.T) {
 		wantState string
 	}{
 		{"error", "{", time.Time{}, backupStateError},
-		{"not configured", "", time.Time{}, backupStateNotConfigured},
 		{"stale", `{"version":1,"repos":[]}`, now.Add(-27 * time.Hour), backupStateStale},
 	}
 	for _, tc := range tests {
@@ -181,6 +180,57 @@ func TestBackupCollectorDriftDoesNotOverrideStatus(t *testing.T) {
 				}
 			}
 			c := testBackupCollector(statusPath, now)
+			enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
+			points, err := c.Collect(context.Background())
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 1 {
+				t.Fatalf("backup_agent_stale = %v,%v, want 1,true", value, ok)
+			}
+			if state := c.Status().State; state != tc.wantState {
+				t.Fatalf("state = %q, want %q", state, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name           string
+		statusPath     func(t *testing.T) string
+		scheduledRepos []string
+		wantState      string
+	}{
+		{
+			name: "missing",
+			statusPath: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "backup-status.json")
+			},
+			wantState: backupStateStaleAgent,
+		},
+		{
+			name: "scheduled",
+			statusPath: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "backup-status.json")
+			},
+			scheduledRepos: []string{"vps-a"},
+			wantState:      backupStateStaleAgent,
+		},
+		{
+			name: "read error",
+			statusPath: func(t *testing.T) string {
+				return t.TempDir()
+			},
+			scheduledRepos: []string{"vps-a"},
+			wantState:      backupStateError,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testBackupCollector(tc.statusPath(t), now)
+			c.scheduledRepos = tc.scheduledRepos
 			enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
 			points, err := c.Collect(context.Background())
 			if err != nil {
@@ -480,14 +530,42 @@ func TestBackupCollectorInventoryThrottle(t *testing.T) {
 }
 
 func TestParseSystemdNextElapse(t *testing.T) {
-	want := time.UnixMicro(1783130400000000).UTC()
-	if got := parseSystemdNextElapse("1783130400000000\n"); got == nil || !got.Equal(want) {
-		t.Fatalf("parsed time = %#v, want %v", got, want)
+	unixSeconds := time.Unix(1752613800, 0).UTC()
+	unixMicros := time.UnixMicro(1783130400000000).UTC()
+	formatted := time.Date(2026, 7, 15, 21, 57, 12, 0, time.UTC)
+	tests := []struct {
+		name string
+		raw  string
+		want *time.Time
+	}{
+		{"empty", "", nil},
+		{"whitespace", "  \n", nil},
+		{"not available", "n/a\n", nil},
+		{"zero", "0", nil},
+		{"infinity", "infinity", nil},
+		{"unix seconds", "@1752613800\n", &unixSeconds},
+		{"microseconds", "1783130400000000\n", &unixMicros},
+		{"formatted", "Wed 2026-07-15 21:57:12 UTC\n", &formatted},
+		{"empty unix seconds", "@", nil},
+		{"negative unix seconds", "@-5", nil},
+		{"negative microseconds", "-5", nil},
+		{"overflow", "18446744073709551615", nil},
+		{"garbage", "garbage", nil},
+		{"malformed formatted", "Wed 2026-07-15 21:57 UTC", nil},
 	}
-	for _, raw := range []string{"0", "", "  \n", "infinity", "garbage", "-5", "18446744073709551615"} {
-		if got := parseSystemdNextElapse(raw); got != nil {
-			t.Fatalf("parseSystemdNextElapse(%q) = %v, want nil", raw, got)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseSystemdNextElapse(tc.raw)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("parseSystemdNextElapse(%q) = %v, want nil", tc.raw, got)
+				}
+				return
+			}
+			if got == nil || !got.Equal(*tc.want) {
+				t.Fatalf("parseSystemdNextElapse(%q) = %v, want %v", tc.raw, got, *tc.want)
+			}
+		})
 	}
 }
 

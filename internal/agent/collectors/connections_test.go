@@ -64,3 +64,27 @@ func TestPortOwnerStateLatch(t *testing.T) {
 		t.Fatalf("zero-socket state = %q, want %q", c.state, connStateOK)
 	}
 }
+
+func TestDecodePortOwnerCapabilities(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		status  string
+		dac     bool
+		ptrace  bool
+		decoded bool
+	}{
+		{name: "both", status: "Name:\tsm-agent\nCapEff:\t0000000000080004\n", dac: true, ptrace: true, decoded: true},
+		{name: "dac", status: "CapEff: 0000000000000004", dac: true, decoded: true},
+		{name: "ptrace", status: "CapEff:\t0000000000080000", ptrace: true, decoded: true},
+		{name: "neither", status: "CapEff:\t0000000000000000", decoded: true},
+		{name: "invalid", status: "CapEff:\tnot-hex"},
+		{name: "missing", status: "Name:\tsm-agent"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dac, ptrace, decoded := decodePortOwnerCapabilities(test.status)
+			if dac != test.dac || ptrace != test.ptrace || decoded != test.decoded {
+				t.Fatalf("decoded (%v, %v, %v), want (%v, %v, %v)", dac, ptrace, decoded, test.dac, test.ptrace, test.decoded)
+			}
+		})
+	}
+}

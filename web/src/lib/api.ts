@@ -110,6 +110,10 @@ export interface BackupSnapshot {
   id: string;
   time?: string;
   paths?: string[];
+  size_bytes?: number;
+  added_bytes?: number;
+  file_count?: number;
+  duration_s?: number;
 }
 
 export interface BackupRepoStatus {
