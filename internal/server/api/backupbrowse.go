@@ -24,7 +24,7 @@ import (
 
 const (
 	browseQueuedTTL  = 90 * time.Second
-	browseRunningTTL = 180 * time.Second
+	browseRunningTTL = 6 * time.Minute
 	browseResultTTL  = 10 * time.Minute
 	browseGlobalCap  = 256
 	browseHostCap    = 4
@@ -68,7 +68,7 @@ func (s *browseStore) cleanupLocked(now time.Time) {
 		switch job.State {
 		case "queued":
 			if now.Sub(job.Created) > browseQueuedTTL {
-				result := wire.BackupBrowseResult{ErrorKind: "agent_unreachable", Error: "the agent has not picked this up — it may be offline or running a pre-0.4.0 build"}
+				result := wire.BackupBrowseResult{ErrorKind: "agent_unreachable", Error: "the agent has not picked this up yet - it may be offline, busy with an earlier browse, or running a pre-0.4.0 agent"}
 				job.State = "failed"
 				job.Finished = now
 				job.Result = &result
@@ -121,10 +121,28 @@ func (s *browseStore) create(hostID int64, repo, snapshot, path string) (*browse
 	now := s.now().UTC()
 	s.cleanupLocked(now)
 	active := 0
+	var reusable *browseJob
 	for _, job := range s.jobs {
+		if job.HostID == hostID && job.Repo == repo && job.Snapshot == snapshot && job.Path == path && (job.State == "queued" || job.State == "running" || job.State == "done") {
+			jobPriority := 0
+			reusablePriority := 0
+			if job.State == "done" {
+				jobPriority = 1
+			}
+			if reusable != nil && reusable.State == "done" {
+				reusablePriority = 1
+			}
+			if reusable == nil || jobPriority > reusablePriority || jobPriority == reusablePriority && (job.Created.After(reusable.Created) || job.Created.Equal(reusable.Created) && job.ID > reusable.ID) {
+				reusable = job
+			}
+		}
 		if job.HostID == hostID && (job.State == "queued" || job.State == "running") {
 			active++
 		}
+	}
+	if reusable != nil {
+		copy := *reusable
+		return &copy, nil
 	}
 	if active >= browseHostCap {
 		return nil, errBrowseHostCap
@@ -187,7 +205,8 @@ func (s *browseStore) finish(hostID int64, id string, result wire.BackupBrowseRe
 	now := s.now().UTC()
 	s.cleanupLocked(now)
 	job, ok := s.jobs[id]
-	if !ok || job.HostID != hostID || job.State != "running" {
+	lateTimedOut := ok && job.State == "failed" && job.Result != nil && job.Result.ErrorKind == "timed_out"
+	if !ok || job.HostID != hostID || job.State != "running" && !lateTimedOut {
 		return false
 	}
 	job.Result = &result

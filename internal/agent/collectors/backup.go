@@ -257,6 +257,16 @@ func (c *backupCollector) currentTime() time.Time {
 func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := c.currentTime()
 	out := c.backupProgressPoints(now)
+	info, status, ok := c.readBackupStatus()
+	scheduledRepos := c.scheduledReposCopy()
+	if !ok && c.Status().State != backupStateError && len(scheduledRepos) > 0 {
+		c.setState(backupStateScheduled, "")
+	}
+	state := c.Status().State
+	configured := ok || state == backupStateError || len(scheduledRepos) > 0
+	if !configured {
+		return out, nil
+	}
 	staleAgent, staleKnown, unexecutable, executableKnown, agentHealthMsg := c.privilegedAgentDrift(ctx)
 	if staleKnown {
 		value := 0.0
@@ -272,12 +282,8 @@ func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		}
 		out = append(out, point(now, metrics.BackupAgentUnexecutable, nil, value))
 	}
-	info, status, ok := c.readBackupStatus()
 	if !ok {
-		if c.Status().State != backupStateError && len(c.scheduledReposCopy()) > 0 {
-			c.setState(backupStateScheduled, "")
-		}
-		state := c.Status().State
+		state = c.Status().State
 		if unexecutable && (state == backupStateNotConfigured || state == backupStateScheduled) {
 			c.setState(backupStateAgentPerms, agentHealthMsg)
 		} else if staleAgent && (state == backupStateNotConfigured || state == backupStateScheduled) {

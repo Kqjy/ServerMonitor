@@ -35,6 +35,8 @@ import (
 	"servermonitor/pkg/wire"
 )
 
+const backupBrowseJobTimeout = 5 * time.Minute
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -769,12 +771,14 @@ func runBackupBrowseLoop(ctx context.Context, client *transport.Client, logger *
 				logger.Warn("fetch backup browse jobs failed", "err", err)
 			} else {
 				for _, job := range jobs {
-					result, browseErr := agentbackup.BrowseFromConfigPath(ctx, agentbackup.DefaultConfigPath(), agentbackup.BrowseOptions{
+					jobCtx, cancel := context.WithTimeout(ctx, backupBrowseJobTimeout)
+					result, browseErr := agentbackup.BrowseFromConfigPath(jobCtx, agentbackup.DefaultConfigPath(), agentbackup.BrowseOptions{
 						Repo:       job.Repo,
 						Snapshot:   job.Snapshot,
 						Path:       job.Path,
 						MaxEntries: 2000,
 					}, agentbackup.BaseOptions(logger))
+					cancel()
 					response := wire.BackupBrowseResult{}
 					if browseErr != nil {
 						kind, message := agentbackup.ClassifyBrowseError(browseErr)

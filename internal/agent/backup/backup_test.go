@@ -916,6 +916,8 @@ func TestBrowseErrorClassification(t *testing.T) {
 		err  error
 		kind string
 	}{
+		{fmt.Errorf("browse: %w", context.DeadlineExceeded), "timed_out"},
+		{errors.New("snapshot browse failed: context deadline exceeded: load index files"), "timed_out"},
 		{fmt.Errorf("read config: %w", os.ErrPermission), "insufficient_privilege"},
 		{errors.New("another backup operation holds the tunnel lock; retry"), "busy"},
 		{errors.New("snapshot browse failed: no matching ID found"), "not_found"},

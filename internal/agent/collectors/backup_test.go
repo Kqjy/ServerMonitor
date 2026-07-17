@@ -205,6 +205,8 @@ func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
 		name           string
 		statusPath     func(t *testing.T) string
 		scheduledRepos []string
+		accessError    bool
+		wantStale      bool
 		wantState      string
 	}{
 		{
@@ -212,7 +214,15 @@ func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
 			statusPath: func(t *testing.T) string {
 				return filepath.Join(t.TempDir(), "backup-status.json")
 			},
-			wantState: backupStateStaleAgent,
+			wantState: backupStateNotConfigured,
+		},
+		{
+			name: "missing access error",
+			statusPath: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "backup-status.json")
+			},
+			accessError: true,
+			wantState:   backupStateNotConfigured,
 		},
 		{
 			name: "scheduled",
@@ -220,6 +230,7 @@ func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
 				return filepath.Join(t.TempDir(), "backup-status.json")
 			},
 			scheduledRepos: []string{"vps-a"},
+			wantStale:      true,
 			wantState:      backupStateStaleAgent,
 		},
 		{
@@ -228,6 +239,7 @@ func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
 				return t.TempDir()
 			},
 			scheduledRepos: []string{"vps-a"},
+			wantStale:      true,
 			wantState:      backupStateError,
 		},
 	}
@@ -236,12 +248,18 @@ func TestBackupCollectorDriftWithoutStatus(t *testing.T) {
 			c := testBackupCollector(tc.statusPath(t), now)
 			c.scheduledRepos = tc.scheduledRepos
 			enableBackupAgentDrift(t, c, "sm-agent 0.1.0\n")
+			if tc.accessError {
+				c.accessExecutable = func(string) error { return errors.New("access denied") }
+			}
 			points, err := c.Collect(context.Background())
 			if err != nil {
 				t.Fatalf("Collect: %v", err)
 			}
-			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 1 {
-				t.Fatalf("backup_agent_stale = %v,%v, want 1,true", value, ok)
+			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); ok != tc.wantStale || ok && value != 1 {
+				t.Fatalf("backup_agent_stale = %v,%v, want 1,%v", value, ok, tc.wantStale)
+			}
+			if value, ok := backupMetricValue(points, metrics.BackupAgentUnexecutable); ok != tc.wantStale || ok && value != 0 {
+				t.Fatalf("backup_agent_unexecutable = %v,%v, want 0,%v", value, ok, tc.wantStale)
 			}
 			if state := c.Status().State; state != tc.wantState {
 				t.Fatalf("state = %q, want %q", state, tc.wantState)

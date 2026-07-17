@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -112,6 +113,97 @@ func TestBrowseStoreLifecycleAndHostIsolation(t *testing.T) {
 	}
 }
 
+func TestBrowseStoreAcceptsLateResultAfterRunningTimeout(t *testing.T) {
+	now := time.Date(2026, 7, 17, 8, 0, 0, 0, time.UTC)
+	store := newBrowseStore()
+	store.now = func() time.Time { return now }
+	job, err := store.create(10, "repo1", "latest", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.pick(10)
+	now = now.Add(browseRunningTTL + time.Second)
+	result := wire.BackupBrowseResult{Entries: []wire.BackupBrowseEntry{{Name: "etc", Type: "dir"}}}
+	if !store.finish(10, job.ID, result) {
+		t.Fatal("late result was rejected")
+	}
+	got, ok := store.get(10, job.ID)
+	if !ok || got.State != "done" || got.Result == nil || got.Result.Entries[0].Name != "etc" {
+		t.Fatalf("stored late result = %#v", got)
+	}
+}
+
+func TestBrowseStoreCreateReuse(t *testing.T) {
+	store := newBrowseStore()
+	job, err := store.create(10, "repo1", "latest", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.create(10, "repo1", "latest", "/")
+	if err != nil || queued.ID != job.ID {
+		t.Fatalf("queued reuse = %#v, %v", queued, err)
+	}
+	store.pick(10)
+	running, err := store.create(10, "repo1", "latest", "/")
+	if err != nil || running.ID != job.ID {
+		t.Fatalf("running reuse = %#v, %v", running, err)
+	}
+	if !store.finish(10, job.ID, wire.BackupBrowseResult{}) {
+		t.Fatal("finish failed")
+	}
+	done, err := store.create(10, "repo1", "latest", "/")
+	if err != nil || done.ID != job.ID {
+		t.Fatalf("done reuse = %#v, %v", done, err)
+	}
+	different, err := store.create(10, "repo1", "latest", "/etc")
+	if err != nil || different.ID == job.ID {
+		t.Fatalf("different create = %#v, %v", different, err)
+	}
+}
+
+func TestBrowseStoreCreatePrefersDoneJob(t *testing.T) {
+	now := time.Date(2026, 7, 17, 8, 0, 0, 0, time.UTC)
+	store := newBrowseStore()
+	store.now = func() time.Time { return now }
+	done, err := store.create(10, "repo1", "latest", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.pick(10)
+	if !store.finish(10, done.ID, wire.BackupBrowseResult{}) {
+		t.Fatal("finish failed")
+	}
+	now = now.Add(time.Second)
+	running, err := store.create(10, "repo1", "latest", "/other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.pick(10)
+	store.mu.Lock()
+	store.jobs[running.ID].Path = "/"
+	store.mu.Unlock()
+	reused, err := store.create(10, "repo1", "latest", "/")
+	if err != nil || reused.ID != done.ID {
+		t.Fatalf("preferred reuse = %#v, %v, want done job %q", reused, err, done.ID)
+	}
+}
+
+func TestBrowseStoreDoesNotReuseFailedJob(t *testing.T) {
+	store := newBrowseStore()
+	job, err := store.create(10, "repo1", "latest", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.pick(10)
+	if !store.finish(10, job.ID, wire.BackupBrowseResult{ErrorKind: "failed", Error: "browse failed"}) {
+		t.Fatal("finish failed")
+	}
+	retry, err := store.create(10, "repo1", "latest", "/")
+	if err != nil || retry.ID == job.ID {
+		t.Fatalf("failed retry = %#v, %v", retry, err)
+	}
+}
+
 func TestBrowseStoreTimeoutsAndCap(t *testing.T) {
 	now := time.Date(2026, 7, 17, 8, 0, 0, 0, time.UTC)
 	store := newBrowseStore()
@@ -129,7 +221,7 @@ func TestBrowseStoreTimeoutsAndCap(t *testing.T) {
 	store = newBrowseStore()
 	store.now = func() time.Time { return now }
 	for i := 0; i < browseHostCap; i++ {
-		if _, err := store.create(2, "repo", "latest", "/"); err != nil {
+		if _, err := store.create(2, "repo", "latest", fmt.Sprintf("/%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -186,7 +278,7 @@ func TestCreateBackupBrowseHandlerValidationRepoAndCap(t *testing.T) {
 
 	store := newBrowseStore()
 	for i := 0; i < browseHostCap; i++ {
-		if _, err := store.create(1, "known", "latest", "/"); err != nil {
+		if _, err := store.create(1, "known", "latest", fmt.Sprintf("/%d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}

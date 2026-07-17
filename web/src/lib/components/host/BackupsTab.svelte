@@ -197,6 +197,9 @@
   let browseCache = $state(new Map<string, BackupBrowseResult>());
   let browseGen = 0;
   let browseAC: AbortController | null = null;
+  const backupBrowseClientBudgetMs = 390_000;
+  let browseElapsedS = $state(0);
+  let browseElapsedTimer: ReturnType<typeof setInterval> | null = null;
   let browseCopyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let browseCopyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -481,6 +484,7 @@
     if (copyTimer) clearTimeout(copyTimer);
     if (agentPermsCopyTimer) clearTimeout(agentPermsCopyTimer);
     if (browseCopyTimer) clearTimeout(browseCopyTimer);
+    if (browseElapsedTimer) clearInterval(browseElapsedTimer);
     backupsAC?.abort();
     browseAC?.abort();
   });
@@ -553,6 +557,8 @@
     browseGen++;
     browseAC?.abort();
     browseAC = null;
+    if (browseElapsedTimer) clearInterval(browseElapsedTimer);
+    browseElapsedTimer = null;
     browseOpen = false;
     browsePath = '/';
     browseState = 'idle';
@@ -576,6 +582,12 @@
       crumbs.push({ label: segment, path: current });
     }
     return crumbs;
+  }
+
+  function browseElapsedText(): string {
+    const minutes = Math.floor(browseElapsedS / 60);
+    const seconds = browseElapsedS % 60;
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   }
 
   function browseMaxBytes(scope: ScopeGroup): number {
@@ -616,14 +628,20 @@
     browseResult = null;
     browseState = 'loading';
     const startedAt = Date.now();
+    browseElapsedS = 0;
+    if (browseElapsedTimer) clearInterval(browseElapsedTimer);
+    const elapsedTimer = setInterval(() => {
+      browseElapsedS = Math.floor((Date.now() - startedAt) / 1000);
+    }, 1000);
+    browseElapsedTimer = elapsedTimer;
     let hardTimedOut = false;
     const hardTimer = setTimeout(() => {
       hardTimedOut = true;
       ac.abort();
-    }, 120_000);
+    }, backupBrowseClientBudgetMs);
     try {
       const started = await api.backupBrowseStart(hostId, { repo: selectedRepo, snapshot: selectedSnapshot.id, path }, { signal: ac.signal });
-      while (Date.now() - startedAt < 120_000) {
+      while (Date.now() - startedAt < backupBrowseClientBudgetMs) {
         if (gen !== browseGen) return;
         const job = await api.backupBrowseJob(hostId, started.job_id, { signal: ac.signal });
         if (job.status === 'done' || job.status === 'failed') {
@@ -652,6 +670,8 @@
       browseState = 'error';
     } finally {
       clearTimeout(hardTimer);
+      clearInterval(elapsedTimer);
+      if (browseElapsedTimer === elapsedTimer) browseElapsedTimer = null;
     }
   }
 
@@ -1180,12 +1200,17 @@
                 {#if browseState === 'loading'}
                   <div class="px-3 py-3">
                     <div class="h-8 rounded shimmer"></div>
-                    <div class="mt-2 text-xs text-zinc-500">Asking the agent — it picks up work on its next check-in.</div>
+                    <div class="mt-2 flex items-center justify-between gap-3 text-xs text-zinc-500">
+                      <span>Asking the agent - it picks up work on its next check-in.</span>
+                      <span class="numeric shrink-0">{browseElapsedText()}</span>
+                    </div>
+                    <div class="mt-1 text-xs text-zinc-500">Large repositories over tunnels can take a few minutes.</div>
                   </div>
                 {:else if browseState === 'error'}
                   <div class="px-3 py-3">
                     {#if browseResult?.error_kind === 'busy'}
-                      <div class="text-xs text-amber-300">A backup or check is running on this host — try again when it finishes.</div>
+                      <div class="text-xs text-amber-300">{browseResult?.error ?? 'Backup browse is busy.'}</div>
+                      <div class="mt-1 text-xs text-zinc-500">A backup or check is holding the repository lock; try again after it finishes.</div>
                       <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
                     {:else if browseResult?.error_kind === 'insufficient_privilege'}
                       <div class="text-xs text-amber-300">{browseErrorText()}</div>
@@ -1196,7 +1221,13 @@
                         </button>
                       </div>
                       <pre class="mt-1 text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre select-text text-zinc-200">{browseFallbackCommand()}</pre>
-                    {:else if browseResult?.error_kind === 'agent_unreachable' || browseResult?.error_kind === 'timed_out'}
+                    {:else if browseResult?.error_kind === 'timed_out'}
+                      <div class="text-xs text-amber-300">
+                        <div>{browseResult?.error}</div>
+                        <div class="mt-1">Retry is usually faster: the agent keeps a warm cache, and a finished result may already be waiting.</div>
+                      </div>
+                      <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
+                    {:else if browseResult?.error_kind === 'agent_unreachable'}
                       <div class="text-xs text-rose-300">{browseResult?.error}</div>
                       <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
                     {:else}

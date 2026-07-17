@@ -535,6 +535,8 @@ Overlapping runs are safe: `backup run`, `backup check` and `backup restore` sha
 
 The backup, check and restore units all deliberately execute the root/SYSTEM-owned agent copy (`/usr/local/bin/sm-agent`; Windows: `C:\Program Files\ServerMonitor\sm-agent.exe`) rather than directly executing the resident service's writable copy. A successful resident self-update now writes the server signature beside that binary. On Linux, a root-owned systemd path unit verifies the signature against an installer-pinned Ed25519 public key and then atomically promotes only a newer signed binary; a six-hour timer is the fallback reconciler. Windows performs the same independent verification from a SYSTEM scheduled task every five minutes. This keeps the privileged copy current without making the low-privilege service an authority over privileged code. Existing pre-0.3.7 installs need one installer rerun to bootstrap the pin and reconciliation job; after that, normal agent self-upgrades synchronize both copies automatically.
 
+Privileged-agent drift metrics and the `stale_agent` and `agent_perms` states apply only to hosts with backups configured.
+
 Backups tab banner states:
 
 - **not configured** — the status file doesn't exist yet. Normal before the first run finishes; otherwise check that the timer is enabled (`systemctl list-timers sm-backup.timer`).

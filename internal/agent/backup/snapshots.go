@@ -202,6 +202,8 @@ func ClassifyBrowseError(err error) (string, string) {
 	message := strings.TrimSpace(err.Error())
 	lower := strings.ToLower(message)
 	switch {
+	case errors.Is(err, context.DeadlineExceeded), strings.Contains(lower, "context deadline exceeded"):
+		return "timed_out", "snapshot browse timed out after 5m; retrying is usually faster because the restic cache is already warm"
 	case errors.Is(err, os.ErrPermission), strings.Contains(lower, "permission denied"), strings.Contains(lower, "access is denied"):
 		return "insufficient_privilege", message
 	case strings.Contains(lower, "holds the tunnel lock"):

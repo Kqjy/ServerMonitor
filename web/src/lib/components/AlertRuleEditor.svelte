@@ -43,6 +43,8 @@
     comparator: string;
     threshold: number;
     severity: string;
+    agg?: string;
+    windowS?: number;
   };
 
   const suggestedRules: RulePreset[] = [
@@ -50,7 +52,7 @@
     { label: 'Backup failed', name: 'Backup failed', metric: 'backup_last_run_ok', comparator: '<', threshold: 1, severity: 'critical' },
     { label: 'Check failing', name: 'Backup check failing', metric: 'backup_check_ok', comparator: '<', threshold: 1, severity: 'warning' },
     { label: 'Check overdue', name: 'Backup check overdue', metric: 'backup_check_age_s', comparator: '>', threshold: 3456000, severity: 'warning' },
-    { label: 'Backup agent outdated', name: 'Backup agent outdated', metric: 'backup_agent_stale', comparator: '>', threshold: 0, severity: 'warning' }
+    { label: 'Backup agent outdated', name: 'Backup agent outdated', metric: 'backup_agent_stale', comparator: '>', threshold: 0, severity: 'warning', agg: 'last', windowS: 120 }
   ];
 
   function pairsToText(pairs: Record<string, string> | undefined | null): string {
@@ -176,8 +178,8 @@
     comparator = preset.comparator;
     threshold = preset.threshold;
     severity = preset.severity;
-    agg = 'last';
-    windowS = 60;
+    agg = preset.agg ?? 'last';
+    windowS = preset.windowS ?? 60;
     forS = 60;
     cooldownS = 600;
     labelText = '';
