@@ -11,6 +11,29 @@ import (
 	"strings"
 )
 
+var DefaultLinuxExcludes = []string{
+	"**/.cache",
+	"/var/lib/servermonitor",
+	"/var/lib/docker/overlay2",
+	"/var/lib/docker/overlay",
+	"/var/lib/docker/image",
+	"/var/lib/docker/containers",
+	"/var/lib/docker/buildkit",
+	"/var/lib/docker/tmp",
+	"/var/lib/docker/plugins",
+	"/var/lib/docker/network",
+	"/var/lib/docker/runtimes",
+	"/var/lib/docker/aufs",
+	"/var/lib/docker/btrfs",
+	"/var/lib/docker/devicemapper",
+	"/var/lib/docker/fuse-overlayfs",
+	"/var/lib/docker/vfs",
+	"/var/lib/docker/zfs",
+	"/var/lib/containerd",
+}
+
+const dockerVolumesPath = "/var/lib/docker/volumes"
+
 type ProvisionResult struct {
 	ConfigPath   string
 	KeyGenerated bool
@@ -58,7 +81,10 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 		return res, err
 	}
 
-	toml, err := renderBackupTOML(getenv, keyPath, credsPath, haveCreds)
+	toml, err := renderBackupTOML(getenv, keyPath, credsPath, haveCreds, func(path string) error {
+		_, statErr := os.Stat(path)
+		return statErr
+	})
 	if err != nil {
 		return res, err
 	}
@@ -124,12 +150,23 @@ func writeCredsFile(getenv func(string) string, path string) (bool, error) {
 	return true, nil
 }
 
-func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, haveCreds bool) (string, error) {
+func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, haveCreds bool, stat func(string) error) (string, error) {
 	repos := splitCSV(getenv("SM_BACKUP_REPOS"))
 	names := splitCSV(getenv("SM_BACKUP_REPO_NAMES"))
-	paths := splitCSV(getenv("SM_BACKUP_PATHS"))
-	if len(paths) == 0 {
+	pathsValue := strings.TrimSpace(getenv("SM_BACKUP_PATHS"))
+	paths := splitCSV(pathsValue)
+	if pathsValue == "" {
 		paths = []string{"/etc", "/home", "/root", "/var/lib"}
+		if stat(HostRootFromEnv(getenv)+dockerVolumesPath) == nil {
+			paths = append(paths, dockerVolumesPath)
+		}
+	}
+	excludes := resolveExcludes(getenv)
+	oneFileSystem := true
+	if value := strings.TrimSpace(getenv("SM_BACKUP_ONE_FILE_SYSTEM")); value != "" {
+		if parsed, parseErr := strconv.ParseBool(value); parseErr == nil {
+			oneFileSystem = parsed
+		}
 	}
 	pruneMode := strings.TrimSpace(getenv("SM_BACKUP_PRUNE_MODE"))
 	if pruneMode == "" {
@@ -147,8 +184,15 @@ func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, hav
 		fmt.Fprintf(&b, "%q", path)
 	}
 	b.WriteString("]\n")
-	b.WriteString("excludes = [\"**/.cache\", \"/var/lib/docker\", \"/var/lib/servermonitor\"]\n")
-	b.WriteString("one_file_system = true\n")
+	b.WriteString("excludes = [")
+	for i, exclude := range excludes {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q", exclude)
+	}
+	b.WriteString("]\n")
+	fmt.Fprintf(&b, "one_file_system = %t\n", oneFileSystem)
 	fmt.Fprintf(&b, "prune_mode = %q\n", pruneMode)
 	writeScheduleTOML(&b, getenv)
 	b.WriteString("\n[retention]\ndaily = 7\nweekly = 4\nmonthly = 6\n")
@@ -204,6 +248,20 @@ func renderBackupTOML(getenv func(string) string, keyPath, credsPath string, hav
 		}
 	}
 	return b.String(), nil
+}
+
+func resolveExcludes(getenv func(string) string) []string {
+	value := strings.TrimSpace(getenv("SM_BACKUP_EXCLUDES"))
+	if value == "" {
+		return append([]string(nil), DefaultLinuxExcludes...)
+	}
+	if strings.EqualFold(value, "none") {
+		return []string{}
+	}
+	if strings.HasPrefix(value, "+") {
+		return append(append([]string(nil), DefaultLinuxExcludes...), splitCSV(value[1:])...)
+	}
+	return splitCSV(value)
 }
 
 func parseTunnelRepository(spec string) (string, string, error) {
@@ -313,19 +371,61 @@ func RenderRecoveryKit(configPath string) (string, error) {
 		case repo.URL != "":
 			fmt.Fprintf(&b, "  - %s -> %s\n", repo.Name, repo.URL)
 		case repo.TunnelName != "":
-			fmt.Fprintf(&b, "  - %s -> tunnel:%s\n", repo.Name, repo.TunnelName)
+			if repo.TunnelNode != "" {
+				endpoint := "unknown"
+				if cfg.Tunnel != nil {
+					if node := cfg.Tunnel.Node(repo.TunnelNode); node != nil {
+						endpoint = node.Endpoint
+					}
+				}
+				fmt.Fprintf(&b, "  - %s -> tunnel:%s/%s on storage node %s (endpoint %s)\n", repo.Name, repo.TunnelNode, repo.TunnelName, repo.TunnelNode, endpoint)
+			} else {
+				endpoint := "unknown"
+				if cfg.Tunnel != nil && cfg.Tunnel.Endpoint != "" {
+					endpoint = cfg.Tunnel.Endpoint
+				}
+				fmt.Fprintf(&b, "  - %s -> tunnel:%s on the monitoring server (endpoint %s)\n", repo.Name, repo.TunnelName, endpoint)
+			}
 		}
 	}
 
 	credsPath := filepath.Join(filepath.Dir(configPath), "repo-credentials.env")
-	if _, err := os.Stat(credsPath); err == nil {
-		fmt.Fprintf(&b, "\nEndpoint credentials (S3/B2/REST) are at %s; you also need those to reach the destination.\n", credsPath)
+	if creds, readErr := os.ReadFile(credsPath); readErr == nil {
+		fmt.Fprintf(&b, "\nEndpoint credentials (KEEP THIS SECRET AND OFFLINE; contents of %s):\n\n    %s\n", credsPath, strings.ReplaceAll(strings.TrimRight(string(creds), "\n"), "\n", "\n    "))
+	} else if !os.IsNotExist(readErr) {
+		fmt.Fprintf(&b, "\nEndpoint credentials file %s could not be read: %v\n", credsPath, readErr)
 	}
 
-	b.WriteString("\nRestore from anywhere with restic and the password above:\n")
-	b.WriteString("  export RESTIC_PASSWORD='<the password above>'\n")
-	b.WriteString("  restic -r <repo url> snapshots\n")
-	b.WriteString("  restic -r <repo url> restore latest --target /some/empty/dir\n")
+	b.WriteString("\nPer-repository restore instructions:\n")
+	for _, repo := range cfg.Repos {
+		fmt.Fprintf(&b, "\n%s:\n", repo.Name)
+		if repo.URL != "" {
+			b.WriteString("  export RESTIC_PASSWORD='<the password above>'\n")
+			fmt.Fprintf(&b, "  restic -r %s snapshots\n", repo.URL)
+			fmt.Fprintf(&b, "  restic -r %s restore latest --target /some/empty/dir\n", repo.URL)
+			continue
+		}
+		location := "the monitoring server"
+		endpoint := "unknown"
+		if repo.TunnelNode != "" {
+			location = "storage node " + repo.TunnelNode
+			if cfg.Tunnel != nil {
+				if node := cfg.Tunnel.Node(repo.TunnelNode); node != nil {
+					endpoint = node.Endpoint
+				}
+			}
+		} else if cfg.Tunnel != nil {
+			endpoint = cfg.Tunnel.Endpoint
+		}
+		fmt.Fprintf(&b, "  1. The data physically lives on %s at endpoint %s.\n", location, endpoint)
+		fmt.Fprintf(&b, "  2. The endpoint exists only inside the ServerMonitor WireGuard tunnel. From this host, or any host holding this backup.toml and tunnel.key, run:\n     sm-agent backup proxy --config %s\n     The command brings the tunnel up and prints a local RESTIC_REPOSITORY URL.\n", configPath)
+		b.WriteString("  3. Export RESTIC_REST_USERNAME and RESTIC_REST_PASSWORD from the endpoint credentials above, export RESTIC_PASSWORD='<the password above>', then run:\n     restic -r \"$RESTIC_REPOSITORY\" snapshots\n     restic -r \"$RESTIC_REPOSITORY\" restore latest --target /some/empty/dir\n")
+		fmt.Fprintf(&b, "  4. If the original host is gone, install sm-agent on a recovery machine, register it with the same monitoring server, recreate backup.toml with tunnel_name = %q", repo.TunnelName)
+		if repo.TunnelNode != "" {
+			fmt.Fprintf(&b, " and tunnel_node = %q", repo.TunnelNode)
+		}
+		b.WriteString(", run sm-agent backup tunnel-enroll, then run the proxy command above.\n")
+	}
 	return b.String(), nil
 }
 

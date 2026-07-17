@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='de0b4c2e1ba330ce398899c85c38c09821f67cfcd9f52c77653385dbc6c3d727'
+CANONICAL_INSTALLER_SHA256='58739e6833a59d43fe4aa61e0e986b8211b8f76c367dbfa2b3ac8bfd398cacdc'
 TOKEN="${SM_TOKEN:-}"
 DOWNLOADED_SERVER_PUBKEY=""
 INTERVAL="${SM_INTERVAL:-10}"
@@ -24,6 +24,8 @@ esac
 BACKUP_REPOS="${SM_BACKUP_REPOS:-}"
 BACKUP_REPO_NAMES="${SM_BACKUP_REPO_NAMES:-}"
 BACKUP_PATHS="${SM_BACKUP_PATHS:-}"
+BACKUP_EXCLUDES="${SM_BACKUP_EXCLUDES:-}"
+BACKUP_ONE_FILE_SYSTEM="${SM_BACKUP_ONE_FILE_SYSTEM:-}"
 BACKUP_TIME="${SM_BACKUP_TIME:-02:30}"
 BACKUP_PRUNE_MODE="${SM_BACKUP_PRUNE_MODE:-host}"
 BACKUP_S3_REGION="${SM_BACKUP_S3_REGION:-}"
@@ -34,6 +36,8 @@ BACKUP_S3_SESSION_TOKEN="${SM_BACKUP_S3_SESSION_TOKEN:-}"
 BACKUP_REST_USERNAME="${SM_BACKUP_REST_USERNAME:-}"
 BACKUP_REST_PASSWORD="${SM_BACKUP_REST_PASSWORD:-}"
 RESTIC_VERSION="0.19.0"
+DEFAULT_BACKUP_EXCLUDES_CSV='**/.cache,/var/lib/servermonitor,/var/lib/docker/overlay2,/var/lib/docker/overlay,/var/lib/docker/image,/var/lib/docker/containers,/var/lib/docker/buildkit,/var/lib/docker/tmp,/var/lib/docker/plugins,/var/lib/docker/network,/var/lib/docker/runtimes,/var/lib/docker/aufs,/var/lib/docker/btrfs,/var/lib/docker/devicemapper,/var/lib/docker/fuse-overlayfs,/var/lib/docker/vfs,/var/lib/docker/zfs,/var/lib/containerd'
+DEFAULT_BACKUP_EXCLUDES_TOML='excludes = ["**/.cache", "/var/lib/servermonitor", "/var/lib/docker/overlay2", "/var/lib/docker/overlay", "/var/lib/docker/image", "/var/lib/docker/containers", "/var/lib/docker/buildkit", "/var/lib/docker/tmp", "/var/lib/docker/plugins", "/var/lib/docker/network", "/var/lib/docker/runtimes", "/var/lib/docker/aufs", "/var/lib/docker/btrfs", "/var/lib/docker/devicemapper", "/var/lib/docker/fuse-overlayfs", "/var/lib/docker/vfs", "/var/lib/docker/zfs", "/var/lib/containerd"]'
 if [ "$ENABLE_ALL" = "1" ]; then
     ENABLE_SMART=1
     ENABLE_DOCKER=1
@@ -78,6 +82,10 @@ refresh_agent_binaries() {
         install -o root -g root -m 0755 "$TMP/sm-agent" /usr/local/bin/sm-agent
         install -o sm-agent -g sm-agent -m 0755 "$TMP/sm-agent" /opt/servermonitor/sm-agent
         return 0
+    fi
+    if [ -f /usr/local/bin/sm-agent ]; then
+        chown root:root /usr/local/bin/sm-agent
+        chmod 0755 /usr/local/bin/sm-agent
     fi
     local platform token old_version new_version
     local -a curl_opts
@@ -493,11 +501,31 @@ backup_write_env_file() {
 }
 
 backup_write_toml() {
-    local tmp i name url tunnel_name tunnel_node first item
-    local -a repo_arr name_arr path_arr
+    local tmp i name url tunnel_name tunnel_node first item path_csv excludes_value one_file_system
+    local -a repo_arr name_arr path_arr exclude_arr default_exclude_arr appended_exclude_arr
     IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
     IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
-    IFS=',' read -ra path_arr <<< "${BACKUP_PATHS:-/etc,/home,/root,/var/lib}"
+    path_csv="$BACKUP_PATHS"
+    if [ -z "$path_csv" ]; then
+        path_csv="/etc,/home,/root,/var/lib"
+        [ -d /var/lib/docker/volumes ] && path_csv="$path_csv,/var/lib/docker/volumes"
+    fi
+    IFS=',' read -ra path_arr <<< "$path_csv"
+    excludes_value="$(backup_trim "$BACKUP_EXCLUDES")"
+    IFS=',' read -ra default_exclude_arr <<< "$DEFAULT_BACKUP_EXCLUDES_CSV"
+    case "$(printf '%s' "$excludes_value" | tr '[:upper:]' '[:lower:]')" in
+        '') exclude_arr=("${default_exclude_arr[@]}") ;;
+        none) exclude_arr=() ;;
+        +*)
+            IFS=',' read -ra appended_exclude_arr <<< "${excludes_value#+}"
+            exclude_arr=("${default_exclude_arr[@]}" ${appended_exclude_arr[@]+"${appended_exclude_arr[@]}"})
+            ;;
+        *) IFS=',' read -ra exclude_arr <<< "$excludes_value" ;;
+    esac
+    case "$(printf '%s' "$(backup_trim "$BACKUP_ONE_FILE_SYSTEM")" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no) one_file_system=false ;;
+        *) one_file_system=true ;;
+    esac
     tmp="$(mktemp /etc/servermonitor-backup/backup.toml.XXXXXX)"
     {
         echo "status_path = \"/var/lib/servermonitor/backup-status.json\""
@@ -511,8 +539,20 @@ backup_write_toml() {
             printf '"%s"' "$(backup_toml_escape "$item")"
         done
         printf ']\n'
-        echo "excludes = [\"**/.cache\", \"/var/lib/docker\", \"/var/lib/servermonitor\"]"
-        echo "one_file_system = true"
+        if [ -z "$excludes_value" ]; then
+            echo "$DEFAULT_BACKUP_EXCLUDES_TOML"
+        else
+            first=1
+            printf 'excludes = ['
+            for item in ${exclude_arr[@]+"${exclude_arr[@]}"}; do
+                item="$(backup_trim "$item")"
+                [ -z "$item" ] && continue
+                if [ "$first" = 1 ]; then first=0; else printf ', '; fi
+                printf '"%s"' "$(backup_toml_escape "$item")"
+            done
+            printf ']\n'
+        fi
+        printf 'one_file_system = %s\n' "$one_file_system"
         printf 'prune_mode = "%s"\n' "$BACKUP_PRUNE_MODE"
         echo ""
         echo "[retention]"
@@ -949,6 +989,28 @@ for grp in "${WANTED_GROUPS[@]}"; do
     fi
 done
 usermod -G "$(IFS=,; printf '%s' "${PRESENT_GROUPS[*]:-}")" sm-agent
+
+SMART_UDEV_RULES=/etc/udev/rules.d/90-servermonitor-smart.rules
+if [ "$ENABLE_SMART" = "1" ]; then
+    cat > "$SMART_UDEV_RULES" <<'RULES'
+KERNEL=="megaraid_sas_ioctl_node", GROUP="disk", MODE="0660"
+KERNEL=="megadev[0-9]*", GROUP="disk", MODE="0660"
+KERNEL=="twa[0-9]*", GROUP="disk", MODE="0660"
+KERNEL=="twl[0-9]*", GROUP="disk", MODE="0660"
+KERNEL=="twe[0-9]*", GROUP="disk", MODE="0660"
+KERNEL=="aac[0-9]*", GROUP="disk", MODE="0660"
+RULES
+    chmod 0644 "$SMART_UDEV_RULES"
+    udevadm control --reload >/dev/null 2>&1 || true
+    for node in /dev/megaraid_sas_ioctl_node /dev/megadev0 /dev/twa0 /dev/twl0 /dev/twe0 /dev/aac0; do
+        if [ -e "$node" ]; then
+            chgrp disk "$node" 2>/dev/null || true
+            chmod 0660 "$node" 2>/dev/null || true
+        fi
+    done
+else
+    rm -f "$SMART_UDEV_RULES"
+fi
 
 install -o sm-agent -g sm-agent -m 0700 -d /etc/servermonitor
 install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor

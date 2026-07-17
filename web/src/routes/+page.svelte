@@ -1,16 +1,17 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { api, type Host, type BatchSeriesResp } from '$lib/api';
-  import { statusFor, timeAgo, pct, severityClass } from '$lib/format';
+  import { statusFor, timeAgo, pct, severityClass, bytes } from '$lib/format';
   import { subscribeHosts, subscribeAlerts } from '$lib/sse';
   import StatusDot from '$lib/components/StatusDot.svelte';
 
-  type Usage = { cpu?: number; mem?: number; disk?: number };
+  type Usage = { cpu?: number; mem?: number; disk?: number; diskUsed?: number; diskTotal?: number; diskOverall?: boolean };
 
   let hosts = $state<Host[]>([]);
   let usage = $state<Record<number, Usage>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let storageNodeIds = $state<Set<number>>(new Set());
   let query = $state('');
   const visible = $derived(
     hosts
@@ -25,15 +26,18 @@
   async function loadUsage(targets: Host[]) {
     if (targets.length === 0) return;
     const ids = targets.map((h) => h.id);
-    const [cpu, mem, disk] = await Promise.all([
+    const [cpu, mem, disk, overallPct, overallUsed, overallTotal] = await Promise.all([
       api.seriesBatch({ hosts: ids, metric: 'cpu_total_pct', from: '-15m', step: 30 }).catch(() => null),
       api.seriesBatch({ hosts: ids, metric: 'mem_used_pct', from: '-15m', step: 30 }).catch(() => null),
-      api.seriesBatch({ hosts: ids, metric: 'fs_used_pct', from: '-15m', step: 30, agg: 'max' }).catch(() => null)
+      api.seriesBatch({ hosts: ids, metric: 'fs_used_pct', from: '-15m', step: 30, agg: 'max' }).catch(() => null),
+      api.seriesBatch({ hosts: ids, metric: 'fs_overall_used_pct', from: '-15m', step: 30 }).catch(() => null),
+      api.seriesBatch({ hosts: ids, metric: 'fs_overall_used', from: '-15m', step: 30 }).catch(() => null),
+      api.seriesBatch({ hosts: ids, metric: 'fs_overall_total', from: '-15m', step: 30 }).catch(() => null)
     ]);
-    if (!cpu && !mem && !disk) return;
+    if (!cpu && !mem && !disk && !overallPct && !overallUsed && !overallTotal) return;
     const next: Record<number, Usage> = { ...usage };
     for (const h of targets) next[h.id] = { ...(next[h.id] ?? {}) };
-    const apply = (resp: BatchSeriesResp | null, key: keyof Usage) => {
+    const apply = (resp: BatchSeriesResp | null, key: 'cpu' | 'mem') => {
       if (!resp) return;
       for (const h of targets) {
         if (next[h.id][key] !== undefined) continue;
@@ -44,14 +48,29 @@
     };
     apply(cpu, 'cpu');
     apply(mem, 'mem');
-    apply(disk, 'disk');
+    for (const h of targets) {
+      const overall = overallPct?.hosts[String(h.id)]?.points.at(-1);
+      const legacy = disk?.hosts[String(h.id)]?.points.at(-1);
+      const used = overallUsed?.hosts[String(h.id)]?.points.at(-1);
+      const total = overallTotal?.hosts[String(h.id)]?.points.at(-1);
+      if (overall) {
+        next[h.id].disk = overall.v;
+        next[h.id].diskOverall = true;
+      } else if (legacy) {
+        next[h.id].disk = legacy.v;
+        next[h.id].diskOverall = false;
+      }
+      if (used) next[h.id].diskUsed = used.v;
+      if (total) next[h.id].diskTotal = total.v;
+    }
     usage = next;
   }
 
   async function refreshHosts() {
     try {
-      const list = await api.hosts();
+      const [list, nodeResp] = await Promise.all([api.hosts(), api.backupNodes().catch(() => null)]);
       hosts = list;
+      if (nodeResp) storageNodeIds = new Set(nodeResp.nodes.map((n) => n.host_id));
       const fresh = list.filter((h) => usage[h.id] === undefined);
       if (fresh.length > 0) void loadUsage(fresh);
       if (!pointsUnsub) subscribe();
@@ -60,8 +79,9 @@
 
   async function bootstrap() {
     try {
-      const list = await api.hosts();
+      const [list, nodeResp] = await Promise.all([api.hosts(), api.backupNodes().catch(() => null)]);
       hosts = list;
+      if (nodeResp) storageNodeIds = new Set(nodeResp.nodes.map((n) => n.host_id));
       error = null;
       await loadUsage(list);
       subscribe();
@@ -74,15 +94,20 @@
 
   function subscribe() {
     pointsUnsub?.();
-    pointsUnsub = subscribeHosts(['cpu_total_pct', 'mem_used_pct', 'fs_used_pct'], (hostId, points) => {
+    pointsUnsub = subscribeHosts(['cpu_total_pct', 'mem_used_pct', 'fs_used_pct', 'fs_overall_used_pct', 'fs_overall_used', 'fs_overall_total'], (hostId, points) => {
       const cur: Usage = { ...(usage[hostId] ?? {}) };
       let diskMax: number | undefined;
       for (const p of points) {
         if (p.metric === 'cpu_total_pct') cur.cpu = p.v;
         else if (p.metric === 'mem_used_pct') cur.mem = p.v;
-        else if (p.metric === 'fs_used_pct') diskMax = diskMax === undefined ? p.v : Math.max(diskMax, p.v);
+        else if (p.metric === 'fs_overall_used_pct') {
+          cur.disk = p.v;
+          cur.diskOverall = true;
+        } else if (p.metric === 'fs_overall_used') cur.diskUsed = p.v;
+        else if (p.metric === 'fs_overall_total') cur.diskTotal = p.v;
+        else if (p.metric === 'fs_used_pct' && !cur.diskOverall) diskMax = diskMax === undefined ? p.v : Math.max(diskMax, p.v);
       }
-      if (diskMax !== undefined) cur.disk = diskMax;
+      if (diskMax !== undefined && !cur.diskOverall) cur.disk = diskMax;
       usage[hostId] = cur;
     });
   }
@@ -113,8 +138,8 @@
   });
 </script>
 
-{#snippet usageBar(label: string, value: number | undefined)}
-  <div class="flex items-center gap-2.5">
+{#snippet usageBar(label: string, value: number | undefined, title?: string)}
+  <div class="flex items-center gap-2.5" {title}>
     <span class="w-9 shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{label}</span>
     <div class="flex-1 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
       {#if value !== undefined}
@@ -185,6 +210,9 @@
         {@const s = statusFor(h.last_seen, h.sample_interval_s || 10)}
         {@const firing = h.firing_alerts ?? 0}
         {@const u = usage[h.id] ?? {}}
+        {@const backupState = h.collector_status?.backup?.state}
+        {@const backupMessage = h.collector_status?.backup?.message}
+        {@const showBackupAgentBadge = !storageNodeIds.has(h.id)}
         <a href={`/hosts/${h.id}`}
            class="group rounded-lg border border-zinc-800 hover:border-zinc-700 bg-zinc-900/40 hover:bg-zinc-900/70 p-4 transition-colors block">
           <div class="flex items-start justify-between gap-3">
@@ -196,6 +224,17 @@
                   <span class="shrink-0 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider tabular-nums {severityClass(h.firing_severity ?? '', 'chip')}">
                     <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
                     {firing} {firing === 1 ? 'alert' : 'alerts'}
+                  </span>
+                {/if}
+                {#if showBackupAgentBadge && backupState === 'stale_agent'}
+                  <span class="shrink-0 inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-300 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider tabular-nums" title={backupMessage}>
+                    <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+                    stale agent
+                  </span>
+                {:else if showBackupAgentBadge && backupState === 'agent_perms'}
+                  <span class="shrink-0 inline-flex items-center gap-1 rounded-full border border-rose-500/40 bg-rose-500/10 text-rose-300 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider tabular-nums" title={backupMessage}>
+                    <span class="h-1.5 w-1.5 rounded-full bg-current"></span>
+                    backup blocked
                   </span>
                 {/if}
                 {#if h.update_available}
@@ -233,7 +272,7 @@
           <div class="mt-4 space-y-1.5">
             {@render usageBar('CPU', u.cpu)}
             {@render usageBar('MEM', u.mem)}
-            {@render usageBar('DISK', u.disk)}
+            {@render usageBar('DISK', u.disk, u.diskOverall && u.diskUsed !== undefined && u.diskTotal !== undefined ? `${bytes(u.diskUsed)} of ${bytes(u.diskTotal)} used across local filesystems` : u.disk !== undefined ? `fullest mount at ${u.disk.toFixed(0)}%` : undefined)}
           </div>
         </a>
       {/each}

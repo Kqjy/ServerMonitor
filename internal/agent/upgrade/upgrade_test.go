@@ -2,6 +2,8 @@ package upgrade
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"servermonitor/pkg/agentsig"
+	"servermonitor/pkg/version"
 )
 
 func TestVerifyDirSafeAcceptsNormalDir(t *testing.T) {
@@ -161,5 +164,88 @@ func TestManagedEnvUnparseableTreatedAsManaged(t *testing.T) {
 	}
 	if !strings.Contains(reason, "yes") {
 		t.Fatalf("expected reason to surface the offending value, got %q", reason)
+	}
+}
+
+func writePrivilegedSyncFixture(t *testing.T, targetMode os.FileMode) (string, string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "sm-agent")
+	source := filepath.Join(dir, "resident-agent")
+	signature := filepath.Join(dir, "resident-agent.sig")
+	pubkey := filepath.Join(dir, "agent-signing.pub")
+	if err := os.WriteFile(target, bytes.Repeat([]byte{'t'}, 2048), targetMode); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	body := bytes.Repeat([]byte{'s'}, 2048)
+	if err := os.WriteFile(source, body, 0o755); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	digest, _, err := agentsig.DigestReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("digest source: %v", err)
+	}
+	signer, err := agentsig.NewSigner()
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	if err := os.WriteFile(signature, []byte(signer.SignDigest(digest)), 0o600); err != nil {
+		t.Fatalf("write signature: %v", err)
+	}
+	if err := os.WriteFile(pubkey, []byte(signer.PublicKeyHex()), 0o600); err != nil {
+		t.Fatalf("write pubkey: %v", err)
+	}
+	return target, source, signature, pubkey
+}
+
+func TestSyncPrivilegedPromotionMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits not enforced on windows")
+	}
+	target, source, signature, pubkey := writePrivilegedSyncFixture(t, 0o500)
+	updated, err := syncPrivilegedTarget(context.Background(), target, source, signature, pubkey, slog.Default(), func(context.Context, string) (string, error) {
+		return "999.0.0", nil
+	})
+	if err != nil {
+		t.Fatalf("syncPrivilegedTarget: %v", err)
+	}
+	if !updated {
+		t.Fatal("updated = false, want true")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("target mode = %#o, want 0755", info.Mode().Perm())
+	}
+	if privilegedRunningAsRoot() && privilegedOwnerNeedsRepair(info) {
+		t.Fatal("root sync did not converge target ownership")
+	}
+}
+
+func TestSyncPrivilegedEqualVersionRepairsMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits not enforced on windows")
+	}
+	target, source, signature, pubkey := writePrivilegedSyncFixture(t, 0o500)
+	updated, err := syncPrivilegedTarget(context.Background(), target, source, signature, pubkey, slog.Default(), func(context.Context, string) (string, error) {
+		return version.Version, nil
+	})
+	if err != nil {
+		t.Fatalf("syncPrivilegedTarget: %v", err)
+	}
+	if updated {
+		t.Fatal("updated = true, want false")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("target mode = %#o, want 0755", info.Mode().Perm())
+	}
+	if privilegedRunningAsRoot() && privilegedOwnerNeedsRepair(info) {
+		t.Fatal("root sync did not converge target ownership")
 	}
 }

@@ -3,17 +3,38 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"servermonitor/pkg/wire"
 )
 
 const snapshotInventoryLimit = 50
+
+var browseSnapshotRE = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
+
+type BrowseOptions struct {
+	Repo       string
+	Snapshot   string
+	Path       string
+	Recursive  bool
+	MaxEntries int
+}
+
+type BrowseResult struct {
+	Snapshot  string
+	Entries   []wire.BackupBrowseEntry
+	Truncated bool
+}
 
 type Snapshot struct {
 	ID         string    `json:"id"`
@@ -34,6 +55,162 @@ type SnapshotRepoResult struct {
 
 type SnapshotListResult struct {
 	Repos []SnapshotRepoResult `json:"repos"`
+}
+
+func BrowseFromConfigPath(ctx context.Context, configPath string, bo BrowseOptions, opts Options) (BrowseResult, error) {
+	cfg, err := Load(configPath)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	resticPath, err := ResolveResticPath(cfg)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	cfg.ResticPath = resticPath
+	return browseSnapshot(ctx, cfg, bo, opts)
+}
+
+func browseSnapshot(ctx context.Context, cfg Config, bo BrowseOptions, opts Options) (BrowseResult, error) {
+	cfg = normalizedConfig(cfg)
+	if err := cfg.Validate(); err != nil {
+		return BrowseResult{}, err
+	}
+	if cfg.ResticPath == "" {
+		return BrowseResult{}, fmt.Errorf("restic path is not resolved")
+	}
+	repo, err := validateBrowseOptions(cfg.Repos, bo)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	release, err := tunnelLockGuard(cfg, opts)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	defer release()
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
+	for _, candidate := range cfg.Repos {
+		if candidate.Name == repo.Name {
+			repo = candidate
+			break
+		}
+	}
+	cacheDir := filepath.Join(filepath.Dir(cfg.StatusPath), "restic-browse-cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return BrowseResult{}, fmt.Errorf("create restic browse cache dir: %w", err)
+	}
+	if err := os.Chmod(cacheDir, 0o700); err != nil {
+		return BrowseResult{}, fmt.Errorf("secure restic browse cache dir: %w", err)
+	}
+	args := []string{"ls", "--json"}
+	if bo.Recursive {
+		args = append(args, "--recursive")
+	}
+	args = append(args, bo.Snapshot, bo.Path)
+	result := BrowseResult{Snapshot: bo.Snapshot, Entries: []wire.BackupBrowseEntry{}}
+	requestedPath := strings.TrimRight(bo.Path, "/")
+	if requestedPath == "" {
+		requestedPath = "/"
+	}
+	_, err = resticCommandStreamDiscard(ctx, cfg, repo, cacheDir, args, "snapshot browse", opts, func(line []byte) {
+		var node struct {
+			MessageType string    `json:"message_type"`
+			ID          string    `json:"id"`
+			Name        string    `json:"name"`
+			Type        string    `json:"type"`
+			Path        string    `json:"path"`
+			Size        int64     `json:"size"`
+			Mtime       time.Time `json:"mtime"`
+		}
+		if json.Unmarshal(line, &node) != nil {
+			return
+		}
+		if node.MessageType == "snapshot" {
+			if node.ID != "" {
+				result.Snapshot = node.ID
+			}
+			return
+		}
+		if node.MessageType != "node" {
+			return
+		}
+		if !bo.Recursive && node.Type == "dir" && node.Path == requestedPath {
+			return
+		}
+		if len(result.Entries) >= bo.MaxEntries {
+			result.Truncated = true
+			return
+		}
+		entry := wire.BackupBrowseEntry{Name: node.Name, Type: node.Type}
+		if node.Type == "file" {
+			entry.Size = node.Size
+		}
+		if !node.Mtime.IsZero() {
+			mtime := node.Mtime.UTC()
+			entry.Mtime = &mtime
+		}
+		result.Entries = append(result.Entries, entry)
+	})
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	sort.SliceStable(result.Entries, func(i, j int) bool {
+		iDir := result.Entries[i].Type == "dir"
+		jDir := result.Entries[j].Type == "dir"
+		if iDir != jDir {
+			return iDir
+		}
+		return strings.ToLower(result.Entries[i].Name) < strings.ToLower(result.Entries[j].Name)
+	})
+	return result, nil
+}
+
+func validateBrowseOptions(repos []Repo, bo BrowseOptions) (Repo, error) {
+	var repo Repo
+	for _, candidate := range repos {
+		if candidate.Name == bo.Repo {
+			repo = candidate
+			break
+		}
+	}
+	if repo.Name == "" {
+		return Repo{}, fmt.Errorf("repo %q not found", bo.Repo)
+	}
+	if bo.Snapshot != "latest" && !browseSnapshotRE.MatchString(bo.Snapshot) {
+		return Repo{}, fmt.Errorf("snapshot must be latest or 4 to 64 hexadecimal characters")
+	}
+	if len(bo.Path) == 0 || len(bo.Path) > 4096 || bo.Path[0] != '/' || strings.ContainsRune(bo.Path, 0) {
+		return Repo{}, fmt.Errorf("path must be an absolute snapshot path of at most 4096 bytes")
+	}
+	for _, segment := range strings.Split(bo.Path, "/") {
+		if segment == ".." {
+			return Repo{}, fmt.Errorf("path must not contain a .. segment")
+		}
+	}
+	if bo.MaxEntries <= 0 {
+		return Repo{}, fmt.Errorf("max entries must be positive")
+	}
+	return repo, nil
+}
+
+func ClassifyBrowseError(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	message := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(message)
+	switch {
+	case errors.Is(err, os.ErrPermission), strings.Contains(lower, "permission denied"), strings.Contains(lower, "access is denied"):
+		return "insufficient_privilege", message
+	case strings.Contains(lower, "holds the tunnel lock"):
+		return "busy", message
+	case strings.Contains(lower, "no matching id found"), strings.Contains(lower, "snapshot not found"), strings.Contains(lower, "path not found"), strings.Contains(lower, "no such file or directory"):
+		return "not_found", message
+	default:
+		return "failed", message
+	}
 }
 
 func SnapshotsFromConfigPath(ctx context.Context, path, repoName string, opts Options) (SnapshotListResult, error) {

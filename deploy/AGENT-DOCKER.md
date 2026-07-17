@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.3.9 .
-docker push registry.example.com/servermonitor-agent:0.3.9
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.0 .
+docker push registry.example.com/servermonitor-agent:0.4.0
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.3.9
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.0
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -107,6 +107,8 @@ docker compose -f deploy/docker-compose.agent.yml --env-file .env.agent up -d --
 
 (A bare `up -d` would try to *build* the new tag from source rather than pull it.)
 
+Upgrade the server before deploying a 0.4.0 agent image: server ingest rejects unknown fields, so a pre-0.4.0 server rejects the backup-scope fields sent by the newer agent.
+
 **Older images (pre-0.1.9).** The behavior above only holds for agents running **0.1.9+**, the release that added `externally_managed` reporting. The server can't tell that an *older* containerized agent — new enough to accept remote upgrade (0.1.1+) but too old to report the field — is read-only, so it may still show *Update now* and honour an auto-upgrade toggle. The agent then attempts a self-replace that fails on the read-only rootfs and retries with backoff (harmless but noisy). For such images, set `SM_AUTO_UPGRADE=false` as defense in depth and don't click *Update now* until you redeploy onto a 0.1.9+ image, which closes the gap. (Host-installed agents self-upgrade normally.)
 
 ### Sampling interval
@@ -133,7 +135,9 @@ SM_BACKUP_REST_PASSWORD=<the minted credential>
 SM_BACKUP_TIME=02:30
 ```
 
-Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
+Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_EXCLUDES`, `SM_BACKUP_ONE_FILE_SYSTEM`, `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
+
+**What gets backed up.** The default paths are `/etc`, `/home`, `/root`, and `/var/lib`, with `/var/lib/docker/volumes` added explicitly when it exists. Reproducible Docker image layers, writable container layers, build caches, container logs, networking state, and containerd content are excluded; named volumes and Docker swarm state remain in scope. `SM_BACKUP_EXCLUDES=none` disables the defaults, a value beginning with `+` appends comma-separated patterns, and any other comma-separated value replaces the defaults. The first backup after upgrading can be substantially larger because it includes named volumes; check endpoint quota first, or set `SM_BACKUP_EXCLUDES=+/var/lib/docker` to retain the old scope.
 
 **Tunnel repositories.** Set `SM_BACKUP_REPOS=tunnel:NAME` for storage on the monitoring server or `SM_BACKUP_REPOS=tunnel:NODE/NAME` for a promoted storage node, and set `SM_BACKUP_REPO_NAMES` to the repository's logical name. A `tunnel:` repository authenticates with the **same minted upload credential** as a `rest:` repository: `SM_BACKUP_REST_USERNAME` and `SM_BACKUP_REST_PASSWORD` must both be set. The tunnel replaces the public network path; it does not replace endpoint authentication. Enrollment is automatic at boot over the agent-token channel and needs only outbound UDP to the server or node WireGuard endpoint; WireGuard runs in userspace, so it needs no new capabilities or kernel module. The create-once `tunnel.key` lives in the state volume. `docker compose down -v` destroys it, which does not affect backup data because a fresh key enrolls again, but the `backup.key` recovery warning below still applies. During a run, restic uses a transient loopback proxy; with `network_mode: host` this is the host loopback, the same exposure class as a host install, and it exists only for the duration of the run.
 
@@ -144,6 +148,13 @@ Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/hom
 ```bash
 docker compose -f deploy/docker-compose.agent.yml exec sm-agent \
   /usr/local/bin/sm-agent backup run
+```
+
+List the root of the latest snapshot from the managed repository:
+
+```bash
+docker compose -f deploy/docker-compose.agent.yml exec sm-agent \
+  /usr/local/bin/sm-agent backup ls --snapshot latest /
 ```
 
 **Coolify/runc migration from 0.3.5–0.3.6.** Those recipes nested the state volume at `/host/var/lib/servermonitor`. On a fresh host where that directory did not already exist, runc tried to create the mountpoint after `/host` had become read-only and the container failed during initialization with `create mountpoint ... mkdirat`. Use the 0.3.7 Compose recipe as a unit: it keeps the existing named volume (and therefore the identity/key) but replaces that failing nested target with the already-existing `/host/tmp` target and its matching `/tmp` alias. Simply deleting the old nested mount lets the process start but breaks chrooted backups.

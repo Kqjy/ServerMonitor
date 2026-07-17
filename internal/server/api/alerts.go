@@ -291,24 +291,38 @@ type alertHistoryRow struct {
 
 func alertHistoryHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		csvFormat := r.URL.Query().Get("format") == "csv"
 		limit := 100
-		if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 1000 {
-			limit = l
+		limitSet := !csvFormat
+		if raw, ok := r.URL.Query()["limit"]; ok && len(raw) > 0 {
+			if l, err := strconv.Atoi(raw[0]); err == nil && l > 0 && (csvFormat || l <= 1000) {
+				limit = l
+				limitSet = true
+			}
 		}
-		rows, err := pool.Query(r.Context(), `
+		query := `
 			SELECT h.id, h.rule_id, COALESCE(r.name, ''), h.host_id, COALESCE(ho.hostname,''),
 			       h.label_key, h.fired_at, h.resolved_at, h.value, h.labels, COALESCE(h.severity,'')
 			FROM alert_history h
 			LEFT JOIN alert_rules r ON r.id = h.rule_id
 			LEFT JOIN hosts ho ON ho.id = h.host_id
 			ORDER BY h.fired_at DESC
-			LIMIT $1
-		`, limit)
+		`
+		args := []any{}
+		if limitSet {
+			query += " LIMIT $1"
+			args = append(args, limit)
+		}
+		rows, err := pool.Query(r.Context(), query, args...)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		defer rows.Close()
+		if csvFormat {
+			writeAlertHistoryCSV(w, rows)
+			return
+		}
 		out := []alertHistoryRow{}
 		for rows.Next() {
 			var ah alertHistoryRow
@@ -319,7 +333,74 @@ func alertHistoryHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			}
 			out = append(out, ah)
 		}
+		if err := rows.Err(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+func writeAlertHistoryCSV(w http.ResponseWriter, rows pgx.Rows) {
+	filename := "alert-history-" + time.Now().UTC().Format("20060102-150405") + ".csv"
+	cw := setCSVHeadersFilename(w, filename)
+	_ = cw.Write([]string{"fired_at", "resolved_at", "rule", "severity", "host", "value", "labels"})
+	for rows.Next() {
+		var ah alertHistoryRow
+		if err := rows.Scan(&ah.ID, &ah.RuleID, &ah.RuleName, &ah.HostID, &ah.Hostname,
+			&ah.LabelKey, &ah.FiredAt, &ah.ResolvedAt, &ah.Value, &ah.Labels, &ah.Severity); err != nil {
+			return
+		}
+		resolvedAt := ""
+		if ah.ResolvedAt != nil {
+			resolvedAt = ah.ResolvedAt.UTC().Format(time.RFC3339)
+		}
+		labels := []byte("{}")
+		if ah.Labels != nil {
+			if encoded, err := json.Marshal(ah.Labels); err == nil {
+				labels = encoded
+			}
+		}
+		_ = cw.Write([]string{
+			ah.FiredAt.UTC().Format(time.RFC3339),
+			resolvedAt,
+			csvSafe(ah.RuleName),
+			csvSafe(ah.Severity),
+			csvSafe(ah.Hostname),
+			formatFloat(ah.Value),
+			csvSafe(string(labels)),
+		})
+	}
+	cw.Flush()
+}
+
+func clearAlertHistoryHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		olderThanDays := 0
+		if values, ok := r.URL.Query()["older_than_days"]; ok {
+			if len(values) != 1 || values[0] == "" {
+				writeError(w, http.StatusBadRequest, "invalid older_than_days")
+				return
+			}
+			value, err := strconv.Atoi(values[0])
+			if err != nil || value < 0 {
+				writeError(w, http.StatusBadRequest, "invalid older_than_days")
+				return
+			}
+			olderThanDays = value
+		}
+		query := `DELETE FROM alert_history WHERE resolved_at IS NOT NULL`
+		args := []any{}
+		if olderThanDays > 0 {
+			query += ` AND fired_at < now() - make_interval(days => $1)`
+			args = append(args, olderThanDays)
+		}
+		result, err := pool.Exec(r.Context(), query, args...)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]int64{"deleted": result.RowsAffected()})
 	}
 }
 

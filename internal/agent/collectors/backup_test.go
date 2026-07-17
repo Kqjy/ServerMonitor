@@ -61,6 +61,7 @@ func enableBackupAgentDrift(t *testing.T, c *backupCollector, rawVersion string)
 	}
 	c.privPath = path
 	c.execVersion = func(context.Context, string) (string, error) { return rawVersion, nil }
+	c.accessExecutable = func(string) error { return nil }
 	return path
 }
 
@@ -110,6 +111,9 @@ func TestBackupCollectorCurrentPrivilegedAgent(t *testing.T) {
 			}
 			if value, ok := backupMetricValue(points, metrics.BackupAgentStale); !ok || value != 0 {
 				t.Fatalf("backup_agent_stale = %v,%v, want 0,true", value, ok)
+			}
+			if value, ok := backupMetricValue(points, metrics.BackupAgentUnexecutable); !ok || value != 0 {
+				t.Fatalf("backup_agent_unexecutable = %v,%v, want 0,true", value, ok)
 			}
 			if state := c.Status().State; state != backupStateOK {
 				t.Fatalf("state = %q, want %q", state, backupStateOK)
@@ -275,6 +279,70 @@ func TestBackupCollectorPrivilegedAgentFingerprintCache(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("execVersion calls after touch = %d, want 2", calls)
+	}
+}
+
+func TestBackupCollectorBlockedPrivilegedAgent(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+	c := testBackupCollector(statusPath, now)
+	enableBackupAgentDrift(t, c, "sm-agent "+version.Version+"\n")
+	execCalls := 0
+	c.execVersion = func(context.Context, string) (string, error) {
+		execCalls++
+		return "sm-agent " + version.Version + "\n", nil
+	}
+	c.accessExecutable = func(string) error { return errors.New("access denied") }
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if value, ok := backupMetricValue(points, metrics.BackupAgentUnexecutable); !ok || value != 1 {
+		t.Fatalf("backup_agent_unexecutable = %v,%v, want 1,true", value, ok)
+	}
+	if _, ok := backupMetricValue(points, metrics.BackupAgentStale); ok {
+		t.Fatalf("blocked copy must not emit a stale metric: %#v", points)
+	}
+	if execCalls != 0 {
+		t.Fatalf("execVersion calls = %d, want 0", execCalls)
+	}
+	status := c.Status()
+	wantMessage := "backup agent copy at " + c.privPath + " is not executable by the agent service account; scheduled backups cannot run until it is repaired (chown root:root, chmod 0755, or re-run the installer)"
+	if status.State != backupStateAgentPerms || status.Message != wantMessage {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestBackupCollectorBlockedStateClears(t *testing.T) {
+	now := time.Date(2026, 7, 3, 3, 0, 0, 0, time.UTC)
+	statusPath := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, statusPath, `{"version":1,"repos":[]}`)
+	c := testBackupCollector(statusPath, now)
+	enableBackupAgentDrift(t, c, "sm-agent "+version.Version+"\n")
+	blocked := true
+	c.accessExecutable = func(string) error {
+		if blocked {
+			return errors.New("access denied")
+		}
+		return nil
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect blocked: %v", err)
+	}
+	if c.Status().State != backupStateAgentPerms {
+		t.Fatalf("blocked state = %q", c.Status().State)
+	}
+	blocked = false
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect repaired: %v", err)
+	}
+	if value, ok := backupMetricValue(points, metrics.BackupAgentUnexecutable); !ok || value != 0 {
+		t.Fatalf("backup_agent_unexecutable = %v,%v, want 0,true", value, ok)
+	}
+	if c.Status().State != backupStateOK {
+		t.Fatalf("repaired state = %q, want %q", c.Status().State, backupStateOK)
 	}
 }
 
@@ -529,6 +597,20 @@ func TestBackupCollectorInventoryThrottle(t *testing.T) {
 	}
 }
 
+func TestBackupCollectorPassesScopeThrough(t *testing.T) {
+	now := time.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "backup-status.json")
+	writeBackupStatus(t, path, `{"version":1,"repos":[{"name":"vps-a","success":true,"paths":["/etc","/var/lib/docker/volumes"],"excludes":["/var/lib/docker/overlay2"],"one_file_system":false,"path_stats":[{"path":"/etc","bytes":2048,"files":4}],"stats_snapshot":"abcdef12"}]}`)
+	c := testBackupCollector(path, now)
+	backups, err := c.CollectBackups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 || !reflect.DeepEqual(backups[0].Paths, []string{"/etc", "/var/lib/docker/volumes"}) || !reflect.DeepEqual(backups[0].Excludes, []string{"/var/lib/docker/overlay2"}) || backups[0].OneFileSystem == nil || *backups[0].OneFileSystem || backups[0].StatsSnapshot != "abcdef12" || len(backups[0].PathStats) != 1 || backups[0].PathStats[0].Bytes != 2048 {
+		t.Fatalf("scope did not pass through: %#v", backups)
+	}
+}
+
 func TestParseSystemdNextElapse(t *testing.T) {
 	unixSeconds := time.Unix(1752613800, 0).UTC()
 	unixMicros := time.UnixMicro(1783130400000000).UTC()
@@ -719,7 +801,7 @@ func TestBackupStatusTruncatesSnapshots(t *testing.T) {
 }
 
 func TestBackupMetricIDs(t *testing.T) {
-	if metrics.BackupLastSuccessAgeS != 1000 || metrics.BackupCheckOK != 1007 || metrics.BackupAgentStale != 1013 {
+	if metrics.BackupLastSuccessAgeS != 1000 || metrics.BackupCheckOK != 1007 || metrics.BackupAgentStale != 1013 || metrics.BackupAgentUnexecutable != 1014 {
 		t.Fatalf("backup metric ID block changed")
 	}
 }

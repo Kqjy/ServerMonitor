@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	agentbackup "servermonitor/internal/agent/backup"
@@ -31,6 +32,7 @@ import (
 	"servermonitor/internal/agent/transport"
 	"servermonitor/internal/agent/upgrade"
 	"servermonitor/pkg/version"
+	"servermonitor/pkg/wire"
 )
 
 func main() {
@@ -137,6 +139,7 @@ func main() {
 	defer cancel()
 
 	client.StartDrainer(ctx)
+	go runBackupBrowseLoop(ctx, client, logger)
 
 	nodeManager := backupnode.New(cfg.ServerURL, cfg.Token, cfg.InsecureSkip, filepath.Dir(cfg.BackupStatusPath), logger)
 	go nodeManager.Run(ctx)
@@ -471,7 +474,7 @@ func syncPrivilegedCmd(args []string) {
 
 func backupCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -530,6 +533,77 @@ func backupCmd(args []string) {
 		}
 		if result.Failed() {
 			os.Exit(1)
+		}
+	case "ls":
+		fs := flag.NewFlagSet("backup ls", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		repoName := fs.String("repo", "", "repo name")
+		snapshot := fs.String("snapshot", "latest", "snapshot id or latest")
+		recursive := fs.Bool("recursive", false, "list recursively")
+		jsonOut := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() > 1 {
+			fmt.Fprintln(os.Stderr, "usage: sm-agent backup ls [options] [path]")
+			os.Exit(2)
+		}
+		path := "/"
+		if fs.NArg() == 1 {
+			path = fs.Arg(0)
+		}
+		cfg, err := agentbackup.Load(*configPath)
+		if err != nil {
+			logger.Error("backup ls failed", "err", err)
+			os.Exit(1)
+		}
+		if *repoName == "" {
+			if len(cfg.Repos) != 1 {
+				logger.Error("backup ls failed", "err", "--repo is required when more than one repository is configured")
+				os.Exit(2)
+			}
+			*repoName = cfg.Repos[0].Name
+		}
+		result, err := agentbackup.BrowseFromConfigPath(ctx, *configPath, agentbackup.BrowseOptions{
+			Repo:       *repoName,
+			Snapshot:   *snapshot,
+			Path:       path,
+			Recursive:  *recursive,
+			MaxEntries: 100000,
+		}, agentbackup.BaseOptions(logger))
+		if err != nil {
+			logger.Error("backup ls failed", "err", err)
+			os.Exit(1)
+		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(result.Entries); err != nil {
+				logger.Error("write backup ls output failed", "err", err)
+				os.Exit(1)
+			}
+		} else {
+			tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "NAME\tTYPE\tSIZE\tMODIFIED")
+			for _, entry := range result.Entries {
+				name := entry.Name
+				size := ""
+				modified := ""
+				if entry.Type == "dir" {
+					name += "/"
+				} else if entry.Type == "file" {
+					size = fmt.Sprintf("%d", entry.Size)
+				}
+				if entry.Mtime != nil {
+					modified = entry.Mtime.UTC().Format(time.RFC3339)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", name, entry.Type, size, modified)
+			}
+			if err := tw.Flush(); err != nil {
+				logger.Error("write backup ls output failed", "err", err)
+				os.Exit(1)
+			}
+		}
+		if result.Truncated {
+			fmt.Fprintln(os.Stderr, "listing truncated at 100000 entries")
 		}
 	case "check":
 		fs := flag.NewFlagSet("backup check", flag.ExitOnError)
@@ -623,6 +697,8 @@ func backupCmd(args []string) {
 		defer info.Session.Close()
 		if err := info.Session.Handshaken(15 * time.Second); err != nil {
 			logger.Error("backup proxy failed", "err", err)
+			info.Session.Close()
+			info.Release()
 			os.Exit(1)
 		}
 		fmt.Println("tunnel up; local restic proxies:")
@@ -668,9 +744,85 @@ func backupCmd(args []string) {
 				result.Summary.BytesRestored, result.Summary.TotalBytes, result.Summary.FilesSkipped)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
+}
+
+func runBackupBrowseLoop(ctx context.Context, client *transport.Client, logger *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-client.BrowseSignals():
+			if !ok {
+				return
+			}
+		}
+		idleDeadline := time.Now().Add(60 * time.Second)
+		for {
+			jobs, err := client.FetchBackupBrowseJobs(ctx)
+			if err != nil {
+				if ctx.Err() != nil || errors.Is(err, transport.ErrDeregistered) {
+					return
+				}
+				logger.Warn("fetch backup browse jobs failed", "err", err)
+			} else {
+				for _, job := range jobs {
+					result, browseErr := agentbackup.BrowseFromConfigPath(ctx, agentbackup.DefaultConfigPath(), agentbackup.BrowseOptions{
+						Repo:       job.Repo,
+						Snapshot:   job.Snapshot,
+						Path:       job.Path,
+						MaxEntries: 2000,
+					}, agentbackup.BaseOptions(logger))
+					response := wire.BackupBrowseResult{}
+					if browseErr != nil {
+						kind, message := agentbackup.ClassifyBrowseError(browseErr)
+						if kind == "insufficient_privilege" {
+							message += "; fallback command: " + backupBrowseFallbackCommand(job, runtime.GOOS)
+						}
+						response.ErrorKind = kind
+						response.Error = message
+					} else {
+						response.Entries = result.Entries
+						response.Truncated = result.Truncated
+					}
+					if err := client.PostBackupBrowseResult(ctx, job.ID, response); err != nil {
+						if ctx.Err() != nil || errors.Is(err, transport.ErrDeregistered) {
+							return
+						}
+						logger.Warn("post backup browse result failed", "job", job.ID, "err", err)
+					}
+					idleDeadline = time.Now().Add(60 * time.Second)
+				}
+			}
+			if len(jobs) == 0 && time.Now().After(idleDeadline) {
+				break
+			}
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func backupBrowseFallbackCommand(job wire.BackupBrowseJob, goos string) string {
+	if goos == "windows" {
+		return "& 'C:\\Program Files\\ServerMonitor\\sm-agent.exe' backup ls --repo " + powershellSingleQuote(job.Repo) + " --snapshot " + powershellSingleQuote(job.Snapshot) + " " + powershellSingleQuote(job.Path)
+	}
+	return "sudo /usr/local/bin/sm-agent backup ls --repo " + shellSingleQuote(job.Repo) + " --snapshot " + shellSingleQuote(job.Snapshot) + " " + shellSingleQuote(job.Path)
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func powershellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func upgradeBackoff(attempt int) time.Duration {

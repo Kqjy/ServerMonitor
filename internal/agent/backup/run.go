@@ -32,6 +32,7 @@ type backupSummary struct {
 	DurationS  int64
 	AddedBytes int64
 	TotalBytes int64
+	SnapshotID string
 }
 
 type backupProgress struct {
@@ -203,11 +204,15 @@ func (r RunResult) AnySucceeded() bool {
 func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) RepoStatus {
 	logger := opts.logger()
 	start := utcSecond(opts.now())
+	oneFileSystem := cfg.OneFileSystem
 	status := RepoStatus{
-		Name:        repo.Name,
-		Engine:      "restic",
-		LastStarted: &start,
-		Tunnel:      repo.UsesTunnel(),
+		Name:          repo.Name,
+		Engine:        "restic",
+		LastStarted:   &start,
+		Tunnel:        repo.UsesTunnel(),
+		Paths:         nonEmptyCopy(cfg.Paths),
+		Excludes:      nonEmptyCopy(cfg.Excludes),
+		OneFileSystem: &oneFileSystem,
 	}
 	logger.Info("backup repo started", "repo", repo.Name)
 
@@ -231,6 +236,15 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	}
 	status.SnapshotCount = int64(len(snapshots))
 	status.Snapshots = snapshotInventory(snapshots)
+	if summary.SnapshotID != "" {
+		stats, statsErr := collectPathStats(ctx, cfg, repo, cacheDir, summary.SnapshotID, opts)
+		if statsErr != nil {
+			logger.Warn("could not collect backup path stats", "repo", repo.Name, "snapshot", summary.SnapshotID, "err", statsErr)
+		} else {
+			status.PathStats = stats
+			status.StatsSnapshot = summary.SnapshotID
+		}
+	}
 
 	finish := utcSecond(opts.now())
 	status.LastFinished = &finish
@@ -238,6 +252,16 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	status.Success = true
 	logger.Info("backup repo completed", "repo", repo.Name)
 	return status
+}
+
+func nonEmptyCopy(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func finishRepoStatus(status RepoStatus, opts Options, err error, logger *slog.Logger) RepoStatus {
@@ -309,7 +333,7 @@ func backupArgs(cfg Config, goos string) []string {
 }
 
 func forgetArgs(retention Retention) []string {
-	args := []string{"forget", "--prune"}
+	args := []string{"forget", "--prune", "--group-by", "host"}
 	if retention.Daily > 0 {
 		args = append(args, "--keep-daily", strconv.Itoa(retention.Daily))
 	}
@@ -336,6 +360,7 @@ func parseBackupSummary(data []byte) (backupSummary, error) {
 			TotalDuration       float64 `json:"total_duration"`
 			DataAdded           int64   `json:"data_added"`
 			TotalBytesProcessed int64   `json:"total_bytes_processed"`
+			SnapshotID          string  `json:"snapshot_id"`
 		}
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
@@ -345,6 +370,7 @@ func parseBackupSummary(data []byte) (backupSummary, error) {
 				DurationS:  int64(math.Round(msg.TotalDuration)),
 				AddedBytes: msg.DataAdded,
 				TotalBytes: msg.TotalBytesProcessed,
+				SnapshotID: msg.SnapshotID,
 			}
 		}
 	}
@@ -355,6 +381,62 @@ func parseBackupSummary(data []byte) (backupSummary, error) {
 		return backupSummary{}, fmt.Errorf("summary record not found")
 	}
 	return *summary, nil
+}
+
+func collectPathStats(ctx context.Context, cfg Config, repo Repo, cacheDir, snapshotID string, opts Options) ([]PathStat, error) {
+	stats := make([]PathStat, len(cfg.Paths))
+	matchPaths := make([]string, len(cfg.Paths))
+	windows := opts.goos() == "windows"
+	for i, path := range cfg.Paths {
+		stats[i].Path = path
+		matchPaths[i] = pathStatsMatchPath(path, windows)
+	}
+	statsCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	_, err := resticCommandStreamDiscard(statsCtx, cfg, repo, cacheDir, []string{"ls", "--json", "--recursive", snapshotID, "/"}, "path stats", opts, func(line []byte) {
+		var node struct {
+			MessageType string `json:"message_type"`
+			Type        string `json:"type"`
+			Path        string `json:"path"`
+			Size        int64  `json:"size"`
+		}
+		if json.Unmarshal(line, &node) != nil || node.MessageType != "node" || node.Type != "file" {
+			return
+		}
+		best := -1
+		bestLen := -1
+		nodePath := pathStatsMatchPath(node.Path, windows)
+		for i, matchPath := range matchPaths {
+			matches := matchPath == "/" || nodePath == matchPath || strings.HasPrefix(nodePath, matchPath+"/")
+			if matches && len(matchPath) > bestLen {
+				best = i
+				bestLen = len(matchPath)
+			}
+		}
+		if best >= 0 {
+			stats[best].Bytes += node.Size
+			stats[best].Files++
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func pathStatsMatchPath(path string, windows bool) string {
+	if windows {
+		path = strings.ReplaceAll(path, `\`, "/")
+		if len(path) >= 3 && path[1] == ':' && path[2] == '/' {
+			path = "/" + path[:1] + path[2:]
+		}
+		path = strings.ToLower(path)
+	}
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		return "/"
+	}
+	return path
 }
 
 func acquireRunLock(statusPath string, now time.Time) (func(), bool, error) {

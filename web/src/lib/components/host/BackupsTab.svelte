@@ -5,6 +5,7 @@
     type CollectorStatus,
     type BackupRepoRow,
     type BackupSnapshot,
+    type BackupBrowseResult,
     type BackupTargetsResp,
     type BackupNode
   } from '$lib/api';
@@ -34,12 +35,26 @@
   const backupStatus = $derived(collectorStatus.backup);
   const isWindows = $derived((os ?? '').toLowerCase().startsWith('windows'));
   let baseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
+  const agentPermsCommand = 'sudo chown root:root /usr/local/bin/sm-agent && sudo chmod 0755 /usr/local/bin/sm-agent';
+  let agentPermsCopyState = $state<'idle' | 'copied' | 'failed'>('idle');
+  let agentPermsCopyTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function loadServerInfo() {
     try {
       const info = await api.serverInfo();
       if (info?.url) baseUrl = info.url.replace(/\/+$/, '');
     } catch {}
+  }
+
+  async function copyAgentPermsCommand() {
+    if (agentPermsCopyTimer) clearTimeout(agentPermsCopyTimer);
+    try {
+      await navigator.clipboard.writeText(agentPermsCommand);
+      agentPermsCopyState = 'copied';
+    } catch {
+      agentPermsCopyState = 'failed';
+    }
+    agentPermsCopyTimer = setTimeout(() => (agentPermsCopyState = 'idle'), 1500);
   }
 
   let endpoint = $state<BackupTargetsResp | null>(null);
@@ -90,6 +105,11 @@
     checkAgeS: number | null;
     backupTone: Tone;
     checkTone: Tone;
+    paths: string[];
+    excludes: string[];
+    oneFileSystem: boolean | undefined;
+    pathStats: { path: string; bytes: number; files: number }[];
+    statsSnapshot?: string;
     snapshots: BackupSnapshot[];
   };
 
@@ -170,6 +190,15 @@
   const snapSort = new TableSort<'time' | 'id'>('time');
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
+  let browseOpen = $state(false);
+  let browsePath = $state('/');
+  let browseState = $state<'idle' | 'loading' | 'done' | 'error'>('idle');
+  let browseResult = $state<BackupBrowseResult | null>(null);
+  let browseCache = $state(new Map<string, BackupBrowseResult>());
+  let browseGen = 0;
+  let browseAC: AbortController | null = null;
+  let browseCopyState = $state<'idle' | 'copied' | 'failed'>('idle');
+  let browseCopyTimer: ReturnType<typeof setTimeout> | null = null;
 
   function ageS(iso?: string): number | null {
     if (!iso) return null;
@@ -241,11 +270,65 @@
           checkAgeS,
           backupTone: backupTone(s.success, lastSuccessAgeS, pending),
           checkTone: checkTone(s.check_success, s.check_last, checkAgeS),
+          paths: s.paths ?? [],
+          excludes: s.excludes ?? [],
+          oneFileSystem: s.one_file_system,
+          pathStats: s.path_stats ?? [],
+          statsSnapshot: s.stats_snapshot,
           snapshots: s.snapshots ?? []
         };
       })
       .sort((a, b) => a.repo.localeCompare(b.repo))
   );
+
+  type ScopeGroup = {
+    repos: string[];
+    paths: string[];
+    excludes: string[];
+    oneFileSystem: boolean | undefined;
+    stats?: {
+      repo: string;
+      snapshot: string;
+      measuredAt: number;
+      rows: { path: string; bytes: number; files: number }[];
+    };
+  };
+
+  const scopeGroups = $derived.by<ScopeGroup[]>(() => {
+    const groups = new Map<string, ScopeGroup>();
+    for (const view of views) {
+      if (view.paths.length === 0 && view.excludes.length === 0 && view.oneFileSystem === undefined) continue;
+      const signature = JSON.stringify({ paths: view.paths, excludes: view.excludes, one_file_system: view.oneFileSystem });
+      const existing = groups.get(signature);
+      const stats = view.success && view.pathStats.length > 0 && view.statsSnapshot
+        ? {
+            repo: view.repo,
+            snapshot: view.statsSnapshot,
+            measuredAt: view.lastSuccessIso ? new Date(view.lastSuccessIso).getTime() : 0,
+            rows: view.pathStats
+          }
+        : undefined;
+      if (existing) {
+        existing.repos.push(view.repo);
+        if (stats && (!existing.stats || stats.measuredAt > existing.stats.measuredAt)) existing.stats = stats;
+      } else {
+        groups.set(signature, { repos: [view.repo], paths: view.paths, excludes: view.excludes, oneFileSystem: view.oneFileSystem, stats });
+      }
+    }
+    return Array.from(groups.values());
+  });
+
+  const dockerVolumesWarning = $derived.by<string | null>(() => {
+    if (collectorStatus.containers?.state !== 'ok') return null;
+    let matchingExclude: string | null = null;
+    for (const view of views) {
+      if (view.excludes.includes('/var/lib/docker/volumes')) matchingExclude = '/var/lib/docker/volumes';
+      else if (!matchingExclude && view.excludes.includes('/var/lib/docker')) matchingExclude = '/var/lib/docker';
+    }
+    if (!matchingExclude) return null;
+    if (views.some((view) => view.paths.some((path) => path.startsWith('/var/lib/docker/volumes')))) return null;
+    return matchingExclude;
+  });
 
   let hiddenRepos = $state(new Set<string>());
   const repoNames = $derived(views.map((view) => view.repo));
@@ -360,8 +443,10 @@
     const names = views.map((v) => v.repo);
     untrack(() => {
       if (names.length === 0) {
+        if (selectedRepo !== '') resetBrowser();
         selectedRepo = '';
       } else if (!names.includes(selectedRepo)) {
+        resetBrowser();
         selectedRepo = names[0];
       }
     });
@@ -394,7 +479,10 @@
     if (liveTimer) clearInterval(liveTimer);
     liveUnsub?.();
     if (copyTimer) clearTimeout(copyTimer);
+    if (agentPermsCopyTimer) clearTimeout(agentPermsCopyTimer);
+    if (browseCopyTimer) clearTimeout(browseCopyTimer);
     backupsAC?.abort();
+    browseAC?.abort();
   });
 
   const activeRepo = $derived(views.find((v) => v.repo === selectedRepo) ?? null);
@@ -412,10 +500,19 @@
     if (selectedSnap === s.id) {
       selectedSnap = null;
       includePaths = [];
+      resetBrowser();
       return;
     }
     selectedSnap = s.id;
     includePaths = [];
+    resetBrowser();
+  }
+
+  function selectRepo(repo: string) {
+    selectedRepo = repo;
+    selectedSnap = null;
+    includePaths = [];
+    resetBrowser();
   }
 
   function togglePath(p: string) {
@@ -451,15 +548,145 @@
     }
     copyTimer = setTimeout(() => (copyState = 'idle'), 1500);
   }
+
+  function resetBrowser() {
+    browseGen++;
+    browseAC?.abort();
+    browseAC = null;
+    browseOpen = false;
+    browsePath = '/';
+    browseState = 'idle';
+    browseResult = null;
+    browseCache = new Map();
+  }
+
+  function browseCacheKey(path: string): string {
+    return `${selectedRepo}\0${selectedSnapshot?.id ?? ''}\0${path}`;
+  }
+
+  function browseChildPath(name: string): string {
+    return browsePath === '/' ? `/${name}` : `${browsePath.replace(/\/$/, '')}/${name}`;
+  }
+
+  function browseCrumbs(path: string): { label: string; path: string }[] {
+    const crumbs = [{ label: '/', path: '/' }];
+    let current = '';
+    for (const segment of path.split('/').filter(Boolean)) {
+      current += `/${segment}`;
+      crumbs.push({ label: segment, path: current });
+    }
+    return crumbs;
+  }
+
+  function browseMaxBytes(scope: ScopeGroup): number {
+    return Math.max(0, ...(scope.stats?.rows.map((row) => row.bytes) ?? []));
+  }
+
+  function waitForBrowsePoll(signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      }, 1000);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+
+  async function browseTo(path: string, retry = false) {
+    if (!selectedSnapshot) return;
+    browseOpen = true;
+    browsePath = path;
+    const key = browseCacheKey(path);
+    if (!retry) {
+      const cached = browseCache.get(key);
+      if (cached) {
+        browseResult = cached;
+        browseState = cached.error ? 'error' : 'done';
+        return;
+      }
+    }
+    const gen = ++browseGen;
+    browseAC?.abort();
+    const ac = new AbortController();
+    browseAC = ac;
+    browseResult = null;
+    browseState = 'loading';
+    const startedAt = Date.now();
+    let hardTimedOut = false;
+    const hardTimer = setTimeout(() => {
+      hardTimedOut = true;
+      ac.abort();
+    }, 120_000);
+    try {
+      const started = await api.backupBrowseStart(hostId, { repo: selectedRepo, snapshot: selectedSnapshot.id, path }, { signal: ac.signal });
+      while (Date.now() - startedAt < 120_000) {
+        if (gen !== browseGen) return;
+        const job = await api.backupBrowseJob(hostId, started.job_id, { signal: ac.signal });
+        if (job.status === 'done' || job.status === 'failed') {
+          const result = job.result ?? { error: 'Backup browse job ended without a result.', error_kind: 'failed' };
+          if (gen !== browseGen) return;
+          browseCache = new Map(browseCache).set(key, result);
+          browseResult = result;
+          browseState = result.error ? 'error' : 'done';
+          return;
+        }
+        await waitForBrowsePoll(ac.signal);
+      }
+      if (gen !== browseGen) return;
+      const result = { error: 'The backup browse request timed out.', error_kind: 'timed_out' };
+      browseResult = result;
+      browseState = 'error';
+    } catch (e) {
+      if (gen !== browseGen) return;
+      if (hardTimedOut) {
+        browseResult = { error: 'The backup browse request timed out.', error_kind: 'timed_out' };
+        browseState = 'error';
+        return;
+      }
+      if ((e as { name?: string })?.name === 'AbortError') return;
+      browseResult = { error: (e as Error).message, error_kind: 'failed' };
+      browseState = 'error';
+    } finally {
+      clearTimeout(hardTimer);
+    }
+  }
+
+  function retryBrowse() {
+    browseCache.delete(browseCacheKey(browsePath));
+    browseCache = new Map(browseCache);
+    void browseTo(browsePath, true);
+  }
+
+  function browseFallbackCommand(): string {
+    const marker = 'fallback command: ';
+    const message = browseResult?.error ?? '';
+    const index = message.indexOf(marker);
+    return index >= 0 ? message.slice(index + marker.length) : message;
+  }
+
+  function browseErrorText(): string {
+    const message = browseResult?.error ?? 'Backup browse failed.';
+    const index = message.indexOf('; fallback command: ');
+    return index >= 0 ? message.slice(0, index) : message;
+  }
+
+  async function copyBrowseCommand() {
+    if (browseCopyTimer) clearTimeout(browseCopyTimer);
+    try {
+      await navigator.clipboard.writeText(browseFallbackCommand());
+      browseCopyState = 'copied';
+    } catch {
+      browseCopyState = 'failed';
+    }
+    browseCopyTimer = setTimeout(() => (browseCopyState = 'idle'), 1500);
+  }
 </script>
 
 <div class="space-y-6">
-  {#if !hideBackupDetail}
-    <p class="text-xs text-zinc-500">
-      This host backs up its own files with restic to one or more destinations — this server or an external endpoint.
-    </p>
-  {/if}
-
   {#if isStorageNode && nodeRole}
     <div class="rounded-lg border border-sky-900/50 bg-sky-950/20 px-4 py-3">
       <div class="flex items-start gap-2.5">
@@ -486,9 +713,26 @@
     <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
       Backup agent binary is outdated{backupStatus.message ? `: ${backupStatus.message}` : ''}. Reconfigure this host to refresh it: <code>{isWindows ? `iex (iwr -useb ${baseUrl}/install.ps1).Content` : `sudo bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`}</code> For offline installs, re-run the install script with --binary (Linux) or -BinaryPath (Windows).
     </div>
+  {:else if backupStatus?.state === 'agent_perms'}
+    <div class="rounded-lg border border-rose-900/50 bg-rose-950/20 px-4 py-3 text-sm text-rose-100/90">
+      <div>{backupStatus.message}</div>
+      <div class="mt-2 flex items-center gap-2">
+        <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-xs text-zinc-200 select-text">{agentPermsCommand}</code>
+        <button type="button" onclick={copyAgentPermsCommand} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentPermsCopyState === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+          {agentPermsCopyState === 'copied' ? 'copied' : agentPermsCopyState === 'failed' ? 'copy failed' : 'copy'}
+        </button>
+      </div>
+      <div class="mt-2 text-xs text-rose-100/70">Upgrading the agent makes the privileged sync service repair this automatically going forward. Re-running the installer also fixes it.</div>
+    </div>
   {:else if backupStatus?.state === 'error'}
     <div class="rounded-lg border border-rose-900/50 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">
       Backup status could not be read{backupStatus.message ? `: ${backupStatus.message}` : ''}.
+    </div>
+  {/if}
+
+  {#if dockerVolumesWarning}
+    <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-100/90">
+      This host runs Docker containers, but its backups exclude {dockerVolumesWarning} — named volumes are not being backed up. Edit the excludes in /etc/servermonitor-backup/backup.toml (or redeploy a containerized agent to pick up the current default, which keeps /var/lib/docker/volumes).
     </div>
   {/if}
 
@@ -691,6 +935,62 @@
           </section>
         {/each}
       </div>
+      <div class="border-t border-zinc-800 px-4 sm:px-5 py-4">
+        {#if scopeGroups.length > 0}
+          <div class="text-[10px] uppercase tracking-wider text-zinc-500">Backup scope</div>
+          <div class="mt-3 space-y-4">
+            {#each scopeGroups as scope (JSON.stringify(scope))}
+              <div>
+                {#if scopeGroups.length > 1}
+                  <div class="mb-2 font-mono text-[11px] text-zinc-400">{scope.repos.join(', ')}</div>
+                {/if}
+                {#if scope.stats}
+                  <div class="space-y-2">
+                    {#each scope.stats.rows as stat (stat.path)}
+                      <div class="grid grid-cols-[minmax(0,1fr)_minmax(5rem,0.8fr)_auto] items-center gap-3">
+                        <span class="truncate font-mono text-xs text-zinc-300" title={stat.path}>{stat.path}</span>
+                        <div class="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                          <div class="h-full rounded-full bg-sky-500/70" style="width: {browseMaxBytes(scope) > 0 ? Math.max(0, Math.min(100, stat.bytes / browseMaxBytes(scope) * 100)) : 0}%"></div>
+                        </div>
+                        <div class="text-right text-[11px] whitespace-nowrap">
+                          <span class="numeric {stat.bytes === 0 ? 'text-amber-300' : 'text-zinc-300'}">{bytes(stat.bytes)}</span>
+                          <span class="ml-2 numeric text-zinc-500">{stat.files.toLocaleString('en-US')} files</span>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                  <div class="mt-2 text-[11px] text-zinc-500">Measured from snapshot <span class="font-mono numeric text-zinc-400">{scope.stats.snapshot}</span> on <span class="font-mono text-zinc-400">{scope.stats.repo}</span>.</div>
+                {:else}
+                  <div class="flex flex-wrap gap-1.5">
+                    {#each scope.paths as path (path)}
+                      <span class="px-2 py-1 rounded-md border border-zinc-800 bg-zinc-950 font-mono text-xs text-zinc-300">{path}</span>
+                    {/each}
+                  </div>
+                {/if}
+                <div class="mt-3">
+                  {#if scope.excludes.length > 0}
+                    <details>
+                      <summary class="numeric text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer select-none">{scope.excludes.length} exclude {scope.excludes.length === 1 ? 'pattern' : 'patterns'}</summary>
+                      <div class="mt-2 flex flex-wrap gap-1.5">
+                        {#each scope.excludes as exclude (exclude)}
+                          <span class="px-2 py-1 rounded-md border border-zinc-800 bg-zinc-950 font-mono text-xs text-zinc-500">{exclude}</span>
+                        {/each}
+                      </div>
+                    </details>
+                  {:else}
+                    <div class="text-xs text-zinc-500">No exclude patterns</div>
+                  {/if}
+                </div>
+                {#if scope.oneFileSystem === true}
+                  <div class="mt-3 text-[11px] text-zinc-500">Stays on one filesystem — mounts nested under the paths above are not crossed.</div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="text-[11px] text-zinc-600">Scope not reported — agents send backup scope from <span class="numeric">v0.4.0</span> after their next run.</div>
+        {/if}
+      </div>
     {/if}
   </section>
 
@@ -766,7 +1066,7 @@
             {#each views as v (v.repo)}
               <button
                 type="button"
-                onclick={() => { selectedRepo = v.repo; selectedSnap = null; includePaths = []; }}
+                onclick={() => selectRepo(v.repo)}
                 class="px-2 py-1 rounded-md font-mono transition-colors {selectedRepo === v.repo ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">
                 {v.repo}
               </button>
@@ -853,6 +1153,90 @@
               {isWindows ? 'Run in elevated PowerShell.' : 'Run as root on the host.'}
               Restores to <span class="font-mono text-zinc-400">{stagingTarget}</span> by default; no restore is triggered from this UI.
             </p>
+
+            <div class="pt-1">
+              <button
+                type="button"
+                onclick={() => browseOpen ? resetBrowser() : void browseTo('/')}
+                class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
+                {browseOpen ? 'Close browser' : 'Browse contents'}
+              </button>
+            </div>
+
+            {#if browseOpen}
+              <section class="rounded-lg border border-zinc-800 bg-zinc-950/40 overflow-hidden">
+                <div class="flex flex-wrap items-center gap-1 border-b border-zinc-800 px-3 py-2 text-xs font-mono">
+                  {#each browseCrumbs(browsePath) as crumb, index (crumb.path)}
+                    {#if index > 0}<span class="text-zinc-700">/</span>{/if}
+                    <button
+                      type="button"
+                      onclick={() => void browseTo(crumb.path)}
+                      class={crumb.path === browsePath ? 'text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}>
+                      {crumb.label}
+                    </button>
+                  {/each}
+                </div>
+
+                {#if browseState === 'loading'}
+                  <div class="px-3 py-3">
+                    <div class="h-8 rounded shimmer"></div>
+                    <div class="mt-2 text-xs text-zinc-500">Asking the agent — it picks up work on its next check-in.</div>
+                  </div>
+                {:else if browseState === 'error'}
+                  <div class="px-3 py-3">
+                    {#if browseResult?.error_kind === 'busy'}
+                      <div class="text-xs text-amber-300">A backup or check is running on this host — try again when it finishes.</div>
+                      <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
+                    {:else if browseResult?.error_kind === 'insufficient_privilege'}
+                      <div class="text-xs text-amber-300">{browseErrorText()}</div>
+                      <div class="mt-2 flex items-center justify-between gap-2">
+                        <div class="text-[10px] uppercase tracking-wider text-zinc-500">Run on the host</div>
+                        <button type="button" onclick={copyBrowseCommand} class="text-[11px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 {browseCopyState === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+                          {browseCopyState === 'copied' ? 'copied' : browseCopyState === 'failed' ? 'copy failed — select manually' : 'copy'}
+                        </button>
+                      </div>
+                      <pre class="mt-1 text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre select-text text-zinc-200">{browseFallbackCommand()}</pre>
+                    {:else if browseResult?.error_kind === 'agent_unreachable' || browseResult?.error_kind === 'timed_out'}
+                      <div class="text-xs text-rose-300">{browseResult?.error}</div>
+                      <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
+                    {:else}
+                      <div class="text-xs text-rose-300">{browseResult?.error ?? 'Backup browse failed.'}</div>
+                      <button type="button" onclick={retryBrowse} class="mt-2 text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Retry</button>
+                    {/if}
+                  </div>
+                {:else if browseState === 'done'}
+                  {#if (browseResult?.entries ?? []).length === 0}
+                    <div class="px-3 py-4 text-xs text-zinc-500">Empty directory.</div>
+                  {:else}
+                    <div class="overflow-x-auto">
+                      <table class="w-full text-sm">
+                        <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
+                          <tr>
+                            <th class="text-left font-medium px-3 py-2">Name</th>
+                            <th class="text-right font-medium px-3 py-2">Size</th>
+                            <th class="text-left font-medium px-3 py-2">Modified</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-zinc-800/70">
+                          {#each browseResult?.entries ?? [] as entry (`${entry.type}:${entry.name}`)}
+                            <tr
+                              onclick={() => entry.type === 'dir' && void browseTo(browseChildPath(entry.name))}
+                              class={entry.type === 'dir' ? 'cursor-pointer hover:bg-zinc-900/60' : ''}>
+                              <td class="px-3 py-2 font-mono {entry.type === 'dir' ? 'text-sky-300' : 'text-zinc-300'}">{entry.name}{entry.type === 'dir' ? '/' : ''}</td>
+                              <td class="px-3 py-2 text-right numeric text-zinc-300">{entry.type === 'dir' ? '—' : bytes(entry.size ?? 0)}</td>
+                              <td class="px-3 py-2 numeric text-zinc-400">{entry.mtime ? new Date(entry.mtime).toLocaleString() : '—'}</td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  {/if}
+                  {#if browseResult?.truncated}
+                    <div class="border-t border-zinc-800 px-3 py-2 text-[11px] text-amber-300/80">Showing the first 2,000 entries.</div>
+                  {/if}
+                {/if}
+              </section>
+            {/if}
           </div>
         {/if}
       {/if}

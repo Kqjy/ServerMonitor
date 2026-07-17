@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,11 +17,12 @@ import (
 )
 
 type Command struct {
-	Path         string
-	Args         []string
-	Env          []string
-	Chroot       string
-	OnStdoutLine func([]byte)
+	Path          string
+	Args          []string
+	Env           []string
+	Chroot        string
+	OnStdoutLine  func([]byte)
+	DiscardStdout bool
 }
 
 type CommandResult struct {
@@ -69,7 +71,11 @@ func (ExecRunner) Run(ctx context.Context, command Command) (CommandResult, erro
 	if err := cmd.Start(); err != nil {
 		return CommandResult{Stderr: stderr.Bytes()}, err
 	}
-	scanner := bufio.NewScanner(io.TeeReader(pipe, &stdout))
+	var stream io.Reader = pipe
+	if !command.DiscardStdout {
+		stream = io.TeeReader(pipe, &stdout)
+	}
+	scanner := bufio.NewScanner(stream)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		command.OnStdoutLine(scanner.Bytes())
@@ -231,6 +237,14 @@ func resticCommandAction(ctx context.Context, cfg Config, repo Repo, cacheDir st
 }
 
 func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action, chrootRoot string, opts Options, onStdoutLine func([]byte)) (CommandResult, error) {
+	return resticCommandStreamMode(ctx, cfg, repo, cacheDir, args, action, chrootRoot, opts, onStdoutLine, false)
+}
+
+func resticCommandStreamDiscard(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action string, opts Options, onStdoutLine func([]byte)) (CommandResult, error) {
+	return resticCommandStreamMode(ctx, cfg, repo, cacheDir, args, action, "", opts, onStdoutLine, true)
+}
+
+func resticCommandStreamMode(ctx context.Context, cfg Config, repo Repo, cacheDir string, args []string, action, chrootRoot string, opts Options, onStdoutLine func([]byte), discardStdout bool) (CommandResult, error) {
 	if repo.tunnelErr != nil {
 		return CommandResult{}, fmt.Errorf("%s failed: %w", action, repo.tunnelErr)
 	}
@@ -249,11 +263,12 @@ func resticCommandStream(ctx context.Context, cfg Config, repo Repo, cacheDir st
 		}
 	}
 	result, err := opts.runner().Run(ctx, Command{
-		Path:         cfg.ResticPath,
-		Args:         resticGlobalArgs(repo, args),
-		Env:          withResticEnv(repo, cacheDir, tmpDir, repoEnv),
-		Chroot:       chrootRoot,
-		OnStdoutLine: onStdoutLine,
+		Path:          cfg.ResticPath,
+		Args:          resticGlobalArgs(repo, args),
+		Env:           withResticEnv(repo, cacheDir, tmpDir, repoEnv),
+		Chroot:        chrootRoot,
+		OnStdoutLine:  onStdoutLine,
+		DiscardStdout: discardStdout,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -284,7 +299,43 @@ func sanitizeResticText(text string, repo Repo, repoEnv map[string]string) strin
 	for _, value := range repoEnvSecretValues(repoEnv) {
 		text = strings.ReplaceAll(text, value, "[credential]")
 	}
-	return text
+	return unwrapResticExitError(text)
+}
+
+func unwrapResticExitError(text string) string {
+	lines := strings.Split(text, "\n")
+	suffixStart := len(lines)
+	message := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			suffixStart = i
+			continue
+		}
+		var value map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &value); err != nil {
+			break
+		}
+		suffixStart = i
+		if message != "" {
+			continue
+		}
+		var entry struct {
+			MessageType string `json:"message_type"`
+			Message     string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err == nil && entry.MessageType == "exit_error" && entry.Message != "" {
+			message = entry.Message
+		}
+	}
+	if message == "" {
+		return text
+	}
+	prefix := strings.TrimSpace(strings.Join(lines[:suffixStart], "\n"))
+	if prefix == "" {
+		return message
+	}
+	return prefix + "\n" + message
 }
 
 func (o Options) runner() CommandRunner {

@@ -46,7 +46,18 @@ type RepoStatus struct {
 	CheckLast     *time.Time `json:"check_last,omitempty"`
 	CheckSuccess  *bool      `json:"check_success,omitempty"`
 	Tunnel        bool       `json:"tunnel,omitempty"`
+	Paths         []string   `json:"paths,omitempty"`
+	Excludes      []string   `json:"excludes,omitempty"`
+	OneFileSystem *bool      `json:"one_file_system,omitempty"`
+	PathStats     []PathStat `json:"path_stats,omitempty"`
+	StatsSnapshot string     `json:"stats_snapshot,omitempty"`
 	Snapshots     []Snapshot `json:"snapshots,omitempty"`
+}
+
+type PathStat struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	Files int64  `json:"files"`
 }
 
 func readStatusFile(path string) (StatusFile, error) {
@@ -186,6 +197,18 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 			update.CheckSuccess = prev.CheckSuccess
 			if !update.Success {
 				update.LastSuccess = prev.LastSuccess
+			}
+			if update.Paths == nil && prev.Paths != nil {
+				update.Paths = append([]string(nil), prev.Paths...)
+				update.Excludes = append([]string(nil), prev.Excludes...)
+				if prev.OneFileSystem != nil {
+					oneFileSystem := *prev.OneFileSystem
+					update.OneFileSystem = &oneFileSystem
+				}
+			}
+			if update.PathStats == nil && prev.PathStats != nil {
+				update.PathStats = append([]PathStat(nil), prev.PathStats...)
+				update.StatsSnapshot = prev.StatsSnapshot
 			}
 		}
 		out = append(out, update)

@@ -125,14 +125,14 @@ func TestSmartReadArgs(t *testing.T) {
 		dev  smartDevice
 		want string
 	}{
-		{smartDevice{name: "/dev/sda", devType: "scsi"}, "-a --json=c /dev/sda"},
-		{smartDevice{name: "/dev/sda", devType: "ata"}, "-a --json=c /dev/sda"},
-		{smartDevice{name: "/dev/sda", devType: ""}, "-a --json=c /dev/sda"},
-		{smartDevice{name: "/dev/sda", devType: "sat"}, "-a --json=c -d sat /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: "scsi"}, "-a --json=c -l devstat /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: "ata"}, "-a --json=c -l devstat /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: ""}, "-a --json=c -l devstat /dev/sda"},
+		{smartDevice{name: "/dev/sda", devType: "sat"}, "-a --json=c -l devstat -d sat /dev/sda"},
 		{smartDevice{name: "/dev/nvme0", devType: "nvme"}, "-a --json=c -d nvme /dev/nvme0"},
 		{smartDevice{name: "/dev/sdb", devType: "nvme"}, "-a --json=c -d nvme /dev/sdb"},
-		{smartDevice{name: "/dev/bus/0", devType: "megaraid,0"}, "-a --json=c -d megaraid,0 /dev/bus/0"},
-		{smartDevice{name: "/dev/bus/0", devType: "sat+megaraid,7"}, "-a --json=c -d sat+megaraid,7 /dev/bus/0"},
+		{smartDevice{name: "/dev/bus/0", devType: "megaraid,0"}, "-a --json=c -l devstat -d megaraid,0 /dev/bus/0"},
+		{smartDevice{name: "/dev/bus/0", devType: "sat+megaraid,7"}, "-a --json=c -l devstat -d sat+megaraid,7 /dev/bus/0"},
 	}
 	for _, tc := range cases {
 		if got := strings.Join(smartReadArgs(tc.dev), " "); got != tc.want {
@@ -232,12 +232,13 @@ const (
 
 func newRAIDTestCollector(f *fakeSmartctl) *smartCollector {
 	return &smartCollector{
-		probed:     true,
-		smartctl:   "/fake/smartctl",
-		goos:       "linux",
-		devicesTTL: time.Hour,
-		execFn:     f.exec,
-		fileExists: func(string) bool { return false },
+		probed:        true,
+		smartctl:      "/fake/smartctl",
+		storcliProbed: true,
+		goos:          "linux",
+		devicesTTL:    time.Hour,
+		execFn:        f.exec,
+		fileExists:    func(string) bool { return false },
 	}
 }
 
@@ -323,7 +324,7 @@ func TestWalkIDsMissStreakAndDedupe(t *testing.T) {
 	devs := map[string]bool{}
 	got := c.walkIDs(context.Background(), c.smartctl, "/dev/sda", 0, 63, 16, serials, devs, func(i int) string {
 		return "megaraid," + strconv.Itoa(i)
-	})
+	}, nil)
 	if len(got) != 2 {
 		t.Fatalf("walkIDs found %d devices, want 2 (enclosure filtered): %+v", len(got), got)
 	}
@@ -340,7 +341,7 @@ func TestWalkIDsMissStreakAndDedupe(t *testing.T) {
 	c2 := newRAIDTestCollector(f2)
 	got2 := c2.walkIDs(context.Background(), c2.smartctl, "/dev/sdb", 0, 63, 16, serials, devs, func(i int) string {
 		return "megaraid," + strconv.Itoa(i)
-	})
+	}, nil)
 	if len(got2) != 0 {
 		t.Fatalf("walkIDs must skip serials already claimed by another node, got %+v", got2)
 	}
@@ -351,7 +352,7 @@ func TestProbeRAIDPassthroughNoDrivesSetsNote(t *testing.T) {
 		"-i --json=c /dev/sda": fakeVDIdentity,
 	}}
 	c := newRAIDTestCollector(f)
-	found, hide, note := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
+	found, hide, note, _, _ := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
 		[]smartDevice{{name: "/dev/sda", devType: "scsi"}}, false,
 		[]smartDevice{{name: "/dev/sda", devType: "scsi"}})
 	if len(found) != 0 || len(hide) != 0 {
@@ -371,7 +372,7 @@ func TestProbeRAIDPassthroughSkipsScannedFamily(t *testing.T) {
 		{name: "/dev/sda", devType: "scsi"},
 		{name: "/dev/bus/0", devType: "megaraid,8"},
 	}
-	found, _, note := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
+	found, _, note, _, _ := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux",
 		[]smartDevice{{name: "/dev/sda", devType: "scsi"}}, false, scanned)
 	if len(found) != 0 {
 		t.Fatalf("expected no probed drives when scan already enumerated megaraid, got %+v", found)
@@ -394,13 +395,13 @@ func TestCollectMegaRAIDEndToEnd(t *testing.T) {
 		"temperature":{"current":36},"power_on_time":{"hours":41002},"smart_status":{"passed":true},
 		"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":3}}]}}`
 	f := &fakeSmartctl{responses: map[string]string{
-		"--scan --json=c":                    `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
-		"-i --json=c /dev/sda":               fakeVDIdentity,
-		"-i --json=c -d megaraid,8 /dev/sda": fakeSASDisk8,
-		"-i --json=c -d megaraid,9 /dev/sda": fakeSASDisk9,
-		"-a --json=c /dev/sda":               `{"smartctl":{"exit_status":4}}`,
-		"-a --json=c -d megaraid,8 /dev/sda": fullRead8,
-		"-a --json=c -d megaraid,9 /dev/sda": fullRead9,
+		"--scan --json=c":                               `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
+		"-i --json=c /dev/sda":                          fakeVDIdentity,
+		"-i --json=c -d megaraid,8 /dev/sda":            fakeSASDisk8,
+		"-i --json=c -d megaraid,9 /dev/sda":            fakeSASDisk9,
+		"-a --json=c -l devstat /dev/sda":               `{"smartctl":{"exit_status":4}}`,
+		"-a --json=c -l devstat -d megaraid,8 /dev/sda": fullRead8,
+		"-a --json=c -l devstat -d megaraid,9 /dev/sda": fullRead9,
 	}}
 	c := newRAIDTestCollector(f)
 	if !c.ensure(context.Background()) {
@@ -450,9 +451,9 @@ func TestCollectMegaRAIDEndToEnd(t *testing.T) {
 
 func TestCollectRAIDNoteSurfacesState(t *testing.T) {
 	f := &fakeSmartctl{responses: map[string]string{
-		"--scan --json=c":      `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
-		"-i --json=c /dev/sda": fakeVDIdentity,
-		"-a --json=c /dev/sda": `{"smartctl":{"exit_status":4}}`,
+		"--scan --json=c":                 `{"devices":[{"name":"/dev/sda","type":"scsi","protocol":"SCSI"}]}`,
+		"-i --json=c /dev/sda":            fakeVDIdentity,
+		"-a --json=c -l devstat /dev/sda": `{"smartctl":{"exit_status":4}}`,
 	}}
 	c := newRAIDTestCollector(f)
 	if !c.ensure(context.Background()) {
@@ -538,5 +539,135 @@ func TestSmartPointsATA(t *testing.T) {
 	}
 	if _, ok := m[metrics.SmartPercentUsed]; ok {
 		t.Errorf("ATA device should not emit NVMe percent used")
+	}
+}
+
+func TestSmartPointsATADeviceStatistics(t *testing.T) {
+	const body = `{
+		"logical_block_size": 512,
+		"ata_device_statistics": {"pages": [{"number": 7, "name": "Solid State Device Statistics", "table": [
+			{"name": "Logical Sectors Written", "value": 1200},
+			{"name": "Logical Sectors Read", "value": 3400},
+			{"name": "Number of Reported Uncorrectable Errors", "value": 5}
+		]}]}
+	}`
+	var s smartView
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	m := indexPoints(smartPoints(time.Now(), map[string]string{"device": "sda"}, &s))
+	if m[metrics.SmartDataWrittenBytes] != 1200*512 || m[metrics.SmartDataReadBytes] != 3400*512 || m[metrics.SmartMediaErrors] != 5 {
+		t.Fatalf("device statistics points = %#v", m)
+	}
+}
+
+func TestSmartPointsATADeviceStatisticsWins(t *testing.T) {
+	const body = `{
+		"logical_block_size": 512,
+		"ata_smart_attributes": {"table": [{"name": "Total_LBAs_Written", "raw": {"value": 99}}]},
+		"ata_device_statistics": {"pages": [{"number": 7, "name": "Device Statistics", "table": [
+			{"name": "Logical Sectors Written", "value": 1234}
+		]}]}
+	}`
+	var s smartView
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	points := smartPoints(time.Now(), map[string]string{"device": "sda"}, &s)
+	m := indexPoints(points)
+	if m[metrics.SmartDataWrittenBytes] != 1234*512 {
+		t.Fatalf("data written = %v, want %v", m[metrics.SmartDataWrittenBytes], 1234*512)
+	}
+	count := 0
+	for _, p := range points {
+		if p.Metric == metrics.SmartDataWrittenBytes {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("written point count = %d, want 1", count)
+	}
+}
+
+func TestSmartPointsATADeviceStatistics4Kn(t *testing.T) {
+	const body = `{
+		"logical_block_size": 4096,
+		"ata_device_statistics": {"pages": [{"number": 7, "name": "Device Statistics", "table": [
+			{"name": "Logical Sectors Written", "value": 11},
+			{"name": "Logical Sectors Read", "value": 17}
+		]}]}
+	}`
+	var s smartView
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	m := indexPoints(smartPoints(time.Now(), map[string]string{"device": "sda"}, &s))
+	if m[metrics.SmartDataWrittenBytes] != 11*4096 || m[metrics.SmartDataReadBytes] != 17*4096 {
+		t.Fatalf("4Kn device statistics points = %#v", m)
+	}
+}
+
+func TestSmartPointsSATAPercentUsed(t *testing.T) {
+	const body = `{
+		"ata_device_statistics": {"pages": [{"number": 7, "name": "Solid State Device Statistics", "table": [
+			{"name": "Percentage Used Endurance Indicator", "value": 37}
+		]}]}
+	}`
+	var s smartView
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	m := indexPoints(smartPoints(time.Now(), map[string]string{"device": "sda"}, &s))
+	if m[metrics.SmartPercentUsed] != 37 {
+		t.Fatalf("percent used = %v, want 37", m[metrics.SmartPercentUsed])
+	}
+}
+
+func TestSmartPointsSCSI(t *testing.T) {
+	const body = `{
+		"scsi_grown_defect_list": 14,
+		"scsi_error_counter_log": {
+			"read": {"gigabytes_processed": "123.5", "total_uncorrected_errors": 2},
+			"write": {"gigabytes_processed": "45.25", "total_uncorrected_errors": 3}
+		}
+	}`
+	var s smartView
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	m := indexPoints(smartPoints(time.Now(), map[string]string{"device": "sda"}, &s))
+	if m[metrics.SmartDataReadBytes] != 123.5e9 || m[metrics.SmartDataWrittenBytes] != 45.25e9 || m[metrics.SmartReallocSectors] != 14 || m[metrics.SmartMediaErrors] != 5 {
+		t.Fatalf("SCSI points = %#v", m)
+	}
+}
+
+func TestSmartDevstatUnsupportedStillReads(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"-a --json=c -l devstat /dev/sda": `{
+			"smartctl":{"exit_status":4,"messages":[{"string":"Device Statistics log not supported","severity":"information"}]},
+			"temperature":{"current":31},
+			"smart_status":{"passed":true}
+		}`,
+	}}
+	c := &smartCollector{
+		probed:        true,
+		smartctl:      "/fake/smartctl",
+		storcliProbed: true,
+		goos:          "darwin",
+		scanned:       []smartDevice{{name: "/dev/sda", devType: "ata"}},
+		devicesAt:     time.Now(),
+		devicesTTL:    time.Hour,
+		execFn:        f.exec,
+	}
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	m := indexPoints(points)
+	if m[metrics.SmartTempC] != 31 || m[metrics.SmartHealthy] != 1 {
+		t.Fatalf("normal SMART points missing: %#v", m)
+	}
+	if state := c.Status().State; state != smartStateOK {
+		t.Fatalf("state = %q, want %q", state, smartStateOK)
 	}
 }

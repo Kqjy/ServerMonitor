@@ -36,6 +36,7 @@ type Client struct {
 	appliedIntervalS int
 
 	controlCh chan ControlUpdate
+	browseCh  chan struct{}
 
 	healthMu   sync.Mutex
 	healthPath string
@@ -75,6 +76,7 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 		deregisteredCh: make(chan struct{}),
 		intervalCh:     make(chan int, 1),
 		controlCh:      make(chan ControlUpdate, 1),
+		browseCh:       make(chan struct{}, 1),
 	}
 }
 
@@ -84,6 +86,10 @@ func refuseRedirect(req *http.Request, via []*http.Request) error {
 
 func (c *Client) ControlUpdates() <-chan ControlUpdate {
 	return c.controlCh
+}
+
+func (c *Client) BrowseSignals() <-chan struct{} {
+	return c.browseCh
 }
 
 func (c *Client) SetHealthPath(p string) {
@@ -280,14 +286,15 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		ackBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		ackBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		_, _ = io.Copy(io.Discard, resp.Body)
 		var ack struct {
-			IntervalS          int    `json:"interval_s"`
-			LatestAgentVersion string `json:"latest_agent_version"`
-			AutoUpgrade        *bool  `json:"auto_upgrade"`
-			UpgradeNow         bool   `json:"upgrade_now"`
-			ServerPubkey       string `json:"server_pubkey"`
+			IntervalS           int    `json:"interval_s"`
+			LatestAgentVersion  string `json:"latest_agent_version"`
+			AutoUpgrade         *bool  `json:"auto_upgrade"`
+			UpgradeNow          bool   `json:"upgrade_now"`
+			ServerPubkey        string `json:"server_pubkey"`
+			BackupBrowsePending bool   `json:"backup_browse_pending"`
 		}
 		if len(ackBytes) > 0 {
 			_ = json.Unmarshal(ackBytes, &ack)
@@ -326,7 +333,81 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 				}
 			}
 		}
+		if ack.BackupBrowsePending {
+			select {
+			case c.browseCh <- struct{}{}:
+			default:
+			}
+		}
 		c.writeHealth()
+		return nil
+	}
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode == http.StatusGone {
+		c.markDeregistered()
+		return ErrDeregistered
+	}
+	return &httpError{status: resp.StatusCode, body: string(data)}
+}
+
+func (c *Client) FetchBackupBrowseJobs(ctx context.Context) ([]wire.BackupBrowseJob, error) {
+	select {
+	case <-c.deregisteredCh:
+		return nil, ErrDeregistered
+	default:
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/agent/backup-browse", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Agent-Token", c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+	if resp.StatusCode == http.StatusGone {
+		c.markDeregistered()
+		return nil, ErrDeregistered
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &httpError{status: resp.StatusCode, body: string(data)}
+	}
+	var body wire.BackupBrowseJobs
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	if err := dec.Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode backup browse jobs: %w", err)
+	}
+	return body.Jobs, nil
+}
+
+func (c *Client) PostBackupBrowseResult(ctx context.Context, jobID string, result wire.BackupBrowseResult) error {
+	select {
+	case <-c.deregisteredCh:
+		return ErrDeregistered
+	default:
+	}
+	body, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/agent/backup-browse/"+jobID, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Token", c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

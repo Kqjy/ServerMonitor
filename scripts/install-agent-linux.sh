@@ -23,6 +23,8 @@ esac
 BACKUP_REPOS="${SM_BACKUP_REPOS:-}"
 BACKUP_REPO_NAMES="${SM_BACKUP_REPO_NAMES:-}"
 BACKUP_PATHS="${SM_BACKUP_PATHS:-}"
+BACKUP_EXCLUDES="${SM_BACKUP_EXCLUDES:-}"
+BACKUP_ONE_FILE_SYSTEM="${SM_BACKUP_ONE_FILE_SYSTEM:-}"
 BACKUP_TIME="${SM_BACKUP_TIME:-02:30}"
 BACKUP_PRUNE_MODE="${SM_BACKUP_PRUNE_MODE:-host}"
 BACKUP_S3_REGION="${SM_BACKUP_S3_REGION:-}"
@@ -37,10 +39,12 @@ BACKUP_PRESERVED_TUNNEL_SECTION=""
 BACKUP_TUNNEL_SECTION_PRESERVED=0
 REINSTALL="${SM_REINSTALL:-0}"
 RESTIC_VERSION="0.19.0"
+DEFAULT_BACKUP_EXCLUDES_CSV='**/.cache,/var/lib/servermonitor,/var/lib/docker/overlay2,/var/lib/docker/overlay,/var/lib/docker/image,/var/lib/docker/containers,/var/lib/docker/buildkit,/var/lib/docker/tmp,/var/lib/docker/plugins,/var/lib/docker/network,/var/lib/docker/runtimes,/var/lib/docker/aufs,/var/lib/docker/btrfs,/var/lib/docker/devicemapper,/var/lib/docker/fuse-overlayfs,/var/lib/docker/vfs,/var/lib/docker/zfs,/var/lib/containerd'
+DEFAULT_BACKUP_EXCLUDES_TOML='excludes = ["**/.cache", "/var/lib/servermonitor", "/var/lib/docker/overlay2", "/var/lib/docker/overlay", "/var/lib/docker/image", "/var/lib/docker/containers", "/var/lib/docker/buildkit", "/var/lib/docker/tmp", "/var/lib/docker/plugins", "/var/lib/docker/network", "/var/lib/docker/runtimes", "/var/lib/docker/aufs", "/var/lib/docker/btrfs", "/var/lib/docker/devicemapper", "/var/lib/docker/fuse-overlayfs", "/var/lib/docker/vfs", "/var/lib/docker/zfs", "/var/lib/containerd"]'
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--disable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-time HH:MM] [--reinstall]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--disable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-excludes CSV] [--backup-one-file-system 0|1] [--backup-time HH:MM] [--reinstall]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
@@ -74,6 +78,8 @@ Backup inputs (used with --enable-backup; each also settable via the matching SM
                                tunnel:NAME backs up over the built-in WireGuard tunnel to the ServerMonitor server (requires the server to run with BACKUP_WG_PORT)
   --backup-repo-names NAMES   comma-separated logical names matching --backup-repos (default repo1..repoN)
   --backup-paths PATHS        comma-separated paths to back up (default /etc,/home,/root,/var/lib)
+  --backup-excludes CSV       comma-separated restic excludes; none disables defaults, +CSV appends, any other CSV replaces them
+  --backup-one-file-system 0|1 stay on each listed path's filesystem (default 1)
   --backup-time HH:MM         local time for the nightly backup (default 02:30, with a randomized delay)
   --backup-prune-mode MODE    "host" (prune after each run; default) or "external" (host never prunes; a trusted box holding the key prunes). Use "external" against append-only endpoints
   --backup-s3-region REGION   region for s3: repositories (also SM_BACKUP_S3_REGION)
@@ -124,6 +130,10 @@ refresh_agent_binaries() {
     install -o root -g root -m 0755 "$BIN_PATH" /usr/local/bin/sm-agent
     install -o sm-agent -g sm-agent -m 0755 "$BIN_PATH" /opt/servermonitor/sm-agent
     return 0
+  fi
+  if [ -f /usr/local/bin/sm-agent ]; then
+    chown root:root /usr/local/bin/sm-agent
+    chmod 0755 /usr/local/bin/sm-agent
   fi
   local old_version new_version resident_version
   if [ -n "$BIN_PATH" ]; then
@@ -249,6 +259,8 @@ while [[ $# -gt 0 ]]; do
     --backup-repos)      BACKUP_REPOS="$2"; shift 2 ;;
     --backup-repo-names) BACKUP_REPO_NAMES="$2"; shift 2 ;;
     --backup-paths)      BACKUP_PATHS="$2"; shift 2 ;;
+    --backup-excludes)   BACKUP_EXCLUDES="$2"; shift 2 ;;
+    --backup-one-file-system) BACKUP_ONE_FILE_SYSTEM="$2"; shift 2 ;;
     --backup-time)       BACKUP_TIME="$2"; shift 2 ;;
     --backup-prune-mode) BACKUP_PRUNE_MODE="$2"; shift 2 ;;
     --backup-s3-region)  BACKUP_S3_REGION="$2"; shift 2 ;;
@@ -562,11 +574,31 @@ backup_write_env_file() {
 }
 
 backup_write_toml() {
-  local tmp i name url tunnel_name tunnel_node first item
-  local -a repo_arr name_arr path_arr
+  local tmp i name url tunnel_name tunnel_node first item path_csv excludes_value one_file_system
+  local -a repo_arr name_arr path_arr exclude_arr default_exclude_arr appended_exclude_arr
   IFS=',' read -ra repo_arr <<< "$BACKUP_REPOS"
   IFS=',' read -ra name_arr <<< "$BACKUP_REPO_NAMES"
-  IFS=',' read -ra path_arr <<< "${BACKUP_PATHS:-/etc,/home,/root,/var/lib}"
+  path_csv="$BACKUP_PATHS"
+  if [ -z "$path_csv" ]; then
+    path_csv="/etc,/home,/root,/var/lib"
+    [ -d /var/lib/docker/volumes ] && path_csv="$path_csv,/var/lib/docker/volumes"
+  fi
+  IFS=',' read -ra path_arr <<< "$path_csv"
+  excludes_value="$(backup_trim "$BACKUP_EXCLUDES")"
+  IFS=',' read -ra default_exclude_arr <<< "$DEFAULT_BACKUP_EXCLUDES_CSV"
+  case "$(printf '%s' "$excludes_value" | tr '[:upper:]' '[:lower:]')" in
+    '') exclude_arr=("${default_exclude_arr[@]}") ;;
+    none) exclude_arr=() ;;
+    +*)
+      IFS=',' read -ra appended_exclude_arr <<< "${excludes_value#+}"
+      exclude_arr=("${default_exclude_arr[@]}" ${appended_exclude_arr[@]+"${appended_exclude_arr[@]}"})
+      ;;
+    *) IFS=',' read -ra exclude_arr <<< "$excludes_value" ;;
+  esac
+  case "$(printf '%s' "$(backup_trim "$BACKUP_ONE_FILE_SYSTEM")" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no) one_file_system=false ;;
+    *) one_file_system=true ;;
+  esac
   tmp="$(mktemp /etc/servermonitor-backup/backup.toml.XXXXXX)"
   {
     echo "status_path = \"/var/lib/servermonitor/backup-status.json\""
@@ -580,8 +612,20 @@ backup_write_toml() {
       printf '"%s"' "$(backup_toml_escape "$item")"
     done
     printf ']\n'
-    echo "excludes = [\"**/.cache\", \"/var/lib/docker\", \"/var/lib/servermonitor\"]"
-    echo "one_file_system = true"
+    if [ -z "$excludes_value" ]; then
+      echo "$DEFAULT_BACKUP_EXCLUDES_TOML"
+    else
+      first=1
+      printf 'excludes = ['
+      for item in ${exclude_arr[@]+"${exclude_arr[@]}"}; do
+        item="$(backup_trim "$item")"
+        [ -z "$item" ] && continue
+        if [ "$first" = 1 ]; then first=0; else printf ', '; fi
+        printf '"%s"' "$(backup_toml_escape "$item")"
+      done
+      printf ']\n'
+    fi
+    printf 'one_file_system = %s\n' "$one_file_system"
     printf 'prune_mode = "%s"\n' "$BACKUP_PRUNE_MODE"
     echo ""
     echo "[retention]"

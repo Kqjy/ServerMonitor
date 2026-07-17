@@ -23,7 +23,7 @@ const (
 	maxIngestDecompressed = 256 << 20
 )
 
-func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer *agentsig.Signer, logger *slog.Logger) http.HandlerFunc {
+func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer *agentsig.Signer, logger *slog.Logger, browse *browseStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := hostIDFromContext(r.Context())
 		if !ok {
@@ -63,6 +63,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 
 		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 {
 			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
+			if browse != nil {
+				emptyAck.BackupBrowsePending = browse.HasPending(hostID)
+			}
 			if signer != nil {
 				emptyAck.ServerPubkey = signer.PublicKeyHex()
 			}
@@ -170,6 +173,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			Accepted:           len(batch.Points),
 			HostID:             hostID,
 			LatestAgentVersion: version.Version,
+		}
+		if browse != nil {
+			ack.BackupBrowsePending = browse.HasPending(hostID)
 		}
 		if signer != nil {
 			ack.ServerPubkey = signer.PublicKeyHex()

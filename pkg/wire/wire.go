@@ -73,7 +73,43 @@ type BackupRepoStatus struct {
 	CheckSuccess  *bool            `json:"check_success,omitempty"`
 	Tunnel        bool             `json:"tunnel,omitempty"`
 	NextRun       *time.Time       `json:"next_run,omitempty"`
+	Paths         []string         `json:"paths,omitempty"`
+	Excludes      []string         `json:"excludes,omitempty"`
+	OneFileSystem *bool            `json:"one_file_system,omitempty"`
+	PathStats     []BackupPathStat `json:"path_stats,omitempty"`
+	StatsSnapshot string           `json:"stats_snapshot,omitempty"`
 	Snapshots     []BackupSnapshot `json:"snapshots,omitempty"`
+}
+
+type BackupBrowseJob struct {
+	ID       string `json:"id"`
+	Repo     string `json:"repo"`
+	Snapshot string `json:"snapshot"`
+	Path     string `json:"path"`
+}
+
+type BackupBrowseJobs struct {
+	Jobs []BackupBrowseJob `json:"jobs"`
+}
+
+type BackupBrowseEntry struct {
+	Name  string     `json:"name"`
+	Type  string     `json:"type"`
+	Size  int64      `json:"size,omitempty"`
+	Mtime *time.Time `json:"mtime,omitempty"`
+}
+
+type BackupBrowseResult struct {
+	Entries   []BackupBrowseEntry `json:"entries,omitempty"`
+	Truncated bool                `json:"truncated,omitempty"`
+	Error     string              `json:"error,omitempty"`
+	ErrorKind string              `json:"error_kind,omitempty"`
+}
+
+type BackupPathStat struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	Files int64  `json:"files"`
 }
 
 type TunnelEnrollRequest struct {
@@ -173,14 +209,15 @@ type Batch struct {
 }
 
 type IngestAck struct {
-	Accepted           int    `json:"accepted"`
-	HostID             int64  `json:"host_id"`
-	Message            string `json:"message,omitempty"`
-	IntervalS          int    `json:"interval_s,omitempty"`
-	LatestAgentVersion string `json:"latest_agent_version,omitempty"`
-	AutoUpgrade        *bool  `json:"auto_upgrade,omitempty"`
-	UpgradeNow         bool   `json:"upgrade_now,omitempty"`
-	ServerPubkey       string `json:"server_pubkey,omitempty"`
+	Accepted            int    `json:"accepted"`
+	HostID              int64  `json:"host_id"`
+	Message             string `json:"message,omitempty"`
+	IntervalS           int    `json:"interval_s,omitempty"`
+	LatestAgentVersion  string `json:"latest_agent_version,omitempty"`
+	AutoUpgrade         *bool  `json:"auto_upgrade,omitempty"`
+	UpgradeNow          bool   `json:"upgrade_now,omitempty"`
+	ServerPubkey        string `json:"server_pubkey,omitempty"`
+	BackupBrowsePending bool   `json:"backup_browse_pending,omitempty"`
 }
 
 type RegisterRequest struct {

@@ -36,6 +36,15 @@
   let pickerOpen = $state(false);
   let upgradeBusy = $state(false);
   let upgradeError = $state<string | null>(null);
+  let installBaseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
+  let agentHealthCopy = $state<'idle' | 'stale' | 'perms' | 'failed'>('idle');
+  let agentHealthCopyTimer: ReturnType<typeof setTimeout> | null = null;
+  const backupAgentState = $derived(host?.collector_status?.backup?.state ?? '');
+  const backupAgentMessage = $derived(host?.collector_status?.backup?.message ?? '');
+  const staleAgentInstallCommand = $derived((host?.os ?? '').toLowerCase().startsWith('windows')
+    ? `iex (iwr -useb ${installBaseUrl}/install.ps1).Content`
+    : `sudo bash -c "curl -fsSL ${installBaseUrl}/install.sh | bash"`);
+  const agentPermsCommand = 'sudo chown root:root /usr/local/bin/sm-agent && sudo chmod 0755 /usr/local/bin/sm-agent';
 
   const tabs: { value: TabName; label: string }[] = [
     { value: 'overview', label: 'Overview' },
@@ -73,6 +82,26 @@
     } finally {
       upgradeBusy = false;
     }
+  }
+
+  async function loadInstallBaseUrl() {
+    try {
+      const info = await api.serverInfo();
+      installBaseUrl = (info.url || window.location.origin).replace(/\/+$/, '');
+    } catch {
+      installBaseUrl = window.location.origin;
+    }
+  }
+
+  async function copyAgentHealthCommand(command: string, key: 'stale' | 'perms') {
+    if (agentHealthCopyTimer) clearTimeout(agentHealthCopyTimer);
+    try {
+      await navigator.clipboard.writeText(command);
+      agentHealthCopy = key;
+    } catch {
+      agentHealthCopy = 'failed';
+    }
+    agentHealthCopyTimer = setTimeout(() => (agentHealthCopy = 'idle'), 1500);
   }
 
   $effect(() => {
@@ -115,10 +144,12 @@
   });
 
   onMount(() => {
+    void loadInstallBaseUrl();
     timer = setInterval(refresh, 15_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    if (agentHealthCopyTimer) clearTimeout(agentHealthCopyTimer);
   });
 </script>
 
@@ -156,7 +187,7 @@
       </div>
     {/if}
     <div class="flex flex-wrap items-end gap-x-6 gap-y-3 mb-4">
-      <div class="min-w-0">
+      <div class="min-w-0 flex-1">
         <h1 class="flex items-baseline gap-3 text-xl sm:text-2xl font-semibold tracking-tight">
           <StatusDot status={s} size="lg" />
           <span class="truncate">{host.hostname}</span>
@@ -165,8 +196,11 @@
           {host.os || '—'}{host.arch ? ` · ${host.arch}` : ''}{host.kernel ? ` · ${host.kernel}` : ''}
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
         </div>
-        {#if host.update_available}
-          <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        {#if host.update_available || backupAgentState === 'stale_agent' || backupAgentState === 'agent_perms'}
+          <div class="mt-3 rounded-lg border px-4 py-3 {backupAgentState === 'agent_perms' && !host.update_available ? 'border-rose-900/50 bg-rose-950/20' : 'border-amber-900/50 bg-amber-950/20'}">
+            <div class="space-y-3">
+            {#if host.update_available}
+              <div class="flex flex-wrap items-center gap-2 text-xs">
             <span class="text-sky-300">Update to v{host.latest_agent_version} available</span>
             {#if host.externally_managed}
               <span
@@ -236,6 +270,33 @@
             {#if upgradeError}
               <span class="text-rose-300">{upgradeError}</span>
             {/if}
+              </div>
+            {/if}
+            {#if backupAgentState === 'stale_agent'}
+              <div class="text-xs text-amber-100/90 {host.update_available ? 'border-t border-amber-900/40 pt-3' : ''}">
+                <div>{backupAgentMessage}</div>
+                <div class="mt-1 text-amber-100/70">Re-run the install script to refresh the privileged backup agent copy.</div>
+                <div class="mt-2 flex items-center gap-2">
+                  <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{staleAgentInstallCommand}</code>
+                  <button type="button" onclick={() => copyAgentHealthCommand(staleAgentInstallCommand, 'stale')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+                    {agentHealthCopy === 'stale' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
+                  </button>
+                </div>
+              </div>
+            {/if}
+            {#if backupAgentState === 'agent_perms'}
+              <div class="text-xs text-rose-100/90 {host.update_available ? 'rounded-md border border-rose-900/40 bg-rose-950/30 p-3' : ''}">
+                <div>{backupAgentMessage}</div>
+                <div class="mt-2 flex items-center gap-2">
+                  <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{agentPermsCommand}</code>
+                  <button type="button" onclick={() => copyAgentHealthCommand(agentPermsCommand, 'perms')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+                    {agentHealthCopy === 'perms' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
+                  </button>
+                </div>
+                <div class="mt-2 text-rose-100/70">Upgrading the agent makes the privileged sync service repair this automatically going forward. Re-running the installer also fixes it.</div>
+              </div>
+            {/if}
+            </div>
           </div>
         {/if}
       </div>

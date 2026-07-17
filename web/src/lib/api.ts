@@ -132,7 +132,31 @@ export interface BackupRepoStatus {
   check_success?: boolean;
   tunnel?: boolean;
   next_run?: string;
+  paths?: string[];
+  excludes?: string[];
+  one_file_system?: boolean;
+  path_stats?: { path: string; bytes: number; files: number }[];
+  stats_snapshot?: string;
   snapshots?: BackupSnapshot[];
+}
+
+export interface BackupBrowseEntry {
+  name: string;
+  type: string;
+  size?: number;
+  mtime?: string;
+}
+
+export interface BackupBrowseResult {
+  entries?: BackupBrowseEntry[];
+  truncated?: boolean;
+  error?: string;
+  error_kind?: string;
+}
+
+export interface BackupBrowseJobStatus {
+  status: string;
+  result?: BackupBrowseResult;
 }
 
 export interface BackupRepoRow {
@@ -553,6 +577,19 @@ export const api = {
   },
   backups: (hostId: number, opts: { signal?: AbortSignal } = {}) =>
     request<BackupsResp>(`/api/v1/hosts/${hostId}/backups`, { signal: opts.signal }),
+  backupBrowseStart: (
+    hostId: number,
+    body: { repo: string; snapshot: string; path: string },
+    opts: { signal?: AbortSignal } = {}
+  ) =>
+    request<{ job_id: string }>(`/api/v1/hosts/${hostId}/backups/browse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: opts.signal
+    }),
+  backupBrowseJob: (hostId: number, jobId: string, opts: { signal?: AbortSignal } = {}) =>
+    request<BackupBrowseJobStatus>(`/api/v1/hosts/${hostId}/backups/browse/${jobId}`, { signal: opts.signal }),
   processSeries: (
     hostId: number,
     pid: number,
@@ -599,6 +636,7 @@ export const api = {
     }),
   alertDelete: (id: number) => request<void>(`/api/v1/alerts/${id}`, { method: 'DELETE' }),
   alertHistory: (limit = 100) => request<AlertHistoryRow[]>(`/api/v1/alerts/history?limit=${limit}`),
+  alertHistoryClear: (olderThanDays?: number) => request<{ deleted: number }>(`/api/v1/alerts/history${olderThanDays ? `?older_than_days=${olderThanDays}` : ''}`, { method: 'DELETE' }),
 
   channels: () => request<Channel[]>('/api/v1/channels'),
   channelCreate: (c: ChannelInput) =>

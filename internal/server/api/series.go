@@ -1039,8 +1039,12 @@ func csvFilename(hostname, metric string) string {
 }
 
 func setCSVHeaders(w http.ResponseWriter, hostname, metric string) *csv.Writer {
+	return setCSVHeadersFilename(w, csvFilename(hostname, metric))
+}
+
+func setCSVHeadersFilename(w http.ResponseWriter, filename string) *csv.Writer {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, csvFilename(hostname, metric)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.WriteHeader(http.StatusOK)
 	return csv.NewWriter(w)
 }

@@ -46,6 +46,7 @@ func TestExternallyManagedPresenceTracking(t *testing.T) {
 
 func TestBatchBackupRoundTrip(t *testing.T) {
 	ok := true
+	oneFileSystem := false
 	started := time.Date(2026, 7, 3, 2, 30, 0, 0, time.UTC)
 	finished := time.Date(2026, 7, 3, 2, 41, 12, 0, time.UTC)
 	b := Batch{
@@ -63,6 +64,15 @@ func TestBatchBackupRoundTrip(t *testing.T) {
 			SnapshotCount: 87,
 			CheckLast:     &finished,
 			CheckSuccess:  &ok,
+			Paths:         []string{"/etc", "/var/lib/docker/volumes"},
+			Excludes:      []string{"/var/lib/docker/overlay2"},
+			OneFileSystem: &oneFileSystem,
+			PathStats: []BackupPathStat{{
+				Path:  "/var/lib/docker/volumes",
+				Bytes: 9126805504,
+				Files: 421,
+			}},
+			StatsSnapshot: "1a2b3c4d",
 			Snapshots: []BackupSnapshot{{
 				ID:    "1a2b3c4d",
 				Time:  started,
@@ -81,8 +91,39 @@ func TestBatchBackupRoundTrip(t *testing.T) {
 	if err := dec.Decode(&got); err != nil {
 		t.Fatalf("decode with DisallowUnknownFields: %v", err)
 	}
-	if len(got.Backups) != 1 || got.Backups[0].Name != "vps-a" || got.Backups[0].Snapshots[0].ID != "1a2b3c4d" {
+	if len(got.Backups) != 1 || got.Backups[0].Name != "vps-a" || got.Backups[0].Snapshots[0].ID != "1a2b3c4d" || len(got.Backups[0].Paths) != 2 || got.Backups[0].Excludes[0] != "/var/lib/docker/overlay2" || got.Backups[0].OneFileSystem == nil || *got.Backups[0].OneFileSystem || got.Backups[0].StatsSnapshot != "1a2b3c4d" || got.Backups[0].PathStats[0].Files != 421 {
 		t.Fatalf("backup round-trip mismatch: %+v", got.Backups)
+	}
+}
+
+func TestBackupBrowseWireRoundTrip(t *testing.T) {
+	mtime := time.Date(2026, 7, 17, 8, 30, 0, 0, time.UTC)
+	value := BackupBrowseResult{
+		Entries:   []BackupBrowseEntry{{Name: "data", Type: "dir", Mtime: &mtime}, {Name: "db.sqlite", Type: "file", Size: 4096, Mtime: &mtime}},
+		Truncated: true,
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got BackupBrowseResult
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entries) != 2 || got.Entries[1].Size != 4096 || !got.Truncated || got.Entries[0].Mtime == nil || !got.Entries[0].Mtime.Equal(mtime) {
+		t.Fatalf("browse round-trip mismatch: %+v", got)
+	}
+}
+
+func TestIngestAckBackupBrowseFieldName(t *testing.T) {
+	raw, err := json.Marshal(IngestAck{BackupBrowsePending: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"backup_browse_pending":true`)) {
+		t.Fatalf("ack json = %s", raw)
 	}
 }
 

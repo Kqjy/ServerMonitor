@@ -356,12 +356,12 @@
     return m;
   });
 
-  const activeBackupStates = new Set(['ok', 'stale', 'error', 'scheduled', 'stale_agent']);
+  const activeBackupStates = new Set(['ok', 'stale', 'error', 'scheduled', 'stale_agent', 'agent_perms']);
   const hostBackups = $derived.by<HostBackup[]>(() =>
     hosts
       .filter((h) => {
         const state = h.collector_status?.backup?.state ?? '';
-        return activeBackupStates.has(state) && !(state === 'stale_agent' && nodes.some((n) => n.host_id === h.id));
+        return activeBackupStates.has(state) && !((state === 'stale_agent' || state === 'agent_perms') && nodes.some((n) => n.host_id === h.id));
       })
       .map((h) => ({
         id: h.id,
@@ -380,6 +380,7 @@
       case 'stale':
       case 'stale_agent':
         return 'bg-amber-400';
+      case 'agent_perms':
       case 'error':
         return 'bg-rose-400';
       case 'scheduled':
@@ -395,6 +396,7 @@
       case 'stale':
       case 'stale_agent':
         return 'text-amber-300';
+      case 'agent_perms':
       case 'error':
         return 'text-rose-300';
       case 'scheduled':
@@ -411,6 +413,8 @@
         return 'stale';
       case 'stale_agent':
         return 'stale agent';
+      case 'agent_perms':
+        return 'backups blocked';
       case 'error':
         return 'error';
       case 'scheduled':
@@ -927,7 +931,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                   <button type="button" onclick={() => copy(dockerRedeployCommand, 'docker-redeploy')} class="absolute top-2 right-2 text-[11px] px-2 py-0.5 rounded bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300">{copied === 'docker-redeploy' ? 'copied' : 'copy'}</button>
                 </div>
                 <p class="text-[11px] text-zinc-500">
-                  Backs up <span class="font-mono">/etc /home /root /var/lib</span> by default (override with <span class="font-mono">SM_BACKUP_PATHS</span>); the daily run happens at
+                  Backs up <span class="font-mono">/etc /home /root /var/lib</span> by default, plus <span class="font-mono">/var/lib/docker/volumes</span> when present. Docker image layers, build caches and container logs are excluded; named volumes are included. Override with <span class="font-mono">SM_BACKUP_PATHS</span> / <span class="font-mono">SM_BACKUP_EXCLUDES</span>; the daily run happens at
                   <span class="font-mono">SM_BACKUP_TIME</span> interpreted in <span class="font-mono">TZ</span>. See <span class="font-mono text-zinc-400">deploy/AGENT-DOCKER.md</span> → Managed backups
                   for the complete recipe, including the one-time recovery kit that protects the generated encryption key.
                 </p>

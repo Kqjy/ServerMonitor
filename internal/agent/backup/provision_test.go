@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,18 @@ import (
 
 func envFrom(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
+}
+
+func missingPath(string) error {
+	return os.ErrNotExist
+}
+
+func defaultExcludesLine() string {
+	quoted := make([]string, len(DefaultLinuxExcludes))
+	for i, exclude := range DefaultLinuxExcludes {
+		quoted[i] = strconv.Quote(exclude)
+	}
+	return "excludes = [" + strings.Join(quoted, ", ") + "]"
 }
 
 func TestRenderBackupTOMLIsValid(t *testing.T) {
@@ -33,7 +46,7 @@ func TestRenderBackupTOMLIsValid(t *testing.T) {
 		"SM_BACKUP_S3_ACCESS_KEY_ID":     "AKIA",
 		"SM_BACKUP_S3_SECRET_ACCESS_KEY": "secret",
 	})
-	toml, err := renderBackupTOML(getenv, "/state/backup/backup.key", "/state/backup/repo-credentials.env", true)
+	toml, err := renderBackupTOML(getenv, "/state/backup/backup.key", "/state/backup/repo-credentials.env", true, missingPath)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -70,6 +83,149 @@ func TestRenderBackupTOMLIsValid(t *testing.T) {
 	}
 }
 
+func TestRenderBackupTOMLScopeOverrides(t *testing.T) {
+	tests := []struct {
+		name         string
+		env          map[string]string
+		wantExcludes string
+		wantOneFS    string
+	}{
+		{name: "defaults", env: map[string]string{}, wantExcludes: defaultExcludesLine(), wantOneFS: "one_file_system = true"},
+		{name: "no excludes", env: map[string]string{"SM_BACKUP_EXCLUDES": "none"}, wantExcludes: "excludes = []", wantOneFS: "one_file_system = true"},
+		{name: "append excludes", env: map[string]string{"SM_BACKUP_EXCLUDES": "+/srv/cache"}, wantExcludes: strings.TrimSuffix(defaultExcludesLine(), "]") + ", \"/srv/cache\"]", wantOneFS: "one_file_system = true"},
+		{name: "replace excludes", env: map[string]string{"SM_BACKUP_EXCLUDES": "/a,/b"}, wantExcludes: "excludes = [\"/a\", \"/b\"]", wantOneFS: "one_file_system = true"},
+		{name: "cross filesystems", env: map[string]string{"SM_BACKUP_ONE_FILE_SYSTEM": "0"}, wantExcludes: defaultExcludesLine(), wantOneFS: "one_file_system = false"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.env["SM_BACKUP_REPOS"] = "rest:https://example/repo"
+			rendered, err := renderBackupTOML(envFrom(test.env), "/key", "/creds", false, missingPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(rendered, test.wantExcludes+"\n") || !strings.Contains(rendered, test.wantOneFS+"\n") {
+				t.Fatalf("scope rendering mismatch\n%s", rendered)
+			}
+		})
+	}
+}
+
+func TestRenderBackupTOMLDockerVolumesPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        map[string]string
+		statPath   string
+		statResult error
+		want       bool
+	}{
+		{name: "host path exists", env: map[string]string{}, statPath: dockerVolumesPath, want: true},
+		{name: "container host path exists", env: map[string]string{"SM_HOST_FS_ROOT": "/host"}, statPath: "/host" + dockerVolumesPath, want: true},
+		{name: "path missing", env: map[string]string{}, statPath: dockerVolumesPath, statResult: os.ErrNotExist, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.env["SM_BACKUP_REPOS"] = "rest:https://example/repo"
+			called := ""
+			rendered, err := renderBackupTOML(envFrom(test.env), "/key", "/creds", false, func(path string) error {
+				called = path
+				return test.statResult
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if called != test.statPath {
+				t.Fatalf("stat path = %q, want %q", called, test.statPath)
+			}
+			hasPath := strings.Contains(rendered, `"/var/lib/docker/volumes"`)
+			if hasPath != test.want {
+				t.Fatalf("volumes path presence = %v, want %v\n%s", hasPath, test.want, rendered)
+			}
+		})
+	}
+
+	called := false
+	rendered, err := renderBackupTOML(envFrom(map[string]string{
+		"SM_BACKUP_REPOS": "rest:https://example/repo",
+		"SM_BACKUP_PATHS": "/srv",
+	}), "/key", "/creds", false, func(string) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called || strings.Contains(rendered, `"/var/lib/docker/volumes"`) {
+		t.Fatalf("explicit paths must not stat or append Docker volumes\n%s", rendered)
+	}
+}
+
+func TestRenderRecoveryKitRepositoryTypesAndCredentials(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "backup.toml")
+	passwordPath := filepath.Join(dir, "backup.key")
+	credsPath := filepath.Join(dir, "repo-credentials.env")
+	if err := os.WriteFile(passwordPath, []byte("repository-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credsPath, []byte("RESTIC_REST_USERNAME=archive\nRESTIC_REST_PASSWORD=transport-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := `paths = ["/etc"]
+[retention]
+daily = 1
+weekly = 0
+monthly = 0
+[[repo]]
+name = "direct"
+url = "rest:https://backup.example/direct"
+password_file = "` + filepath.ToSlash(passwordPath) + `"
+[[repo]]
+name = "archive"
+tunnel_name = "archive"
+tunnel_node = "node-a"
+password_file = "` + filepath.ToSlash(passwordPath) + `"
+env_file = "` + filepath.ToSlash(credsPath) + `"
+[tunnel]
+private_key_file = "` + filepath.ToSlash(filepath.Join(dir, "tunnel.key")) + `"
+local_ip = "10.83.0.2"
+[[tunnel.node]]
+host = "node-a"
+public_key = "node-key"
+endpoint = "node.example:51820"
+ip = "10.83.1.1"
+rest_port = 8443
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kit, err := RenderRecoveryKit(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"direct -> rest:https://backup.example/direct",
+		"restic -r rest:https://backup.example/direct snapshots",
+		"archive -> tunnel:node-a/archive on storage node node-a (endpoint node.example:51820)",
+		"RESTIC_REST_PASSWORD=transport-secret",
+		"sm-agent backup proxy --config " + configPath,
+		`recreate backup.toml with tunnel_name = "archive" and tunnel_node = "node-a"`,
+	} {
+		if !strings.Contains(kit, want) {
+			t.Fatalf("recovery kit missing %q\n%s", want, kit)
+		}
+	}
+}
+
+func TestLinuxInstallerDefaultExcludesStayInSync(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "install-agent-linux.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), defaultExcludesLine()) {
+		t.Fatalf("Linux installer does not contain canonical excludes line %q", defaultExcludesLine())
+	}
+}
+
 func TestRenderBackupTOMLTunnelRepositories(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "backup.key")
@@ -90,7 +246,7 @@ func TestRenderBackupTOMLTunnelRepositories(t *testing.T) {
 				"SM_BACKUP_REST_PASSWORD":    "ignored",
 				"SM_BACKUP_S3_ACCESS_KEY_ID": "ignored",
 			})
-			rendered, err := renderBackupTOML(getenv, keyPath, credsPath, true)
+			rendered, err := renderBackupTOML(getenv, keyPath, credsPath, true, missingPath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +270,7 @@ func TestRenderBackupTOMLRejectsMalformedTunnelRepositories(t *testing.T) {
 	for _, spec := range []string{"tunnel:", "tunnel:/archive", "tunnel:node/", "tunnel:a/b/c", "tunnel:bad name", "tunnel:bad node/archive"} {
 		t.Run(spec, func(t *testing.T) {
 			getenv := envFrom(map[string]string{"SM_BACKUP_REPOS": spec})
-			if _, err := renderBackupTOML(getenv, filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false); err == nil {
+			if _, err := renderBackupTOML(getenv, filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false, missingPath); err == nil {
 				t.Fatalf("malformed tunnel repository %q should fail", spec)
 			}
 		})
@@ -127,7 +283,7 @@ func TestRenderBackupTOMLMixedRemoteAndTunnelRepositories(t *testing.T) {
 		"SM_BACKUP_REPOS":         "rest:https://monitor.example/backup/direct,tunnel:node-a/archive",
 		"SM_BACKUP_REPO_NAMES":    "direct,archive",
 		"SM_BACKUP_REST_USERNAME": "direct",
-	}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "repo-credentials.env"), true)
+	}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "repo-credentials.env"), true, missingPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +448,7 @@ func TestEnsureTunnelEnrolledProvisionCycles(t *testing.T) {
 func TestEnsureTunnelEnrolledNodeNotPromoted(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "backup.toml")
-	rendered, err := renderBackupTOML(envFrom(map[string]string{"SM_BACKUP_REPOS": "tunnel:missing/archive"}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false)
+	rendered, err := renderBackupTOML(envFrom(map[string]string{"SM_BACKUP_REPOS": "tunnel:missing/archive"}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false, missingPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +480,7 @@ func TestRecordTunnelEnrollmentFailure(t *testing.T) {
 	rendered, err := renderBackupTOML(envFrom(map[string]string{
 		"SM_BACKUP_REPOS":      "rest:https://monitor.example/backup/direct,tunnel:archive",
 		"SM_BACKUP_REPO_NAMES": "direct,archive",
-	}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false)
+	}), filepath.Join(dir, "backup.key"), filepath.Join(dir, "creds.env"), false, missingPath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -30,17 +30,20 @@ const (
 	SwapFree     ID = 212
 	SwapUsedPct  ID = 213
 
-	DiskReadBytes  ID = 300
-	DiskWriteBytes ID = 301
-	DiskReadOps    ID = 302
-	DiskWriteOps   ID = 303
-	DiskBusyPct    ID = 304
-	FSTotal        ID = 310
-	FSUsed         ID = 311
-	FSFree         ID = 312
-	FSUsedPct      ID = 313
-	FSInodesUsed   ID = 314
-	FSInodesFree   ID = 315
+	DiskReadBytes    ID = 300
+	DiskWriteBytes   ID = 301
+	DiskReadOps      ID = 302
+	DiskWriteOps     ID = 303
+	DiskBusyPct      ID = 304
+	FSTotal          ID = 310
+	FSUsed           ID = 311
+	FSFree           ID = 312
+	FSUsedPct        ID = 313
+	FSInodesUsed     ID = 314
+	FSInodesFree     ID = 315
+	FSOverallTotal   ID = 316
+	FSOverallUsed    ID = 317
+	FSOverallUsedPct ID = 318
 
 	NetRxBytes   ID = 400
 	NetTxBytes   ID = 401
@@ -117,6 +120,7 @@ const (
 	BackupProgressBytes      ID = 1011
 	BackupProgressTotalBytes ID = 1012
 	BackupAgentStale         ID = 1013
+	BackupAgentUnexecutable  ID = 1014
 )
 
 type Meta struct {
@@ -159,6 +163,9 @@ var meta = map[ID]Meta{
 	FSUsedPct:                {"fs_used_pct", "%"},
 	FSInodesUsed:             {"fs_inodes_used", ""},
 	FSInodesFree:             {"fs_inodes_free", ""},
+	FSOverallTotal:           {"fs_overall_total", "B"},
+	FSOverallUsed:            {"fs_overall_used", "B"},
+	FSOverallUsedPct:         {"fs_overall_used_pct", "%"},
 	NetRxBytes:               {"net_rx_bytes", "B"},
 	NetTxBytes:               {"net_tx_bytes", "B"},
 	NetRxPackets:             {"net_rx_packets", "pkts"},
@@ -226,6 +233,7 @@ var meta = map[ID]Meta{
 	BackupProgressBytes:      {"backup_progress_bytes", "B"},
 	BackupProgressTotalBytes: {"backup_progress_total_bytes", "B"},
 	BackupAgentStale:         {"backup_agent_stale", "bool"},
+	BackupAgentUnexecutable:  {"backup_agent_unexecutable", "bool"},
 }
 
 func (id ID) Meta() Meta {

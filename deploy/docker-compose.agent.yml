@@ -1,6 +1,6 @@
 services:
   sm-agent:
-    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.3.9}
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:0.4.0}
     build:
       context: ..
       dockerfile: deploy/agent.Dockerfile
@@ -34,6 +34,8 @@ services:
       SM_BACKUP_REPOS: ${SM_BACKUP_REPOS:-}
       SM_BACKUP_REPO_NAMES: ${SM_BACKUP_REPO_NAMES:-}
       SM_BACKUP_PATHS: ${SM_BACKUP_PATHS:-}
+      SM_BACKUP_EXCLUDES: ${SM_BACKUP_EXCLUDES:-}
+      SM_BACKUP_ONE_FILE_SYSTEM: ${SM_BACKUP_ONE_FILE_SYSTEM:-}
       SM_BACKUP_TIME: ${SM_BACKUP_TIME:-}
       SM_BACKUP_PRUNE_MODE: ${SM_BACKUP_PRUNE_MODE:-}
       SM_BACKUP_REST_USERNAME: ${SM_BACKUP_REST_USERNAME:-}

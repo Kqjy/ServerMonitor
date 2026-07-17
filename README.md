@@ -179,13 +179,16 @@ All routes under `/api/v1/*` except the public `GET /healthz` and `GET /auth/sta
 | `GET  /hosts`, `/hosts/{id}` | cookie / admin | list / detail |
 | `GET  /hosts/{id}/processes` | cookie / admin | top-N process snapshot |
 | `GET  /hosts/{id}/containers` | cookie / admin | container snapshot |
+| `POST /hosts/{id}/backups/browse` | cookie / admin | queue a snapshot directory listing |
+| `GET  /hosts/{id}/backups/browse/{jobID}` | cookie / admin | poll a snapshot directory listing |
 | `GET  /hosts/{id}/labels?key=device` | cookie / admin | distinct label values |
 | `GET  /series`, `/series/multi` | cookie / admin | time-series query (single / per-label) |
 | `GET  /metrics` | cookie / admin | canonical metric registry |
 | `GET  /stream` | cookie / admin | Server-Sent Events live feed |
 | `GET  /stats` | cookie / admin | batcher queue depth, dropped count |
 | `GET/POST/PUT/DELETE /alerts[/{id}]` | cookie / admin | alert rule CRUD |
-| `GET  /alerts/history` | cookie / admin | recent fires |
+| `GET  /alerts/history` | cookie / admin | recent fires; `format=csv` exports matching history |
+| `DELETE /alerts/history` | cookie / admin | clear resolved history, optionally with `older_than_days` |
 | `GET/POST/PUT/DELETE /channels[/{id}]` | cookie / admin | notification channel CRUD |
 
 ---

@@ -207,6 +207,13 @@ func SyncPrivileged(ctx context.Context, sourcePath, signaturePath, pubkeyPath s
 	if err := verifyPinnedKeyFile(pubkeyPath); err != nil {
 		return false, err
 	}
+	return syncPrivilegedTarget(ctx, selfPath, sourcePath, signaturePath, pubkeyPath, logger, stagedAgentVersion)
+}
+
+func syncPrivilegedTarget(ctx context.Context, selfPath, sourcePath, signaturePath, pubkeyPath string, logger *slog.Logger, versionFn func(context.Context, string) (string, error)) (bool, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	pubkey, err := os.ReadFile(pubkeyPath)
 	if err != nil {
 		return false, fmt.Errorf("read pinned server pubkey: %w", err)
@@ -234,22 +241,34 @@ func SyncPrivileged(ctx context.Context, sourcePath, signaturePath, pubkeyPath s
 		return false, fmt.Errorf("verify resident agent signature: %w", err)
 	}
 	if runtime.GOOS != "windows" {
-		if err := os.Chmod(newPath, 0o500); err != nil {
+		if err := os.Chmod(newPath, 0o755); err != nil {
 			_ = os.Remove(newPath)
 			return false, fmt.Errorf("chmod staged privileged agent: %w", err)
+		}
+		if privilegedRunningAsRoot() {
+			if err := chownPrivilegedRoot(newPath); err != nil {
+				logger.Warn("privileged backup agent ownership could not be repaired", "err", err, "target", newPath)
+			}
 		}
 	}
 	if err := verifyStagedBinary(newPath, digest); err != nil {
 		_ = os.Remove(newPath)
 		return false, err
 	}
-	stagedVersion, err := stagedAgentVersion(ctx, newPath)
+	stagedVersion, err := versionFn(ctx, newPath)
 	if err != nil {
 		_ = os.Remove(newPath)
 		return false, err
 	}
 	if !version.IsNewer(stagedVersion, version.Version) {
 		_ = os.Remove(newPath)
+		repaired, err := convergePrivilegedTarget(selfPath, logger)
+		if err != nil {
+			return false, err
+		}
+		if repaired {
+			logger.Info("privileged backup agent synchronized", "repaired", true, "target", selfPath)
+		}
 		return false, nil
 	}
 	if err := swap(selfPath, newPath); err != nil {
@@ -263,6 +282,28 @@ func SyncPrivileged(ctx context.Context, sourcePath, signaturePath, pubkeyPath s
 		"source", sourcePath,
 		"target", selfPath)
 	return true, nil
+}
+
+func convergePrivilegedTarget(path string, logger *slog.Logger) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat privileged agent: %w", err)
+	}
+	repaired := false
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+		if err := os.Chmod(path, 0o755); err != nil {
+			return false, fmt.Errorf("chmod privileged agent: %w", err)
+		}
+		repaired = true
+	}
+	if privilegedRunningAsRoot() && privilegedOwnerNeedsRepair(info) {
+		if err := chownPrivilegedRoot(path); err != nil {
+			logger.Warn("privileged backup agent ownership could not be repaired", "err", err, "target", path)
+		} else {
+			repaired = true
+		}
+	}
+	return repaired, nil
 }
 
 func copyStagedBinary(sourcePath, stagedPath string) ([]byte, int64, error) {

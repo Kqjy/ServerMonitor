@@ -50,12 +50,17 @@ type Deps struct {
 	TunnelInfo     BackupTunnelInfo
 	BackupPublic   bool
 	BackupNodes    *storage.BackupNodes
+	BackupBrowse   *browseStore
 }
 
 func New(d Deps) *Router {
 	r := chi.NewRouter()
 	nodePeerStats := NewNodePeerStatsCache()
 	nodeHealth := NewNodeHealthCache()
+	browse := d.BackupBrowse
+	if browse == nil {
+		browse = newBrowseStore()
+	}
 	r.Use(middleware.RequestID)
 	r.Use(requestLogger(d.Logger))
 	r.Use(middleware.Recoverer)
@@ -85,8 +90,10 @@ func New(d Deps) *Router {
 			r.Use(timeout)
 			r.Use(ingestLimiter(d.IngestRate, d.IngestBurst))
 			r.Use(requireAgentToken(d.Hosts))
-			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger))
+			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger, browse))
 			r.Post("/agent/tunnel", tunnelEnrollHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
+			r.Get("/agent/backup-browse", agentBackupBrowseJobsHandler(browse))
+			r.Post("/agent/backup-browse/{jobID}", agentBackupBrowseResultHandler(browse))
 			r.Get("/agent/tunnel/nodes", agentTunnelNodesHandler(d.BackupNodes))
 			r.Get("/agent/backup-node", agentBackupNodeConfigHandler(d.BackupNodes))
 			r.Post("/agent/backup-node/usage", agentBackupNodeUsageHandler(d.BackupNodes, nodePeerStats, nodeHealth))
@@ -114,6 +121,8 @@ func New(d Deps) *Router {
 				r.Get("/hosts/{id}/containers/{cid}/series", hostContainerSeriesHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/ports", hostPortsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/backups", hostBackupsHandler(d.DB, d.Hosts))
+				r.Post("/hosts/{id}/backups/browse", createBackupBrowseHandler(browse, d.DB, d.Hosts))
+				r.Get("/hosts/{id}/backups/browse/{jobID}", getBackupBrowseJobHandler(browse, d.Hosts))
 				r.Get("/hosts/{id}/labels", hostLabelsHandler(d.DB, d.Hosts))
 				r.Get("/hosts/{id}/alerts/active", hostActiveAlertsHandler(d.DB, d.Hosts))
 				r.Get("/series", seriesHandler(d.DB, d.Hosts, d.Archive, d.Retention))
@@ -131,6 +140,7 @@ func New(d Deps) *Router {
 				r.Put("/alerts/{id}", updateAlertRuleHandler(d.DB.Pool))
 				r.Delete("/alerts/{id}", deleteAlertRuleHandler(d.DB.Pool))
 				r.Get("/alerts/history", alertHistoryHandler(d.DB.Pool))
+				r.Delete("/alerts/history", clearAlertHistoryHandler(d.DB.Pool))
 
 				r.Get("/channels", listChannelsHandler(d.DB.Pool))
 				r.Post("/channels", createChannelHandler(d.DB.Pool))

@@ -25,6 +25,7 @@
 
   type SmartRow = {
     device: string;
+    slot: string | null;
     model: string | null;
     healthy: number | null;
     powerOnHours: number | null;
@@ -38,16 +39,25 @@
     unsafeShutdowns: number | null;
   };
 
+  type RaidRow = {
+    array: string;
+    type: string | null;
+    degraded: number;
+    syncPct: number | null;
+  };
+
   let read = $state<SeriesEntry[]>([]);
   let write = $state<SeriesEntry[]>([]);
   let readOps = $state<SeriesEntry[]>([]);
   let writeOps = $state<SeriesEntry[]>([]);
   let fs = $state<{ mount: string; fstype: string; used: number; total: number; pct: number }[]>([]);
+  let overall = $state<{ total: number; used: number; pct: number } | null>(null);
   let fsUsedPct = $state<SeriesEntry[]>([]);
   let smartTemps = $state<SeriesEntry[]>([]);
   let smartWritten = $state<SeriesEntry[]>([]);
   let smartRead = $state<SeriesEntry[]>([]);
   let smart = $state<SmartRow[]>([]);
+  let raid = $state<RaidRow[]>([]);
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
@@ -87,7 +97,7 @@
       toMs = b.toMs;
     }
     try {
-      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe, fsUsage] = await Promise.all([
+      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, overallTotal, overallUsed, overallPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe, raidDegraded, raidSync, fsUsage] = await Promise.all([
         api.seriesMulti({ host: hostId, metric: 'disk_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_write_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'disk_read_ops', from, to, splitBy: 'device', signal: ac.signal }),
@@ -95,6 +105,9 @@
         api.seriesMulti({ host: hostId, metric: 'fs_total', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'fs_used', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
+        api.series({ host: hostId, metric: 'fs_overall_total', from: '-2m', step: 30, signal: ac.signal }),
+        api.series({ host: hostId, metric: 'fs_overall_used', from: '-2m', step: 30, signal: ac.signal }),
+        api.series({ host: hostId, metric: 'fs_overall_used_pct', from: '-2m', step: 30, signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_temp_c', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_healthy', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_power_on_hours', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
@@ -105,6 +118,8 @@
         api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'raid_degraded', from: '-5m', step: 30, splitBy: 'array', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'raid_sync_pct', from: '-5m', step: 30, splitBy: 'array', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from, to, splitBy: 'mount', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
@@ -133,15 +148,22 @@
         byMount[m].pct = e.points.at(-1)?.v ?? 0;
       }
       fs = Object.values(byMount).sort((a, b) => b.pct - a.pct);
+      const overallTotalValue = overallTotal.points.at(-1)?.v;
+      const overallUsedValue = overallUsed.points.at(-1)?.v;
+      const overallPctValue = overallPct.points.at(-1)?.v;
+      overall = overallTotalValue !== undefined && overallUsedValue !== undefined && overallPctValue !== undefined
+        ? { total: overallTotalValue, used: overallUsedValue, pct: overallPctValue }
+        : null;
 
       const byDev: Record<string, SmartRow> = {};
       const fill = (entries: SeriesEntry[], assign: (row: SmartRow, v: number) => void) => {
         for (const e of entries) {
           const d = e.labels.device;
           if (!d) continue;
-          if (!byDev[d]) byDev[d] = { device: d, model: null, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null, written: null, read: null, percentUsed: null, mediaErrors: null, unsafeShutdowns: null };
+          if (!byDev[d]) byDev[d] = { device: d, slot: null, model: null, healthy: null, powerOnHours: null, realloc: null, pending: null, tempC: null, written: null, read: null, percentUsed: null, mediaErrors: null, unsafeShutdowns: null };
           const row = byDev[d];
           if (e.labels.model && !row.model) row.model = e.labels.model;
+          if (e.labels.slot && !row.slot) row.slot = e.labels.slot;
           const v = e.points.at(-1)?.v;
           if (v !== undefined) assign(row, v);
         }
@@ -160,6 +182,23 @@
       smartTemps = sTemp.series;
       smartWritten = sWritten.series;
       smartRead = sRead.series;
+
+      const byArray: Record<string, RaidRow> = {};
+      for (const e of raidDegraded.series) {
+        const array = e.labels.array;
+        const degraded = e.points.at(-1)?.v;
+        if (!array || degraded === undefined) continue;
+        byArray[array] = { array, type: e.labels.type ?? null, degraded, syncPct: null };
+      }
+      for (const e of raidSync.series) {
+        const array = e.labels.array;
+        const syncPct = e.points.at(-1)?.v;
+        if (!array || syncPct === undefined) continue;
+        if (!byArray[array]) byArray[array] = { array, type: e.labels.type ?? null, degraded: 0, syncPct: null };
+        if (e.labels.type && !byArray[array].type) byArray[array].type = e.labels.type;
+        byArray[array].syncPct = syncPct;
+      }
+      raid = Object.values(byArray).sort((a, b) => a.array.localeCompare(b.array, undefined, { numeric: true }));
 
       error = null;
       loading = false;
@@ -203,6 +242,7 @@
   });
 
   const isZoomed = $derived(chartZoom !== null);
+  const smartHasSlots = $derived(smart.some((row) => row.slot !== null));
   function handleZoom(f: number, t: number) {
     chartZoom = { fromMs: f, toMs: t };
     fromMs = f;
@@ -277,6 +317,12 @@
     </section>
   {/if}
 
+  {#if overall}
+    <div class="text-xs text-zinc-400">
+      Overall <span class="numeric tabular-nums text-zinc-300">{pct(overall.pct, 1)}</span> — <span class="numeric tabular-nums text-zinc-300">{bytes(overall.used)}</span> of <span class="numeric tabular-nums text-zinc-300">{bytes(overall.total)}</span> across local filesystems
+    </div>
+  {/if}
+
   {#if fs.length > 0}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
       <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Filesystems</header>
@@ -305,6 +351,51 @@
                     </div>
                     <span class="numeric text-zinc-300 w-12 text-right">{pct(row.pct, 0)}</span>
                   </div>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {/if}
+
+  {#if raid.length > 0}
+    <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
+      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">RAID arrays</header>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
+            <tr>
+              <th class="text-left font-medium px-5 py-2.5">Array</th>
+              <th class="text-left font-medium px-3 py-2.5">Type</th>
+              <th class="text-left font-medium px-3 py-2.5">Status</th>
+              <th class="text-right font-medium px-5 py-2.5">Rebuild</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-zinc-800/70">
+            {#each raid as row (row.array)}
+              <tr class="hover:bg-zinc-900/60">
+                <td class="px-5 py-2 text-zinc-100 font-mono text-xs">{row.array}</td>
+                <td class="px-3 py-2 text-zinc-400 text-xs uppercase">{row.type ?? '—'}</td>
+                <td class="px-3 py-2">
+                  {#if row.degraded === 0}
+                    <span class="inline-flex items-center rounded-md border border-emerald-900/60 bg-emerald-950/40 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">Optimal</span>
+                  {:else}
+                    <span class="inline-flex items-center rounded-md border border-rose-900/60 bg-rose-950/40 px-1.5 py-0.5 text-[10px] font-medium text-rose-300">Degraded</span>
+                  {/if}
+                </td>
+                <td class="px-5 py-2 text-right">
+                  {#if row.syncPct !== null}
+                    <div class="flex items-center justify-end gap-2">
+                      <div class="h-1.5 w-24 rounded-full bg-zinc-800 overflow-hidden">
+                        <div class="h-full bg-amber-400" style="width: {Math.min(100, Math.max(0, row.syncPct)).toFixed(1)}%"></div>
+                      </div>
+                      <span class="numeric text-zinc-300 w-12 text-right">{pct(row.syncPct, 0)}</span>
+                    </div>
+                  {:else}
+                    <span class="text-zinc-600 text-xs">—</span>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -348,7 +439,8 @@
         <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
         <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
           <p>A hardware RAID controller is hiding this host's drives.</p>
-          <p class="text-amber-100/70 text-xs">The agent detected a RAID virtual disk and probed the controller for member drives (<span class="font-mono">smartctl -d megaraid/cciss/aacraid/3ware/areca</span>), but none answered. Drive health is only visible to the controller itself — check it with the vendor CLI (<span class="font-mono">storcli</span>, <span class="font-mono">perccli</span>, <span class="font-mono">ssacli</span>, <span class="font-mono">arcconf</span>), or verify the passthrough type manually with <span class="font-mono">smartctl -d megaraid,N /dev/sdX</span>. Kernels older than the controller driver's passthrough support can also cause this.</p>
+          <p class="text-amber-100/70 text-xs">The agent automatically uses Broadcom <span class="font-mono">storcli</span> or Dell <span class="font-mono">perccli</span> when installed at <span class="font-mono">/opt/MegaRAID/storcli/storcli64</span> or standard <span class="font-mono">sbin</span>/<span class="font-mono">bin</span> paths. It is picked up within about five minutes with no reconfiguration. You can still verify passthrough manually with <span class="font-mono">smartctl -d megaraid,N /dev/sdX</span> or check the controller with its vendor CLI.</p>
+          <p class="text-amber-100/70 text-xs">If the detail below says permission denied, the udev rule installed by <span class="font-mono">--enable-smart</span> is missing; re-run the installer with that option.</p>
           {#if smartStatus.message}
             <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
           {/if}
@@ -383,7 +475,7 @@
       </div>
     {:else if smartStatus?.state === 'raid_unreadable'}
       <div class="rounded-lg border border-amber-900/50 bg-amber-950/20 px-4 py-2.5 text-xs text-amber-100/80">
-        A hardware RAID controller on this host is hiding some drives{smartStatus.message ? ` — ${smartStatus.message}` : ''}. The devices below are the ones the agent can still reach.
+        A hardware RAID controller on this host is hiding some drives{smartStatus.message ? ` — ${smartStatus.message}` : ''}. The agent automatically uses installed Broadcom <span class="font-mono">storcli</span> or Dell <span class="font-mono">perccli</span>; the devices below are the ones it can still reach.
       </div>
     {/if}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -393,6 +485,7 @@
           <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
             <tr>
               <th class="text-left font-medium px-5 py-2.5">Device</th>
+              {#if smartHasSlots}<th class="text-left font-medium px-3 py-2.5">Slot</th>{/if}
               <th class="text-left font-medium px-3 py-2.5">Model</th>
               <th class="text-left font-medium px-3 py-2.5">Status</th>
               <th class="text-right font-medium px-3 py-2.5">Temp</th>
@@ -410,6 +503,7 @@
             {#each smart as row (row.device)}
               <tr class="hover:bg-zinc-900/60">
                 <td class="px-5 py-2 text-zinc-100 font-mono text-xs">{row.device}</td>
+                {#if smartHasSlots}<td class="px-3 py-2 text-zinc-400 font-mono text-xs">{row.slot ?? '—'}</td>{/if}
                 <td class="px-3 py-2 text-zinc-400 font-mono text-xs max-w-40 truncate" title={row.model ?? undefined}>{row.model ?? '—'}</td>
                 <td class="px-3 py-2">
                   {#if row.healthy === 1}

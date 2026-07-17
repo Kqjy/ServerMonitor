@@ -22,4 +22,10 @@ func replaceFileAtomic(oldPath, newPath string) error {
 
 func fileOwnedByRoot(os.FileInfo) bool { return true }
 
+func privilegedRunningAsRoot() bool { return false }
+
+func privilegedOwnerNeedsRepair(os.FileInfo) bool { return false }
+
+func chownPrivilegedRoot(string) error { return nil }
+
 func verifyRootOwnedPath(string) error { return nil }

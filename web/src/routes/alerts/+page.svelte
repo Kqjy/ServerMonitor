@@ -13,6 +13,10 @@
   let editing = $state<AlertRule | null>(null);
   let creating = $state(false);
   let timer: ReturnType<typeof setInterval> | null = null;
+  let clearOpen = $state(false);
+  let clearOlderThanDays = $state(0);
+  let historyNotice = $state<string | null>(null);
+  let historyNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function refresh() {
     try {
@@ -46,12 +50,24 @@
     await refresh();
   }
 
+  async function clearHistory() {
+    const result = await api.alertHistoryClear(clearOlderThanDays || undefined);
+    await refresh();
+    historyNotice = `Cleared ${result.deleted} ${result.deleted === 1 ? 'entry' : 'entries'}`;
+    if (historyNoticeTimer) clearTimeout(historyNoticeTimer);
+    historyNoticeTimer = setTimeout(() => {
+      historyNotice = null;
+      historyNoticeTimer = null;
+    }, 6_000);
+  }
+
   onMount(() => {
     refresh();
     timer = setInterval(refresh, 15_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
+    if (historyNoticeTimer) clearTimeout(historyNoticeTimer);
   });
 </script>
 
@@ -149,7 +165,27 @@
   {/if}
 
   <section class="mt-8">
-    <h2 class="text-sm uppercase tracking-wider text-zinc-500 mb-3">Recent history</h2>
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center gap-3">
+        <h2 class="text-sm uppercase tracking-wider text-zinc-500">Recent history</h2>
+        {#if historyNotice}<span class="text-xs text-zinc-400">{historyNotice}</span>{/if}
+      </div>
+      <div class="flex items-center gap-1">
+        <a
+          href="/api/v1/alerts/history?format=csv"
+          download
+          class="inline-flex items-center px-2 py-1 rounded-md text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors">
+          Export CSV
+        </a>
+        <button
+          type="button"
+          disabled={history.length === 0}
+          onclick={() => { clearOlderThanDays = 0; clearOpen = true; }}
+          class="px-2 py-1 rounded-md text-xs text-rose-300 hover:bg-rose-950/40 disabled:opacity-40 disabled:cursor-not-allowed">
+          Clear
+        </button>
+      </div>
+    </div>
     <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
       {#if history.length === 0}
         <div class="px-5 py-8 text-center text-zinc-500 text-sm">No alerts triggered yet</div>
@@ -224,3 +260,27 @@
   onconfirm={doDelete}
   onclose={() => (toDelete = null)}
 />
+
+<ConfirmDialog
+  open={clearOpen}
+  title="Clear alert history"
+  body={clearHistoryBody}
+  confirmLabel="Clear"
+  danger
+  onconfirm={clearHistory}
+  onclose={() => (clearOpen = false)}
+/>
+
+{#snippet clearHistoryBody()}
+  <p class="text-sm text-zinc-300">Delete resolved alert history. Still-firing alerts are kept.</p>
+  <label for="clear-history-age" class="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Entries to clear</label>
+  <select
+    id="clear-history-age"
+    bind:value={clearOlderThanDays}
+    class="mt-1.5 w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm text-zinc-200">
+    <option value={0}>All resolved entries</option>
+    <option value={7}>Older than 7 days</option>
+    <option value={30}>Older than 30 days</option>
+    <option value={90}>Older than 90 days</option>
+  </select>
+{/snippet}

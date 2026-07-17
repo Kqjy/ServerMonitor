@@ -26,6 +26,19 @@ func fileOwnedByRoot(info os.FileInfo) bool {
 	return ok && stat.Uid == 0
 }
 
+func privilegedRunningAsRoot() bool {
+	return os.Geteuid() == 0
+}
+
+func privilegedOwnerNeedsRepair(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return !ok || stat.Uid != 0 || stat.Gid != 0
+}
+
+func chownPrivilegedRoot(path string) error {
+	return os.Chown(path, 0, 0)
+}
+
 func verifyRootOwnedPath(dir string) error {
 	cur := filepath.Clean(dir)
 	for {

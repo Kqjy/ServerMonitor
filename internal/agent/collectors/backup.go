@@ -26,6 +26,7 @@ const (
 	backupStateError         = "error"
 	backupStateStale         = "stale"
 	backupStateStaleAgent    = "stale_agent"
+	backupStateAgentPerms    = "agent_perms"
 	backupStatusStaleAfter   = 26 * time.Hour
 	backupSnapshotLimit      = 50
 	backupInventoryInterval  = 15 * time.Minute
@@ -51,6 +52,7 @@ type backupCollector struct {
 	privVersion              string
 	privVersionOK            bool
 	execVersion              func(ctx context.Context, path string) (string, error)
+	accessExecutable         func(path string) error
 }
 
 type backupStatusFingerprint struct {
@@ -64,11 +66,12 @@ func init() { Register(defaultBackupCollector) }
 
 func newBackupCollector(path string) *backupCollector {
 	return &backupCollector{
-		path:         path,
-		now:          time.Now,
-		queryNextRun: nextBackupRun,
-		privPath:     defaultPrivilegedAgentPath(),
-		execVersion:  execAgentVersion,
+		path:             path,
+		now:              time.Now,
+		queryNextRun:     nextBackupRun,
+		privPath:         defaultPrivilegedAgentPath(),
+		execVersion:      execAgentVersion,
+		accessExecutable: defaultExecutableAccess(),
 	}
 }
 
@@ -230,7 +233,11 @@ func (c *backupCollector) Status() wire.CollectorStatus {
 func (c *backupCollector) setState(state, msg string) {
 	c.mu.Lock()
 	c.state = state
-	c.stateMsg = shortBackupMessage(msg)
+	if state == backupStateAgentPerms {
+		c.stateMsg = strings.TrimSpace(msg)
+	} else {
+		c.stateMsg = shortBackupMessage(msg)
+	}
 	c.mu.Unlock()
 }
 
@@ -250,13 +257,20 @@ func (c *backupCollector) currentTime() time.Time {
 func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	now := c.currentTime()
 	out := c.backupProgressPoints(now)
-	staleAgent, privilegedPresent, staleAgentMsg := c.privilegedAgentDrift(ctx)
-	if privilegedPresent {
+	staleAgent, staleKnown, unexecutable, executableKnown, agentHealthMsg := c.privilegedAgentDrift(ctx)
+	if staleKnown {
 		value := 0.0
 		if staleAgent {
 			value = 1
 		}
 		out = append(out, point(now, metrics.BackupAgentStale, nil, value))
+	}
+	if executableKnown {
+		value := 0.0
+		if unexecutable {
+			value = 1
+		}
+		out = append(out, point(now, metrics.BackupAgentUnexecutable, nil, value))
 	}
 	info, status, ok := c.readBackupStatus()
 	if !ok {
@@ -264,8 +278,10 @@ func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 			c.setState(backupStateScheduled, "")
 		}
 		state := c.Status().State
-		if staleAgent && (state == backupStateNotConfigured || state == backupStateScheduled) {
-			c.setState(backupStateStaleAgent, staleAgentMsg)
+		if unexecutable && (state == backupStateNotConfigured || state == backupStateScheduled) {
+			c.setState(backupStateAgentPerms, agentHealthMsg)
+		} else if staleAgent && (state == backupStateNotConfigured || state == backupStateScheduled) {
+			c.setState(backupStateStaleAgent, agentHealthMsg)
 		}
 		return out, nil
 	}
@@ -275,40 +291,48 @@ func (c *backupCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	} else {
 		c.setState(backupStateOK, "")
 	}
-	if staleAgent && c.Status().State == backupStateOK {
-		c.setState(backupStateStaleAgent, staleAgentMsg)
+	if unexecutable && c.Status().State == backupStateOK {
+		c.setState(backupStateAgentPerms, agentHealthMsg)
+	} else if staleAgent && c.Status().State == backupStateOK {
+		c.setState(backupStateStaleAgent, agentHealthMsg)
 	}
 	return out, nil
 }
 
-func (c *backupCollector) privilegedAgentDrift(ctx context.Context) (stale bool, present bool, msg string) {
+func (c *backupCollector) privilegedAgentDrift(ctx context.Context) (stale bool, staleKnown bool, unexecutable bool, executableKnown bool, msg string) {
 	if c.privPath == "" {
-		return false, false, ""
+		return false, false, false, false, ""
 	}
 	info, err := os.Stat(c.privPath)
 	if err != nil {
-		return false, false, ""
+		return false, false, false, false, ""
 	}
 	residentPath, err := os.Executable()
 	if err != nil {
-		return false, false, ""
+		return false, false, false, false, ""
 	}
 	resolvedResidentPath, err := filepath.EvalSymlinks(residentPath)
 	if err != nil {
 		resolvedResidentPath, err = filepath.Abs(residentPath)
 		if err != nil {
-			return false, false, ""
+			return false, false, false, false, ""
 		}
 	}
 	privilegedPath, err := filepath.EvalSymlinks(c.privPath)
 	if err != nil {
 		privilegedPath, err = filepath.Abs(c.privPath)
 		if err != nil {
-			return false, false, ""
+			return false, false, false, false, ""
 		}
 	}
 	if resolvedResidentPath == privilegedPath {
-		return false, false, ""
+		return false, false, false, false, ""
+	}
+	if c.accessExecutable != nil {
+		executableKnown = true
+		if err := c.accessExecutable(c.privPath); err != nil {
+			return false, false, true, true, fmt.Sprintf("backup agent copy at %s is not executable by the agent service account; scheduled backups cannot run until it is repaired (chown root:root, chmod 0755, or re-run the installer)", c.privPath)
+		}
 	}
 	fingerprint := backupStatusFingerprint{mtime: info.ModTime(), size: info.Size()}
 	c.mu.Lock()
@@ -321,11 +345,11 @@ func (c *backupCollector) privilegedAgentDrift(ctx context.Context) (stale bool,
 		c.privVersionOK = execErr == nil && ok
 	}
 	if !c.privVersionOK {
-		return false, false, ""
+		return false, false, false, executableKnown, ""
 	}
 	stale = version.IsNewer(version.Version, c.privVersion)
 	msg = fmt.Sprintf("backup agent copy v%s is older than the resident agent v%s", c.privVersion, version.Version)
-	return stale, true, msg
+	return stale, true, false, executableKnown, msg
 }
 
 type backupProgressFile struct {
@@ -498,6 +522,11 @@ type backupRepoFile struct {
 	CheckLast     *time.Time            `json:"check_last"`
 	CheckSuccess  *bool                 `json:"check_success"`
 	Tunnel        bool                  `json:"tunnel"`
+	Paths         []string              `json:"paths,omitempty"`
+	Excludes      []string              `json:"excludes,omitempty"`
+	OneFileSystem *bool                 `json:"one_file_system,omitempty"`
+	PathStats     []wire.BackupPathStat `json:"path_stats,omitempty"`
+	StatsSnapshot string                `json:"stats_snapshot,omitempty"`
 	Snapshots     []wire.BackupSnapshot `json:"snapshots"`
 }
 
@@ -563,16 +592,21 @@ func backupPoints(now time.Time, repos []backupRepoFile) []wire.Point {
 
 func backupRepoStatus(repo backupRepoFile) wire.BackupRepoStatus {
 	status := wire.BackupRepoStatus{
-		Name:         repo.Name,
-		Engine:       repo.Engine,
-		LastStarted:  repo.LastStarted,
-		LastFinished: repo.LastFinished,
-		LastSuccess:  repo.LastSuccess,
-		Error:        repo.Error,
-		CheckLast:    repo.CheckLast,
-		CheckSuccess: repo.CheckSuccess,
-		Tunnel:       repo.Tunnel,
-		Snapshots:    repo.Snapshots,
+		Name:          repo.Name,
+		Engine:        repo.Engine,
+		LastStarted:   repo.LastStarted,
+		LastFinished:  repo.LastFinished,
+		LastSuccess:   repo.LastSuccess,
+		Error:         repo.Error,
+		CheckLast:     repo.CheckLast,
+		CheckSuccess:  repo.CheckSuccess,
+		Tunnel:        repo.Tunnel,
+		Paths:         repo.Paths,
+		Excludes:      repo.Excludes,
+		OneFileSystem: repo.OneFileSystem,
+		PathStats:     repo.PathStats,
+		StatsSnapshot: repo.StatsSnapshot,
+		Snapshots:     repo.Snapshots,
 	}
 	if repo.Success != nil {
 		status.Success = *repo.Success

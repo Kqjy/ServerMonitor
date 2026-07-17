@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,26 +55,33 @@ type smartDevice struct {
 	name    string
 	devType string
 	isNVMe  bool
+	slot    string
 }
 
 type smartCollector struct {
-	mu         sync.Mutex
-	probed     bool
-	smartctl   string
-	goos       string
-	scanned    []smartDevice
-	raidExtra  []smartDevice
-	raidHide   map[string]bool
-	raidNote   string
-	raidBusy   bool
-	raidRunAt  time.Time
-	devicesAt  time.Time
-	devicesTTL time.Duration
-	state      string
-	stateMsg   string
-	warned     bool
-	execFn     func(ctx context.Context, bin string, args ...string) ([]byte, error)
-	fileExists func(path string) bool
+	mu            sync.Mutex
+	probed        bool
+	smartctl      string
+	storcli       string
+	storcliProbed bool
+	goos          string
+	scanned       []smartDevice
+	raidExtra     []smartDevice
+	raidHide      map[string]bool
+	raidNote      string
+	raidBusy      bool
+	raidRunAt     time.Time
+	cliDrives     []storcliDrive
+	cliVDs        []storcliVD
+	cliAt         time.Time
+	cliBusy       bool
+	devicesAt     time.Time
+	devicesTTL    time.Duration
+	state         string
+	stateMsg      string
+	warned        bool
+	execFn        func(ctx context.Context, bin string, args ...string) ([]byte, error)
+	fileExists    func(path string) bool
 }
 
 func init() { Register(&smartCollector{}) }
@@ -150,7 +158,7 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 	}
 	if time.Since(c.devicesAt) < c.devicesTTL && c.scanned != nil {
 		c.maybeDiscoverRAIDLocked()
-		if len(c.devicesLocked()) > 0 {
+		if len(c.devicesLocked()) > 0 || len(c.cliDrives)+len(c.cliVDs) > 0 {
 			return true
 		}
 		c.emptyStateLocked()
@@ -178,7 +186,7 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 	}
 	c.devicesAt = time.Now()
 	c.maybeDiscoverRAIDLocked()
-	if len(c.devicesLocked()) == 0 {
+	if len(c.devicesLocked()) == 0 && len(c.cliDrives)+len(c.cliVDs) == 0 {
 		c.emptyStateLocked()
 		return false
 	}
@@ -202,6 +210,9 @@ func (c *smartCollector) maybeDiscoverRAIDLocked() {
 		c.raidExtra = nil
 		c.raidHide = nil
 		c.raidNote = ""
+		c.cliDrives = nil
+		c.cliVDs = nil
+		c.cliAt = time.Time{}
 		return
 	}
 	c.raidBusy = true
@@ -241,12 +252,19 @@ func passthroughFamilies(devs []smartDevice) map[string]bool {
 func (c *smartCollector) discoverRAID(bin, goos string, candidates []smartDevice, ioctlFallback bool, scanned []smartDevice) {
 	ctx, cancel := context.WithTimeout(context.Background(), raidProbeBudget)
 	defer cancel()
-	found, hide, note := c.probeRAIDPassthrough(ctx, bin, goos, candidates, ioctlFallback, scanned)
+	found, hide, note, cliDrives, cliVDs := c.probeRAIDPassthrough(ctx, bin, goos, candidates, ioctlFallback, scanned)
 	c.mu.Lock()
 	c.raidBusy = false
 	c.raidExtra = found
 	c.raidHide = hide
 	c.raidNote = note
+	c.cliDrives = cliDrives
+	c.cliVDs = cliVDs
+	if len(cliDrives)+len(cliVDs) > 0 {
+		c.cliAt = time.Now()
+	} else {
+		c.cliAt = time.Time{}
+	}
 	c.mu.Unlock()
 	if len(found) > 0 {
 		slog.Info("smart raid passthrough drives discovered", "collector", "smart", "drives", len(found))
@@ -255,7 +273,17 @@ func (c *smartCollector) discoverRAID(bin, goos string, candidates []smartDevice
 	}
 }
 
-func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos string, candidates []smartDevice, ioctlFallback bool, scanned []smartDevice) ([]smartDevice, map[string]bool, string) {
+type probeFailure struct {
+	kind    string
+	message string
+}
+
+type raidCandidateIdentity struct {
+	view   *smartView
+	opened bool
+}
+
+func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos string, candidates []smartDevice, ioctlFallback bool, scanned []smartDevice) ([]smartDevice, map[string]bool, string, []storcliDrive, []storcliVD) {
 	skip := passthroughFamilies(scanned)
 	seenSerials := map[string]bool{}
 	seenDevs := map[string]bool{}
@@ -263,22 +291,102 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 		seenDevs[d.name+"|"+d.devType] = true
 	}
 	var found []smartDevice
+	var cliDrives []storcliDrive
+	var cliVDs []storcliVD
 	hide := map[string]bool{}
+	identities := make(map[string]raidCandidateIdentity, len(candidates))
+	for _, cand := range candidates {
+		identity, opened := c.readIdentity(ctx, bin, cand.name, "")
+		identities[cand.name] = raidCandidateIdentity{view: identity, opened: opened}
+		if opened && smartSupported(identity) && identityIsDisk(identity) && identity.SerialNumber != "" {
+			seenSerials[identity.SerialNumber] = true
+		}
+	}
+	storcliBin := c.resolveStorcli(goos)
+	coveredNodes := map[string]bool{}
+	storcliProduced := false
+	if storcliBin != "" && ctx.Err() == nil {
+		enumerated, vds, _ := c.enumerateStorcli(ctx, storcliBin)
+		cliVDs = vds
+		coveredControllers := map[int]bool{}
+		fallbackNode := soleMegaRAIDCandidateNode(identities)
+		for _, drive := range enumerated {
+			coveredControllers[drive.ctl] = true
+			if scannedDrive, ok := scannedMegaRAIDDrive(scanned, drive.ctl, drive.did); ok {
+				drive.node = scannedDrive.name
+				drive.cliOnly = false
+				cliDrives = append(cliDrives, drive)
+				continue
+			}
+			usedFallback := false
+			if drive.node == "" && fallbackNode != "" {
+				drive.node = fallbackNode
+				usedFallback = true
+			}
+			devType := fmt.Sprintf("megaraid,%d", drive.did)
+			if drive.node == "" {
+				drive.cliOnly = true
+				cliDrives = append(cliDrives, drive)
+				continue
+			}
+			identity, opened := c.readIdentity(ctx, bin, drive.node, devType)
+			if !opened {
+				drive.cliOnly = true
+				cliDrives = append(cliDrives, drive)
+				continue
+			}
+			cliDrives = append(cliDrives, drive)
+			if usedFallback {
+				hide[drive.node] = true
+				coveredNodes[drive.node] = true
+			}
+			key := drive.node + "|" + devType
+			if seenDevs[key] {
+				continue
+			}
+			serial := strings.TrimSpace(identity.SerialNumber)
+			if serial == "" {
+				serial = drive.serial
+			}
+			if serial != "" && seenSerials[serial] {
+				continue
+			}
+			if serial != "" {
+				seenSerials[serial] = true
+			}
+			seenDevs[key] = true
+			found = append(found, smartDevice{name: drive.node, devType: devType, slot: drive.slot})
+		}
+		storcliProduced = len(enumerated) > 0
+		for _, vd := range cliVDs {
+			if coveredControllers[vd.ctl] && strings.TrimSpace(vd.node) != "" {
+				node := strings.TrimSpace(vd.node)
+				hide[node] = true
+				coveredNodes[node] = true
+			}
+		}
+	}
 	blockedName, blockedModel := "", ""
+	var failure probeFailure
 	for _, cand := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
-		identity, opened := c.readIdentity(ctx, bin, cand.name, "")
+		candidateIdentity := identities[cand.name]
+		identity, opened := candidateIdentity.view, candidateIdentity.opened
 		families, explicit := raidFamiliesFor(identity, opened, goos)
 		hits := 0
 		covered := false
 		for _, fam := range families {
-			if skip[fam] {
+			if skip[fam] || coveredNodes[cand.name] && (fam == "megaraid" || fam == "cciss") {
 				covered = true
 				continue
 			}
-			drives := c.walkFamily(ctx, bin, fam, cand.name, seenSerials, seenDevs)
+			var walkFailure probeFailure
+			drives := c.walkFamily(ctx, bin, fam, cand.name, seenSerials, seenDevs, &walkFailure)
+			if failure.message == "" || failure.kind == "" && walkFailure.kind != "" {
+				failure = walkFailure
+			}
 			if len(drives) > 0 {
 				found = append(found, drives...)
 				hide[cand.name] = true
@@ -295,19 +403,112 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 			blockedModel = identityModel(identity)
 		}
 	}
-	if ioctlFallback && !skip["megaraid"] {
+	if len(cliDrives) > 0 {
+		kept := cliDrives[:0]
+		for _, drive := range cliDrives {
+			serial := strings.TrimSpace(drive.serial)
+			if drive.cliOnly && serial != "" && seenSerials[serial] {
+				continue
+			}
+			kept = append(kept, drive)
+		}
+		cliDrives = kept
+	}
+	if ioctlFallback && !skip["megaraid"] && !storcliProduced {
 		for _, node := range []string{"/dev/bus/0", "/dev/bus/1"} {
 			if ctx.Err() != nil {
 				break
 			}
-			found = append(found, c.walkFamily(ctx, bin, "megaraid", node, seenSerials, seenDevs)...)
+			var walkFailure probeFailure
+			found = append(found, c.walkFamily(ctx, bin, "megaraid", node, seenSerials, seenDevs, &walkFailure)...)
+			if failure.message == "" || failure.kind == "" && walkFailure.kind != "" {
+				failure = walkFailure
+			}
 		}
 	}
 	note := ""
-	if blockedName != "" && len(found) == 0 {
-		note = fmt.Sprintf("hardware RAID virtual disk %s (%s) hides its member drives and the smartctl passthrough probe found none; check the controller with its own CLI (storcli/perccli/ssacli) or run smartctl -d megaraid,N manually", blockedName, blockedModel)
+	if blockedName != "" && len(found) == 0 && !storcliProduced {
+		note = raidProbeNote(blockedName, blockedModel, failure)
+		if storcliBin != "" {
+			note += fmt.Sprintf("; storcli at %s reported no drives", storcliBin)
+		}
 	}
-	return found, hide, note
+	return found, hide, note, cliDrives, cliVDs
+}
+
+func scannedMegaRAIDDrive(scanned []smartDevice, ctl, did int) (smartDevice, bool) {
+	targetType := fmt.Sprintf("megaraid,%d", did)
+	preferredName := fmt.Sprintf("/dev/bus/%d", ctl)
+	var match smartDevice
+	for _, drive := range scanned {
+		if drive.devType != targetType && !strings.HasSuffix(drive.devType, "+"+targetType) {
+			continue
+		}
+		if drive.name == preferredName {
+			return drive, true
+		}
+		if match.name == "" {
+			match = drive
+		}
+	}
+	return match, match.name != ""
+}
+
+func soleMegaRAIDCandidateNode(identities map[string]raidCandidateIdentity) string {
+	node := ""
+	for candidate, identity := range identities {
+		if !identity.opened || smartSupported(identity.view) {
+			continue
+		}
+		model := strings.ToLower(identityModel(identity.view))
+		matched := false
+		for _, signature := range raidSignatures {
+			if signature[1] == "megaraid" && strings.Contains(model, signature[0]) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if node != "" {
+			return ""
+		}
+		node = candidate
+	}
+	return node
+}
+
+func raidProbeNote(name, model string, failure probeFailure) string {
+	message := truncateProbeMessage(failure.message, 120)
+	switch failure.kind {
+	case "permission":
+		return fmt.Sprintf("hardware RAID virtual disk %s (%s): the controller ioctl node refused access (%s); re-run the installer with --enable-smart to install the udev rule that opens it to the disk group, or install Broadcom storcli/perccli which the agent uses automatically", name, model, message)
+	case "nonode":
+		return fmt.Sprintf("hardware RAID virtual disk %s (%s): smartctl could not find the controller ioctl node (%s); the kernel driver may predate passthrough support — install Broadcom storcli/perccli which the agent uses automatically", name, model, message)
+	default:
+		return fmt.Sprintf("hardware RAID virtual disk %s (%s) hides its member drives and the smartctl passthrough probe found none; install Broadcom storcli/perccli for exact enumeration, check the controller with its own CLI, or run smartctl -d megaraid,N manually", name, model)
+	}
+}
+
+func classifyProbeErr(message string) string {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "permission denied"), strings.Contains(lower, "operation not permitted"):
+		return "permission"
+	case strings.Contains(lower, "no such file or directory"), strings.Contains(lower, "no such device"):
+		return "nonode"
+	default:
+		return ""
+	}
+}
+
+func truncateProbeMessage(message string, limit int) string {
+	runes := []rune(strings.TrimSpace(message))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit])
 }
 
 var raidSignatures = [][2]string{
@@ -360,26 +561,26 @@ func familiesForSignature(family, goos string) []string {
 	return []string{family}
 }
 
-func (c *smartCollector) walkFamily(ctx context.Context, bin, family, node string, seenSerials, seenDevs map[string]bool) []smartDevice {
+func (c *smartCollector) walkFamily(ctx context.Context, bin, family, node string, seenSerials, seenDevs map[string]bool, failure *probeFailure) []smartDevice {
 	switch family {
 	case "megaraid":
-		return c.walkIDs(ctx, bin, node, 0, 63, 16, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("megaraid,%d", i) })
+		return c.walkIDs(ctx, bin, node, 0, 63, 16, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("megaraid,%d", i) }, failure)
 	case "cciss":
-		return c.walkIDs(ctx, bin, node, 0, 47, 16, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("cciss,%d", i) })
+		return c.walkIDs(ctx, bin, node, 0, 47, 16, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("cciss,%d", i) }, failure)
 	case "aacraid":
-		return c.walkIDs(ctx, bin, node, 0, 31, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("aacraid,0,0,%d", i) })
+		return c.walkIDs(ctx, bin, node, 0, 31, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("aacraid,0,0,%d", i) }, failure)
 	case "3ware":
 		for _, n := range []string{"/dev/twl0", "/dev/twa0", "/dev/twe0"} {
 			if !c.fileExists(n) {
 				continue
 			}
-			if hits := c.walkIDs(ctx, bin, n, 0, 31, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("3ware,%d", i) }); len(hits) > 0 {
+			if hits := c.walkIDs(ctx, bin, n, 0, 31, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("3ware,%d", i) }, failure); len(hits) > 0 {
 				return hits
 			}
 		}
 	case "areca":
 		for _, n := range arecaNodes(node, c.fileExists) {
-			if hits := c.walkIDs(ctx, bin, n, 1, 24, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("areca,%d", i) }); len(hits) > 0 {
+			if hits := c.walkIDs(ctx, bin, n, 1, 24, 8, seenSerials, seenDevs, func(i int) string { return fmt.Sprintf("areca,%d", i) }, failure); len(hits) > 0 {
 				return hits
 			}
 		}
@@ -398,7 +599,7 @@ func arecaNodes(scannedNode string, exists func(string) bool) []string {
 	return out
 }
 
-func (c *smartCollector) walkIDs(ctx context.Context, bin, node string, lo, hi, missCutoff int, seenSerials, seenDevs map[string]bool, devType func(int) string) []smartDevice {
+func (c *smartCollector) walkIDs(ctx context.Context, bin, node string, lo, hi, missCutoff int, seenSerials, seenDevs map[string]bool, devType func(int) string, failure *probeFailure) []smartDevice {
 	var out []smartDevice
 	misses := 0
 	for i := lo; i <= hi && misses < missCutoff; i++ {
@@ -408,6 +609,10 @@ func (c *smartCollector) walkIDs(ctx context.Context, bin, node string, lo, hi, 
 		t := devType(i)
 		identity, opened := c.readIdentity(ctx, bin, node, t)
 		if !opened {
+			if failure != nil && failure.message == "" {
+				failure.message = smartctlFailureMessage(identity)
+				failure.kind = classifyProbeErr(failure.message)
+			}
 			misses++
 			continue
 		}
@@ -429,6 +634,18 @@ func (c *smartCollector) walkIDs(ctx context.Context, bin, node string, lo, hi, 
 		out = append(out, smartDevice{name: node, devType: t})
 	}
 	return out
+}
+
+func smartctlFailureMessage(view *smartView) string {
+	if view == nil || view.Smartctl == nil {
+		return ""
+	}
+	for _, message := range view.Smartctl.Messages {
+		if strings.TrimSpace(message.String) != "" {
+			return strings.TrimSpace(message.String)
+		}
+	}
+	return ""
 }
 
 func (c *smartCollector) readIdentity(ctx context.Context, bin, node, devType string) (*smartView, bool) {
@@ -482,6 +699,9 @@ func identityModel(v *smartView) string {
 
 func smartReadArgs(dev smartDevice) []string {
 	args := []string{"-a", "--json=c"}
+	if !strings.EqualFold(dev.devType, "nvme") && !strings.Contains(strings.ToLower(dev.name), "nvme") {
+		args = append(args, "-l", "devstat")
+	}
 	if !smartTypeAutoDetect(dev.devType) {
 		args = append(args, "-d", dev.devType)
 	}
@@ -503,13 +723,16 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	c.mu.Lock()
 	devices := c.devicesLocked()
 	bin := c.smartctl
+	cliDrives := append([]storcliDrive(nil), c.cliDrives...)
+	cliVDs := append([]storcliVD(nil), c.cliVDs...)
 	c.mu.Unlock()
 
 	now := time.Now()
 	var (
 		tallyMu    sync.Mutex
 		wg         sync.WaitGroup
-		out        = make([]wire.Point, 0, len(devices)*4)
+		out        = make([]wire.Point, 0, len(devices)*4+len(cliDrives)*3+len(cliVDs))
+		mediaSeen  = make(map[string]bool)
 		readOK     int
 		failed     int
 		nvmeFailed int
@@ -548,14 +771,46 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 			if m := identityModel(&s); m != "unknown" {
 				labels["model"] = m
 			}
-			out = append(out, smartPoints(now, labels, &s)...)
+			if dev.slot != "" {
+				labels["slot"] = dev.slot
+			}
+			points := smartPoints(now, labels, &s)
+			for _, p := range points {
+				if p.Metric == metrics.SmartMediaErrors {
+					mediaSeen[p.Labels["device"]] = true
+				}
+			}
+			out = append(out, points...)
 		}(dev)
 	}
 	wg.Wait()
+	for _, drive := range cliDrives {
+		device := storcliDriveLabels(drive)["device"]
+		if drive.cliOnly {
+			for _, p := range storcliDrivePoints(now, drive) {
+				if p.Metric == metrics.SmartMediaErrors {
+					if mediaSeen[device] {
+						continue
+					}
+					mediaSeen[device] = true
+				}
+				out = append(out, p)
+			}
+			continue
+		}
+		if !mediaSeen[device] {
+			out = append(out, storcliMediaErrorPoint(now, drive))
+			mediaSeen[device] = true
+		}
+	}
+	for _, vd := range cliVDs {
+		out = append(out, storcliVDPoint(now, vd))
+	}
 
 	c.mu.Lock()
 	logHint := c.updateReadStateLocked(readOK, failed, nvmeFailed)
 	msg := c.stateMsg
+	c.maybeRefreshStorcliLocked()
 	c.mu.Unlock()
 	if logHint {
 		slog.Warn("smart per-device read failed", "collector", "smart", "detail", msg)
@@ -635,6 +890,8 @@ func smartPoints(now time.Time, labels map[string]string, s *smartView) []wire.P
 	if sectorBytes <= 0 {
 		sectorBytes = 512
 	}
+	var ataWritten *int64
+	var ataRead *int64
 	for _, a := range s.AtaSmartAttributes.Table {
 		switch a.Name {
 		case "Reallocated_Sector_Ct":
@@ -648,12 +905,70 @@ func smartPoints(now time.Time, labels map[string]string, s *smartView) []wire.P
 		case "Power_Cycle_Count":
 			out = append(out, point(now, metrics.SmartPowerCycles, labels, float64(a.Raw.Value)))
 		case "Total_LBAs_Written":
-			out = append(out, point(now, metrics.SmartDataWrittenBytes, labels, float64(a.Raw.Value)*float64(sectorBytes)))
+			value := a.Raw.Value
+			ataWritten = &value
 		case "Total_LBAs_Read":
-			out = append(out, point(now, metrics.SmartDataReadBytes, labels, float64(a.Raw.Value)*float64(sectorBytes)))
+			value := a.Raw.Value
+			ataRead = &value
+		}
+	}
+	if ataWritten != nil {
+		out = setSmartPoint(out, now, metrics.SmartDataWrittenBytes, labels, float64(*ataWritten)*float64(sectorBytes))
+	}
+	if ataRead != nil {
+		out = setSmartPoint(out, now, metrics.SmartDataReadBytes, labels, float64(*ataRead)*float64(sectorBytes))
+	}
+	if s.AtaDeviceStatistics != nil {
+		for _, page := range s.AtaDeviceStatistics.Pages {
+			for _, entry := range page.Table {
+				switch entry.Name {
+				case "Logical Sectors Written":
+					out = setSmartPoint(out, now, metrics.SmartDataWrittenBytes, labels, float64(entry.Value)*float64(sectorBytes))
+				case "Logical Sectors Read":
+					out = setSmartPoint(out, now, metrics.SmartDataReadBytes, labels, float64(entry.Value)*float64(sectorBytes))
+				case "Number of Reported Uncorrectable Errors":
+					out = setSmartPoint(out, now, metrics.SmartMediaErrors, labels, float64(entry.Value))
+				case "Percentage Used Endurance Indicator":
+					out = setSmartPoint(out, now, metrics.SmartPercentUsed, labels, float64(entry.Value))
+				}
+			}
+		}
+	}
+	if s.SCSIGrownDefectList != nil {
+		out = setSmartPoint(out, now, metrics.SmartReallocSectors, labels, float64(*s.SCSIGrownDefectList))
+	}
+	if s.SCSIErrorCounterLog != nil {
+		mediaErrors := int64(0)
+		mediaPresent := false
+		if s.SCSIErrorCounterLog.Read != nil {
+			if value, err := strconv.ParseFloat(strings.TrimSpace(s.SCSIErrorCounterLog.Read.GigabytesProcessed), 64); err == nil {
+				out = setSmartPoint(out, now, metrics.SmartDataReadBytes, labels, value*1e9)
+			}
+			mediaErrors += s.SCSIErrorCounterLog.Read.TotalUncorrectedErrors
+			mediaPresent = true
+		}
+		if s.SCSIErrorCounterLog.Write != nil {
+			if value, err := strconv.ParseFloat(strings.TrimSpace(s.SCSIErrorCounterLog.Write.GigabytesProcessed), 64); err == nil {
+				out = setSmartPoint(out, now, metrics.SmartDataWrittenBytes, labels, value*1e9)
+			}
+			mediaErrors += s.SCSIErrorCounterLog.Write.TotalUncorrectedErrors
+			mediaPresent = true
+		}
+		if mediaPresent {
+			out = setSmartPoint(out, now, metrics.SmartMediaErrors, labels, float64(mediaErrors))
 		}
 	}
 	return out
+}
+
+func setSmartPoint(points []wire.Point, now time.Time, metric metrics.ID, labels map[string]string, value float64) []wire.Point {
+	for i := range points {
+		if points[i].Metric == metric {
+			points[i] = point(now, metric, labels, value)
+			return points
+		}
+	}
+	return append(points, point(now, metric, labels, value))
 }
 
 func isNVMeDevice(name, typ, protocol string) bool {
@@ -674,6 +989,10 @@ func smartCannotRead(exitStatus int) bool {
 
 type smartctlMeta struct {
 	ExitStatus int `json:"exit_status"`
+	Messages   []struct {
+		String   string `json:"string"`
+		Severity string `json:"severity"`
+	} `json:"messages"`
 }
 
 type smartView struct {
@@ -716,10 +1035,35 @@ type smartView struct {
 			} `json:"raw"`
 		} `json:"table"`
 	} `json:"ata_smart_attributes"`
+	AtaDeviceStatistics *struct {
+		Pages []struct {
+			Number int    `json:"number"`
+			Name   string `json:"name"`
+			Table  []struct {
+				Name  string `json:"name"`
+				Value int64  `json:"value"`
+			} `json:"table"`
+		} `json:"pages"`
+	} `json:"ata_device_statistics"`
+	SCSIGrownDefectList *int64 `json:"scsi_grown_defect_list"`
+	SCSIErrorCounterLog *struct {
+		Read *struct {
+			GigabytesProcessed     string `json:"gigabytes_processed"`
+			TotalUncorrectedErrors int64  `json:"total_uncorrected_errors"`
+		} `json:"read"`
+		Write *struct {
+			GigabytesProcessed     string `json:"gigabytes_processed"`
+			TotalUncorrectedErrors int64  `json:"total_uncorrected_errors"`
+		} `json:"write"`
+	} `json:"scsi_error_counter_log"`
 }
 
 func run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmdCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	return runTimeout(ctx, 8*time.Second, name, args...)
+}
+
+func runTimeout(ctx context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return exec.CommandContext(cmdCtx, name, args...).Output()
 }

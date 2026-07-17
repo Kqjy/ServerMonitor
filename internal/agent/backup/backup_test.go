@@ -75,6 +75,7 @@ func (r *fakeResticRunner) Run(ctx context.Context, command Command) (CommandRes
 	if len(queue) > 0 {
 		response := queue[0]
 		r.responses[key] = queue[1:]
+		emitFakeStdout(command, response.stdout)
 		return CommandResult{Stdout: []byte(response.stdout), Stderr: []byte(response.stderr)}, response.err
 	}
 	switch resticSubcommand(command.Args) {
@@ -90,6 +91,17 @@ func (r *fakeResticRunner) Run(ctx context.Context, command Command) (CommandRes
 		return CommandResult{}, nil
 	default:
 		return CommandResult{Stderr: []byte("unexpected command")}, errors.New("exit status 1")
+	}
+}
+
+func emitFakeStdout(command Command, stdout string) {
+	if command.OnStdoutLine == nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.TrimSpace(line) != "" {
+			command.OnStdoutLine([]byte(line))
+		}
 	}
 }
 
@@ -665,8 +677,8 @@ func TestRunUsesRepoRetentionForForget(t *testing.T) {
 		}
 	}
 	want := map[string][]string{
-		cfg.Repos[0].URL: {"forget", "--prune", "--keep-daily", "30", "--keep-monthly", "6"},
-		cfg.Repos[1].URL: {"forget", "--prune", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "2"},
+		cfg.Repos[0].URL: {"forget", "--prune", "--group-by", "host", "--keep-daily", "30", "--keep-monthly", "6"},
+		cfg.Repos[1].URL: {"forget", "--prune", "--group-by", "host", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "2"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forget args by repo = %#v, want %#v", got, want)
@@ -675,9 +687,27 @@ func TestRunUsesRepoRetentionForForget(t *testing.T) {
 
 func TestForgetArgsOmitZeroRetentionValues(t *testing.T) {
 	got := forgetArgs(Retention{Daily: 0, Weekly: 4, Monthly: 0})
-	want := []string{"forget", "--prune", "--keep-weekly", "4"}
+	want := []string{"forget", "--prune", "--group-by", "host", "--keep-weekly", "4"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forget args = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunRepoRecordsScopeOnSuccessAndFailure(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Paths = []string{"/etc", "", "/var/lib/docker/volumes"}
+	cfg.Excludes = []string{"**/.cache", "", "/var/lib/docker/overlay2"}
+	runner := newFakeResticRunner()
+	success := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil)
+	if !success.Success || !reflect.DeepEqual(success.Paths, []string{"/etc", "/var/lib/docker/volumes"}) || !reflect.DeepEqual(success.Excludes, []string{"**/.cache", "/var/lib/docker/overlay2"}) || success.OneFileSystem == nil || !*success.OneFileSystem {
+		t.Fatalf("success scope = %#v", success)
+	}
+
+	failingRunner := newFakeResticRunner()
+	failingRunner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stderr: "failed", err: errors.New("exit status 1")})
+	failure := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: failingRunner}, nil)
+	if failure.Success || !reflect.DeepEqual(failure.Paths, success.Paths) || !reflect.DeepEqual(failure.Excludes, success.Excludes) || failure.OneFileSystem == nil || !*failure.OneFileSystem {
+		t.Fatalf("failure scope = %#v", failure)
 	}
 }
 
@@ -765,6 +795,226 @@ func TestStatusMergePreservesChecksForeignReposAndLastSuccessOnFailure(t *testin
 	}
 	if got.Repos[1].Name != "foreign" {
 		t.Fatalf("foreign repo not preserved: %#v", got.Repos)
+	}
+}
+
+func TestMergeStatusPreservesScopeForPartialUpdate(t *testing.T) {
+	oneFileSystem := false
+	existing := StatusFile{Repos: []RepoStatus{{
+		Name:          "repo1",
+		Paths:         []string{"/etc", "/srv"},
+		Excludes:      []string{"/srv/cache"},
+		OneFileSystem: &oneFileSystem,
+	}}}
+	merged := mergeStatus(existing, []RepoStatus{{Name: "repo1", Error: "partial update"}})
+	if len(merged.Repos) != 1 || !reflect.DeepEqual(merged.Repos[0].Paths, existing.Repos[0].Paths) || !reflect.DeepEqual(merged.Repos[0].Excludes, existing.Repos[0].Excludes) || merged.Repos[0].OneFileSystem == nil || *merged.Repos[0].OneFileSystem {
+		t.Fatalf("scope not preserved: %#v", merged.Repos)
+	}
+}
+
+func TestMergeStatusPreservesPathStatsForPartialUpdate(t *testing.T) {
+	existing := StatusFile{Repos: []RepoStatus{{
+		Name:          "repo1",
+		PathStats:     []PathStat{{Path: "/etc", Bytes: 100, Files: 2}},
+		StatsSnapshot: "abcdef12",
+	}}}
+	merged := mergeStatus(existing, []RepoStatus{{Name: "repo1", Error: "partial update"}})
+	if len(merged.Repos) != 1 || !reflect.DeepEqual(merged.Repos[0].PathStats, existing.Repos[0].PathStats) || merged.Repos[0].StatsSnapshot != "abcdef12" {
+		t.Fatalf("path stats not preserved: %#v", merged.Repos)
+	}
+}
+
+func TestBrowseValidation(t *testing.T) {
+	cfg := testConfig(t)
+	cases := []struct {
+		name string
+		opts BrowseOptions
+	}{
+		{"bad snapshot", BrowseOptions{Repo: "repo1", Snapshot: "-latest", Path: "/", MaxEntries: 1}},
+		{"relative path", BrowseOptions{Repo: "repo1", Snapshot: "latest", Path: "etc", MaxEntries: 1}},
+		{"parent segment", BrowseOptions{Repo: "repo1", Snapshot: "latest", Path: "/etc/../root", MaxEntries: 1}},
+		{"unknown repo", BrowseOptions{Repo: "missing", Snapshot: "latest", Path: "/", MaxEntries: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validateBrowseOptions(cfg.Repos, tc.opts); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestBrowseResticArgsParsingSortAndCap(t *testing.T) {
+	cfg := testConfig(t)
+	mtime := "2026-07-17T08:30:00Z"
+	listing := strings.Join([]string{
+		`{"message_type":"snapshot","id":"abcdef123456"}`,
+		`{"message_type":"node","name":"z.txt","type":"file","path":"/z.txt","size":9,"mtime":"` + mtime + `"}`,
+		`{"message_type":"node","name":"beta","type":"dir","path":"/beta","mtime":"` + mtime + `"}`,
+		`{"message_type":"node","name":"alpha","type":"dir","path":"/alpha","mtime":"` + mtime + `"}`,
+		`{"message_type":"node","name":"overflow","type":"file","path":"/overflow","size":5}`,
+	}, "\n")
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	result, err := browseSnapshot(context.Background(), cfg, BrowseOptions{Repo: "repo1", Snapshot: "latest", Path: "/", MaxEntries: 3}, Options{Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshot != "abcdef123456" || !result.Truncated || len(result.Entries) != 3 {
+		t.Fatalf("browse result = %#v", result)
+	}
+	if result.Entries[0].Name != "alpha" || result.Entries[1].Name != "beta" || result.Entries[2].Name != "z.txt" || result.Entries[2].Size != 9 || result.Entries[2].Mtime == nil {
+		t.Fatalf("entries = %#v", result.Entries)
+	}
+	want := []string{"ls", "--json", "latest", "/"}
+	if !reflect.DeepEqual(runner.calls[0].Args, want) {
+		t.Fatalf("args = %#v, want %#v", runner.calls[0].Args, want)
+	}
+
+	recursiveRunner := newFakeResticRunner()
+	recursiveRunner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	if _, err := browseSnapshot(context.Background(), cfg, BrowseOptions{Repo: "repo1", Snapshot: "abcd", Path: "/etc", Recursive: true, MaxEntries: 10}, Options{Runner: recursiveRunner}); err != nil {
+		t.Fatal(err)
+	}
+	wantRecursive := []string{"ls", "--json", "--recursive", "abcd", "/etc"}
+	if !reflect.DeepEqual(recursiveRunner.calls[0].Args, wantRecursive) {
+		t.Fatalf("recursive args = %#v, want %#v", recursiveRunner.calls[0].Args, wantRecursive)
+	}
+}
+
+func TestBrowseSkipsRequestedDirectoryNode(t *testing.T) {
+	cfg := testConfig(t)
+	listing := strings.Join([]string{
+		`{"message_type":"snapshot","id":"abcdef123456"}`,
+		`{"message_type":"node","name":"app-db","type":"dir","path":"/e2e/src/data/volumes/app-db"}`,
+		`{"message_type":"node","name":"uploads","type":"dir","path":"/e2e/src/data/volumes/uploads"}`,
+		`{"message_type":"node","name":"volumes","type":"dir","path":"/e2e/src/data/volumes"}`,
+	}, "\n")
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	result, err := browseSnapshot(context.Background(), cfg, BrowseOptions{Repo: "repo1", Snapshot: "latest", Path: "/e2e/src/data/volumes/", MaxEntries: 10}, Options{Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Entries) != 2 || result.Entries[0].Name != "app-db" || result.Entries[1].Name != "uploads" {
+		t.Fatalf("entries = %#v", result.Entries)
+	}
+
+	fileRunner := newFakeResticRunner()
+	fileRunner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: `{"message_type":"node","name":"config.json","type":"file","path":"/e2e/config.json","size":42}`})
+	fileResult, err := browseSnapshot(context.Background(), cfg, BrowseOptions{Repo: "repo1", Snapshot: "latest", Path: "/e2e/config.json", MaxEntries: 10}, Options{Runner: fileRunner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fileResult.Entries) != 1 || fileResult.Entries[0].Name != "config.json" || fileResult.Entries[0].Size != 42 {
+		t.Fatalf("file entries = %#v", fileResult.Entries)
+	}
+}
+
+func TestBrowseErrorClassification(t *testing.T) {
+	cases := []struct {
+		err  error
+		kind string
+	}{
+		{fmt.Errorf("read config: %w", os.ErrPermission), "insufficient_privilege"},
+		{errors.New("another backup operation holds the tunnel lock; retry"), "busy"},
+		{errors.New("snapshot browse failed: no matching ID found"), "not_found"},
+		{errors.New("something else failed"), "failed"},
+	}
+	for _, tc := range cases {
+		kind, message := ClassifyBrowseError(tc.err)
+		if kind != tc.kind || message == "" {
+			t.Fatalf("ClassifyBrowseError(%v) = %q, %q", tc.err, kind, message)
+		}
+	}
+
+	cfg := testConfig(t)
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stderr: "no matching ID found in " + cfg.Repos[0].URL, err: errors.New("exit status 1")})
+	_, err := browseSnapshot(context.Background(), cfg, BrowseOptions{Repo: "repo1", Snapshot: "abcd", Path: "/", MaxEntries: 10}, Options{Runner: runner})
+	kind, message := ClassifyBrowseError(err)
+	if kind != "not_found" || strings.Contains(message, cfg.Repos[0].URL) || !strings.Contains(message, "[repository]") {
+		t.Fatalf("classified sanitized error = %q, %q", kind, message)
+	}
+}
+
+func TestParseBackupSummarySnapshotID(t *testing.T) {
+	summary, err := parseBackupSummary([]byte(`{"message_type":"summary","total_duration":1.2,"data_added":3,"total_bytes_processed":4,"snapshot_id":"abcdef123456"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.SnapshotID != "abcdef123456" {
+		t.Fatalf("snapshot id = %q", summary.SnapshotID)
+	}
+}
+
+func TestCollectPathStatsLongestPrefixAndZeroBuckets(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Paths = []string{"/etc", "/var/lib", "/var/lib/docker/volumes"}
+	listing := strings.Join([]string{
+		`{"message_type":"node","type":"file","path":"/var/lib/db/data","size":100}`,
+		`{"message_type":"node","type":"file","path":"/var/lib/docker/volumes/app/db","size":250}`,
+		`{"message_type":"node","type":"file","path":"/tmp/ignored","size":999}`,
+		`{"message_type":"node","type":"dir","path":"/var/lib/docker/volumes/empty"}`,
+	}, "\n")
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	stats, err := collectPathStats(context.Background(), cfg, cfg.Repos[0], t.TempDir(), "abcdef", Options{Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PathStat{{Path: "/etc"}, {Path: "/var/lib", Bytes: 100, Files: 1}, {Path: "/var/lib/docker/volumes", Bytes: 250, Files: 1}}
+	if !reflect.DeepEqual(stats, want) {
+		t.Fatalf("stats = %#v, want %#v", stats, want)
+	}
+}
+
+func TestCollectPathStatsWindowsDriveAndCaseNormalization(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Paths = []string{`C:\Users`, `D:\Data`}
+	listing := strings.Join([]string{
+		`{"message_type":"node","type":"file","path":"/C/Users/jun/file","size":100}`,
+		`{"message_type":"node","type":"file","path":"/c/uSeRs/JUN/second","size":250}`,
+	}, "\n")
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	stats, err := collectPathStats(context.Background(), cfg, cfg.Repos[0], t.TempDir(), "abcdef", Options{Runner: runner, GOOS: "windows"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PathStat{{Path: `C:\Users`, Bytes: 350, Files: 2}, {Path: `D:\Data`}}
+	if !reflect.DeepEqual(stats, want) {
+		t.Fatalf("stats = %#v, want %#v", stats, want)
+	}
+}
+
+func TestCollectPathStatsLinuxMatchingRemainsByteExact(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Paths = []string{"/Data"}
+	listing := strings.Join([]string{
+		`{"message_type":"node","type":"file","path":"/data/lower","size":100}`,
+		`{"message_type":"node","type":"file","path":"/Data/exact","size":250}`,
+	}, "\n")
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: listing})
+	stats, err := collectPathStats(context.Background(), cfg, cfg.Repos[0], t.TempDir(), "abcdef", Options{Runner: runner, GOOS: "linux"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PathStat{{Path: "/Data", Bytes: 250, Files: 1}}
+	if !reflect.DeepEqual(stats, want) {
+		t.Fatalf("stats = %#v, want %#v", stats, want)
+	}
+}
+
+func TestPathStatsFailureDoesNotFailBackup(t *testing.T) {
+	cfg := testConfig(t)
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stdout: `{"message_type":"summary","total_duration":1,"snapshot_id":"abcdef123456"}`})
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stderr: "listing failed", err: errors.New("exit status 1")})
+	status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil)
+	if !status.Success || status.PathStats != nil || status.StatsSnapshot != "" {
+		t.Fatalf("status = %#v", status)
 	}
 }
 
@@ -1141,6 +1391,33 @@ func TestSanitizeResticTextScrubsOverlappingSecretsLongestFirst(t *testing.T) {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("overlapping secret leaked %q in %q", leaked, got)
 		}
+	}
+}
+
+func TestSanitizeResticTextUnwrapsLastExitError(t *testing.T) {
+	text := "repository lookup failed\n" +
+		`{"message_type":"exit_error","code":1,"message":"first failure"}` + "\n" +
+		`{"message_type":"exit_error","code":1,"message":"no matching ID found for prefix \"ffffffff\""}`
+	want := "repository lookup failed\nno matching ID found for prefix \"ffffffff\""
+	if got := sanitizeResticText(text, Repo{}, nil); got != want {
+		t.Fatalf("sanitizeResticText() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeResticTextLeavesNonJSONUnchanged(t *testing.T) {
+	text := "unable to open repository: connection refused"
+	if got := sanitizeResticText(text, Repo{}, nil); got != text {
+		t.Fatalf("sanitizeResticText() = %q, want %q", got, text)
+	}
+}
+
+func TestSanitizeResticTextScrubsExtractedExitErrorMessage(t *testing.T) {
+	repo := Repo{URL: "rest:https://backup.example/repo"}
+	repoEnv := map[string]string{"RESTIC_REST_PASSWORD": "supersecret"}
+	text := `{"message_type":"exit_error","code":1,"message":"rest:https://backup.example/repo rejected supersecret"}`
+	want := "[repository] rejected [credential]"
+	if got := sanitizeResticText(text, repo, repoEnv); got != want {
+		t.Fatalf("sanitizeResticText() = %q, want %q", got, want)
 	}
 }
 
