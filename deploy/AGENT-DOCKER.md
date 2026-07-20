@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.0 .
-docker push registry.example.com/servermonitor-agent:0.4.0
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.3 .
+docker push registry.example.com/servermonitor-agent:0.4.3
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.0
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.3
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -114,6 +114,8 @@ Upgrade the server before deploying a 0.4.0 agent image: server ingest rejects u
 ### Sampling interval
 
 An interval pushed from the server applies immediately but is **not** persisted across container restarts — config is env-only. Set `SM_INTERVAL_S` in `.env.agent` to pin it across restarts; the compose recipe forwards it into the container.
+
+`SM_SMART_SAMPLE_S` controls the SMART background-sampling cadence in seconds. It defaults to 300 and is clamped between 60 and 3600; the compose recipe forwards a blank value to use the default.
 
 ### SMART / RAID / Wi-Fi
 

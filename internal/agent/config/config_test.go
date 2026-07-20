@@ -19,7 +19,7 @@ func clearIdentityEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"SM_SERVER_URL", "SM_TOKEN", "SM_SERVER_PUBKEY",
-		"SM_INTERVAL_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE", "SM_BACKUP_STATUS_PATH",
+		"SM_INTERVAL_S", "SM_SMART_SAMPLE_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE", "SM_BACKUP_STATUS_PATH",
 	} {
 		t.Setenv(k, "")
 	}
@@ -30,6 +30,7 @@ func TestLoadFileOnly(t *testing.T) {
 	p := writeTempConfig(t, `server_url = "https://file.example.com"
 token = "filetok"
 interval_s = 15
+smart_sample_s = 240
 `)
 	c, err := Load(p)
 	if err != nil {
@@ -40,6 +41,9 @@ interval_s = 15
 	}
 	if c.IntervalS != 15 {
 		t.Fatalf("interval: got %d want 15", c.IntervalS)
+	}
+	if c.SmartSampleS != 240 {
+		t.Fatalf("smart sample interval: got %d want 240", c.SmartSampleS)
 	}
 }
 
@@ -58,6 +62,9 @@ func TestLoadEnvOnlyMissingFile(t *testing.T) {
 	if c.IntervalS != 10 {
 		t.Fatalf("default interval: got %d want 10", c.IntervalS)
 	}
+	if c.SmartSampleS != 0 {
+		t.Fatalf("default smart sample interval: got %d want 0", c.SmartSampleS)
+	}
 }
 
 func TestLoadEnvOverridesFile(t *testing.T) {
@@ -65,16 +72,18 @@ func TestLoadEnvOverridesFile(t *testing.T) {
 	p := writeTempConfig(t, `server_url = "https://file.example.com"
 token = "filetok"
 interval_s = 20
+smart_sample_s = 180
 `)
 	t.Setenv("SM_SERVER_URL", "https://env.example.com")
 	t.Setenv("SM_TOKEN", "envtok")
 	t.Setenv("SM_INTERVAL_S", "30")
+	t.Setenv("SM_SMART_SAMPLE_S", "600")
 	c, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.ServerURL != "https://env.example.com" || c.Token != "envtok" || c.IntervalS != 30 {
-		t.Fatalf("env did not override file: %q %q %d", c.ServerURL, c.Token, c.IntervalS)
+	if c.ServerURL != "https://env.example.com" || c.Token != "envtok" || c.IntervalS != 30 || c.SmartSampleS != 600 {
+		t.Fatalf("env did not override file: %q %q %d %d", c.ServerURL, c.Token, c.IntervalS, c.SmartSampleS)
 	}
 }
 
@@ -121,6 +130,20 @@ func TestLoadInvalidIntervalEnvIgnored(t *testing.T) {
 	}
 	if c.IntervalS != 10 {
 		t.Fatalf("invalid SM_INTERVAL_S should keep default 10, got %d", c.IntervalS)
+	}
+}
+
+func TestLoadInvalidSmartSampleEnvIgnored(t *testing.T) {
+	clearIdentityEnv(t)
+	t.Setenv("SM_SERVER_URL", "https://env.example.com")
+	t.Setenv("SM_TOKEN", "envtok")
+	t.Setenv("SM_SMART_SAMPLE_S", "not-a-number")
+	c, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.SmartSampleS != 0 {
+		t.Fatalf("invalid SM_SMART_SAMPLE_S should keep default 0, got %d", c.SmartSampleS)
 	}
 }
 

@@ -18,6 +18,7 @@ type Config struct {
 	Token            string            `toml:"token"`
 	ServerPubkey     string            `toml:"server_pubkey"`
 	IntervalS        int               `toml:"interval_s"`
+	SmartSampleS     int               `toml:"smart_sample_s"`
 	Enabled          []string          `toml:"enabled"`
 	Disabled         []string          `toml:"disabled"`
 	ProcessTopN      int               `toml:"process_top_n"`
@@ -87,6 +88,11 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("SM_INTERVAL_S"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.IntervalS = n
+		}
+	}
+	if v := os.Getenv("SM_SMART_SAMPLE_S"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.SmartSampleS = n
 		}
 	}
 	if v := os.Getenv("SM_AUTO_UPGRADE"); v != "" {

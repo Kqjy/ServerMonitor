@@ -254,6 +254,107 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+func collectSmartSample(t *testing.T, c *smartCollector) []wire.Point {
+	t.Helper()
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("start SMART sample: %v", err)
+	}
+	waitFor(t, "SMART sample", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.pendingSample != nil
+	})
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("collect SMART sample: %v", err)
+	}
+	return points
+}
+
+func TestSetSMARTSampleIntervalClamp(t *testing.T) {
+	defaultSmartCollector.mu.Lock()
+	original := defaultSmartCollector.sampleInterval
+	defaultSmartCollector.mu.Unlock()
+	defer func() {
+		defaultSmartCollector.mu.Lock()
+		defaultSmartCollector.sampleInterval = original
+		defaultSmartCollector.mu.Unlock()
+	}()
+	for _, tc := range []struct {
+		input time.Duration
+		want  time.Duration
+	}{
+		{0, smartSampleDefault},
+		{30 * time.Second, smartSampleMin},
+		{2 * time.Hour, smartSampleMax},
+		{10 * time.Minute, 10 * time.Minute},
+	} {
+		SetSMARTSampleInterval(tc.input)
+		defaultSmartCollector.mu.Lock()
+		got := defaultSmartCollector.sampleInterval
+		defaultSmartCollector.mu.Unlock()
+		if got != tc.want {
+			t.Fatalf("SetSMARTSampleInterval(%v) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestCollectDoesNotRepeatSMARTReadsBetweenSamples(t *testing.T) {
+	f := &fakeSmartctl{fallback: `{"smartctl":{"exit_status":0},"temperature":{"current":31},"smart_status":{"passed":true}}`}
+	c := &smartCollector{
+		probed:         true,
+		smartctl:       "/fake/smartctl",
+		storcli:        "/fake/storcli",
+		storcliProbed:  true,
+		goos:           "darwin",
+		scanned:        []smartDevice{{name: "/dev/sda", devType: "ata"}, {name: "/dev/sdb", devType: "ata"}},
+		cliDrives:      []storcliDrive{{ctl: 0, did: 8, cliOnly: true}},
+		cliAt:          time.Now().Add(-time.Hour),
+		devicesAt:      time.Now(),
+		devicesTTL:     time.Hour,
+		sampleInterval: time.Hour,
+		execFn:         f.exec,
+	}
+	for range 20 {
+		if _, err := c.Collect(context.Background()); err != nil {
+			t.Fatalf("Collect: %v", err)
+		}
+	}
+	waitFor(t, "SMART sample completion", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.pendingSample != nil
+	})
+	for range 20 {
+		if _, err := c.Collect(context.Background()); err != nil {
+			t.Fatalf("Collect: %v", err)
+		}
+	}
+	waitFor(t, "storcli refresh completion", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.cliBusy
+	})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	reads := 0
+	storcliEnumerations := 0
+	for _, call := range f.calls {
+		if strings.HasPrefix(call, "-a ") {
+			reads++
+		}
+		if call == "show ctrlcount J" {
+			storcliEnumerations++
+		}
+	}
+	if reads != len(c.scanned) {
+		t.Fatalf("SMART read calls = %d, want one per device (%d): %v", reads, len(c.scanned), f.calls)
+	}
+	if storcliEnumerations > 1 {
+		t.Fatalf("storcli enumerations = %d, want at most 1: %v", storcliEnumerations, f.calls)
+	}
+}
+
 func TestRAIDFamiliesFor(t *testing.T) {
 	unavail := &smartView{SmartSupport: &struct {
 		Available bool `json:"available"`
@@ -418,10 +519,7 @@ func TestCollectMegaRAIDEndToEnd(t *testing.T) {
 	if len(devs) != 2 {
 		t.Fatalf("virtual disk must be hidden once members are found, devices = %+v", devs)
 	}
-	pts, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	pts := collectSmartSample(t, c)
 	byDev := map[string]map[metrics.ID]float64{}
 	models := map[string]string{}
 	for _, p := range pts {
@@ -464,9 +562,7 @@ func TestCollectRAIDNoteSurfacesState(t *testing.T) {
 		defer c.mu.Unlock()
 		return !c.raidBusy && c.raidNote != ""
 	})
-	if _, err := c.Collect(context.Background()); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	collectSmartSample(t, c)
 	st := c.Status()
 	if st.State != smartStateRAIDHidden {
 		t.Fatalf("state = %q, want %q", st.State, smartStateRAIDHidden)
@@ -659,10 +755,7 @@ func TestSmartDevstatUnsupportedStillReads(t *testing.T) {
 		devicesTTL:    time.Hour,
 		execFn:        f.exec,
 	}
-	points, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
+	points := collectSmartSample(t, c)
 	m := indexPoints(points)
 	if m[metrics.SmartTempC] != 31 || m[metrics.SmartHealthy] != 1 {
 		t.Fatalf("normal SMART points missing: %#v", m)

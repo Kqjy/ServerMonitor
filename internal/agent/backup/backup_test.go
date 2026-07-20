@@ -698,14 +698,14 @@ func TestRunRepoRecordsScopeOnSuccessAndFailure(t *testing.T) {
 	cfg.Paths = []string{"/etc", "", "/var/lib/docker/volumes"}
 	cfg.Excludes = []string{"**/.cache", "", "/var/lib/docker/overlay2"}
 	runner := newFakeResticRunner()
-	success := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil)
+	success := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil, nil)
 	if !success.Success || !reflect.DeepEqual(success.Paths, []string{"/etc", "/var/lib/docker/volumes"}) || !reflect.DeepEqual(success.Excludes, []string{"**/.cache", "/var/lib/docker/overlay2"}) || success.OneFileSystem == nil || !*success.OneFileSystem {
 		t.Fatalf("success scope = %#v", success)
 	}
 
 	failingRunner := newFakeResticRunner()
 	failingRunner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stderr: "failed", err: errors.New("exit status 1")})
-	failure := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: failingRunner}, nil)
+	failure := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: failingRunner}, nil, nil)
 	if failure.Success || !reflect.DeepEqual(failure.Paths, success.Paths) || !reflect.DeepEqual(failure.Excludes, success.Excludes) || failure.OneFileSystem == nil || !*failure.OneFileSystem {
 		t.Fatalf("failure scope = %#v", failure)
 	}
@@ -822,13 +822,16 @@ func TestMergeStatusPreservesScopeForPartialUpdate(t *testing.T) {
 }
 
 func TestMergeStatusPreservesPathStatsForPartialUpdate(t *testing.T) {
+	statsAt := time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
 	existing := StatusFile{Repos: []RepoStatus{{
 		Name:          "repo1",
 		PathStats:     []PathStat{{Path: "/etc", Bytes: 100, Files: 2}},
 		StatsSnapshot: "abcdef12",
+		StatsAt:       &statsAt,
+		StatsScope:    "scope-hash",
 	}}}
 	merged := mergeStatus(existing, []RepoStatus{{Name: "repo1", Error: "partial update"}})
-	if len(merged.Repos) != 1 || !reflect.DeepEqual(merged.Repos[0].PathStats, existing.Repos[0].PathStats) || merged.Repos[0].StatsSnapshot != "abcdef12" {
+	if len(merged.Repos) != 1 || !reflect.DeepEqual(merged.Repos[0].PathStats, existing.Repos[0].PathStats) || merged.Repos[0].StatsSnapshot != "abcdef12" || merged.Repos[0].StatsAt == nil || !merged.Repos[0].StatsAt.Equal(statsAt) || merged.Repos[0].StatsScope != "scope-hash" {
 		t.Fatalf("path stats not preserved: %#v", merged.Repos)
 	}
 }
@@ -1039,9 +1042,67 @@ func TestPathStatsFailureDoesNotFailBackup(t *testing.T) {
 	runner := newFakeResticRunner()
 	runner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stdout: `{"message_type":"summary","total_duration":1,"snapshot_id":"abcdef123456"}`})
 	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stderr: "listing failed", err: errors.New("exit status 1")})
-	status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil)
+	status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil, nil)
 	if !status.Success || status.PathStats != nil || status.StatsSnapshot != "" {
 		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestRunRepoReusesFreshPathStatsForSameScope(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	statsAt := now.Add(-time.Hour)
+	previous := RepoStatus{
+		Name:          cfg.Repos[0].Name,
+		PathStats:     []PathStat{{Path: "/etc", Bytes: 100, Files: 2}},
+		StatsSnapshot: "oldstats",
+		StatsAt:       &statsAt,
+		StatsScope:    pathStatsScopeFingerprint(cfg),
+	}
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stdout: `{"message_type":"summary","total_duration":1,"snapshot_id":"newbackup"}`})
+	status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner, Now: func() time.Time { return now }}, nil, &previous)
+	if !status.Success || !reflect.DeepEqual(status.PathStats, previous.PathStats) || status.StatsSnapshot != previous.StatsSnapshot || status.StatsAt == nil || !status.StatsAt.Equal(statsAt) || status.StatsScope != previous.StatsScope {
+		t.Fatalf("reused path stats = %#v", status)
+	}
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "ls" {
+			t.Fatalf("restic ls invoked for fresh unchanged stats: %#v", runner.calls)
+		}
+	}
+}
+
+func TestRunRepoRecomputesPathStatsWhenScopeChangesOrStatsExpire(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		prepare func(*Config, *RepoStatus)
+	}{
+		{"scope changed", func(cfg *Config, _ *RepoStatus) { cfg.Excludes = append(cfg.Excludes, "/tmp") }},
+		{"stats expired", func(_ *Config, previous *RepoStatus) {
+			expired := now.Add(-25 * time.Hour)
+			previous.StatsAt = &expired
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			statsAt := now.Add(-time.Hour)
+			previous := RepoStatus{Name: cfg.Repos[0].Name, PathStats: []PathStat{{Path: "/etc", Bytes: 100, Files: 2}}, StatsSnapshot: "oldstats", StatsAt: &statsAt, StatsScope: pathStatsScopeFingerprint(cfg)}
+			tc.prepare(&cfg, &previous)
+			runner := newFakeResticRunner()
+			runner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stdout: `{"message_type":"summary","total_duration":1,"snapshot_id":"newstats"}`})
+			runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: `{"message_type":"node","type":"file","path":"/etc/config","size":42}`})
+			status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner, Now: func() time.Time { return now }}, nil, &previous)
+			lsCalls := 0
+			for _, call := range runner.calls {
+				if resticSubcommand(call.Args) == "ls" {
+					lsCalls++
+				}
+			}
+			if !status.Success || lsCalls != 1 || status.StatsSnapshot != "newstats" || status.StatsAt == nil || !status.StatsAt.Equal(now) || status.StatsScope != pathStatsScopeFingerprint(cfg) || len(status.PathStats) != 2 || status.PathStats[0].Bytes != 42 {
+				t.Fatalf("recomputed path stats = %#v, ls calls %d", status, lsCalls)
+			}
+		})
 	}
 }
 

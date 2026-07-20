@@ -121,6 +121,7 @@ func main() {
 
 	client := transport.New(cfg.ServerURL, cfg.Token, cfg.HTTPTimeout, cfg.InsecureSkip, logger, sp)
 	client.SetCurrentInterval(cfg.IntervalS)
+	collectors.SetSMARTSampleInterval(time.Duration(cfg.SmartSampleS) * time.Second)
 	if cfg.HealthPath == "" {
 		cfg.HealthPath = defaultHealthPath()
 	}

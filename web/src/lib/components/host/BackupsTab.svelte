@@ -111,6 +111,7 @@
     oneFileSystem: boolean | undefined;
     pathStats: { path: string; bytes: number; files: number }[];
     statsSnapshot?: string;
+    statsAt?: string;
     snapshots: BackupSnapshot[];
   };
 
@@ -280,6 +281,7 @@
           oneFileSystem: s.one_file_system,
           pathStats: s.path_stats ?? [],
           statsSnapshot: s.stats_snapshot,
+          statsAt: s.stats_at,
           snapshots: s.snapshots ?? []
         };
       })
@@ -294,7 +296,7 @@
     stats?: {
       repo: string;
       snapshot: string;
-      measuredAt: number;
+      measuredAt: number | null;
       rows: { path: string; bytes: number; files: number }[];
     };
   };
@@ -305,17 +307,17 @@
       if (view.paths.length === 0 && view.excludes.length === 0 && view.oneFileSystem === undefined) continue;
       const signature = JSON.stringify({ paths: view.paths, excludes: view.excludes, one_file_system: view.oneFileSystem });
       const existing = groups.get(signature);
-      const stats = view.success && view.pathStats.length > 0 && view.statsSnapshot
+      const stats = view.pathStats.length > 0 && view.statsSnapshot
         ? {
             repo: view.repo,
             snapshot: view.statsSnapshot,
-            measuredAt: view.lastSuccessIso ? new Date(view.lastSuccessIso).getTime() : 0,
+            measuredAt: view.statsAt ? new Date(view.statsAt).getTime() : null,
             rows: view.pathStats
           }
         : undefined;
       if (existing) {
         existing.repos.push(view.repo);
-        if (stats && (!existing.stats || stats.measuredAt > existing.stats.measuredAt)) existing.stats = stats;
+        if (stats && (!existing.stats || (stats.measuredAt ?? 0) > (existing.stats.measuredAt ?? 0))) existing.stats = stats;
       } else {
         groups.set(signature, { repos: [view.repo], paths: view.paths, excludes: view.excludes, oneFileSystem: view.oneFileSystem, stats });
       }
@@ -981,7 +983,7 @@
                       </div>
                     {/each}
                   </div>
-                  <div class="mt-2 text-[11px] text-zinc-500">Measured from snapshot <span class="font-mono numeric text-zinc-400">{scope.stats.snapshot}</span> on <span class="font-mono text-zinc-400">{scope.stats.repo}</span>.</div>
+                  <div class="mt-2 text-[11px] text-zinc-500 numeric">Measured{scope.stats.measuredAt !== null ? ` ${timeAgo(new Date(scope.stats.measuredAt).toISOString())}` : ''} from snapshot <span class="font-mono text-zinc-400">{scope.stats.snapshot}</span> on <span class="font-mono text-zinc-400">{scope.stats.repo}</span>.</div>
                 {:else}
                   <div class="flex flex-wrap gap-1.5">
                     {#each scope.paths as path (path)}

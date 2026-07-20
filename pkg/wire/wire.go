@@ -78,6 +78,7 @@ type BackupRepoStatus struct {
 	OneFileSystem *bool            `json:"one_file_system,omitempty"`
 	PathStats     []BackupPathStat `json:"path_stats,omitempty"`
 	StatsSnapshot string           `json:"stats_snapshot,omitempty"`
+	StatsAt       *time.Time       `json:"stats_at,omitempty"`
 	Snapshots     []BackupSnapshot `json:"snapshots,omitempty"`
 }
 

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +171,10 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 	}
 
 	updates := make([]RepoStatus, 0, len(cfg.Repos))
+	previous := make(map[string]RepoStatus, len(existing.Repos))
+	for _, repo := range existing.Repos {
+		previous[repo.Name] = repo
+	}
 	for i, repo := range cfg.Repos {
 		if ctx.Err() != nil {
 			break
@@ -177,7 +183,12 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 		if err := writeProgressAtomic(progressFilePath, progress.snapshot(opts.now())); err != nil {
 			return RunResult{Repos: updates}, fmt.Errorf("write backup progress: %w", err)
 		}
-		updates = append(updates, runRepo(ctx, cfg, repo, cacheDir, opts, progress))
+		prior, found := previous[repo.Name]
+		var priorStatus *RepoStatus
+		if found {
+			priorStatus = &prior
+		}
+		updates = append(updates, runRepo(ctx, cfg, repo, cacheDir, opts, progress, priorStatus))
 		progress.finishRepo(i + 1)
 	}
 	stopHeartbeat()
@@ -201,7 +212,7 @@ func (r RunResult) AnySucceeded() bool {
 	return false
 }
 
-func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) RepoStatus {
+func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress, previous *RepoStatus) RepoStatus {
 	logger := opts.logger()
 	start := utcSecond(opts.now())
 	oneFileSystem := cfg.OneFileSystem
@@ -236,14 +247,25 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	}
 	status.SnapshotCount = int64(len(snapshots))
 	status.Snapshots = snapshotInventory(snapshots)
-	if summary.SnapshotID != "" {
+	statsScope := pathStatsScopeFingerprint(cfg)
+	if reusablePathStats(previous, statsScope, opts.now()) {
+		copyPathStats(&status, previous)
+	} else if summary.SnapshotID != "" {
 		stats, statsErr := collectPathStats(ctx, cfg, repo, cacheDir, summary.SnapshotID, opts)
 		if statsErr != nil {
 			logger.Warn("could not collect backup path stats", "repo", repo.Name, "snapshot", summary.SnapshotID, "err", statsErr)
+			if previous != nil && previous.StatsScope == statsScope {
+				copyPathStats(&status, previous)
+			}
 		} else {
+			statsAt := utcSecond(opts.now())
 			status.PathStats = stats
 			status.StatsSnapshot = summary.SnapshotID
+			status.StatsAt = &statsAt
+			status.StatsScope = statsScope
 		}
+	} else if previous != nil && previous.StatsScope == statsScope {
+		copyPathStats(&status, previous)
 	}
 
 	finish := utcSecond(opts.now())
@@ -252,6 +274,31 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	status.Success = true
 	logger.Info("backup repo completed", "repo", repo.Name)
 	return status
+}
+
+func pathStatsScopeFingerprint(cfg Config) string {
+	paths := nonEmptyCopy(cfg.Paths)
+	excludes := nonEmptyCopy(cfg.Excludes)
+	sort.Strings(paths)
+	sort.Strings(excludes)
+	payload, _ := json.Marshal(struct {
+		Paths         []string `json:"paths"`
+		Excludes      []string `json:"excludes"`
+		OneFileSystem bool     `json:"one_file_system"`
+	}{paths, excludes, cfg.OneFileSystem})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func reusablePathStats(previous *RepoStatus, scope string, now time.Time) bool {
+	return previous != nil && len(previous.PathStats) > 0 && previous.StatsScope == scope && previous.StatsAt != nil && now.Before(previous.StatsAt.Add(24*time.Hour))
+}
+
+func copyPathStats(status *RepoStatus, previous *RepoStatus) {
+	status.PathStats = append([]PathStat(nil), previous.PathStats...)
+	status.StatsSnapshot = previous.StatsSnapshot
+	status.StatsAt = previous.StatsAt
+	status.StatsScope = previous.StatsScope
 }
 
 func nonEmptyCopy(values []string) []string {

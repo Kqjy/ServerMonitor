@@ -46,9 +46,12 @@ const (
 )
 
 const (
-	smartReadWorkers  = 4
-	raidProbeBudget   = 2 * time.Minute
-	raidMaxCandidates = 8
+	smartReadWorkers   = 4
+	raidProbeBudget    = 2 * time.Minute
+	raidMaxCandidates  = 8
+	smartSampleDefault = 5 * time.Minute
+	smartSampleMin     = time.Minute
+	smartSampleMax     = time.Hour
 )
 
 type smartDevice struct {
@@ -58,33 +61,60 @@ type smartDevice struct {
 	slot    string
 }
 
-type smartCollector struct {
-	mu            sync.Mutex
-	probed        bool
-	smartctl      string
-	storcli       string
-	storcliProbed bool
-	goos          string
-	scanned       []smartDevice
-	raidExtra     []smartDevice
-	raidHide      map[string]bool
-	raidNote      string
-	raidBusy      bool
-	raidRunAt     time.Time
-	cliDrives     []storcliDrive
-	cliVDs        []storcliVD
-	cliAt         time.Time
-	cliBusy       bool
-	devicesAt     time.Time
-	devicesTTL    time.Duration
-	state         string
-	stateMsg      string
-	warned        bool
-	execFn        func(ctx context.Context, bin string, args ...string) ([]byte, error)
-	fileExists    func(path string) bool
+type smartSample struct {
+	points     []wire.Point
+	readOK     int
+	failed     int
+	nvmeFailed int
 }
 
-func init() { Register(&smartCollector{}) }
+type smartCollector struct {
+	mu             sync.Mutex
+	probed         bool
+	smartctl       string
+	storcli        string
+	storcliProbed  bool
+	goos           string
+	scanned        []smartDevice
+	raidExtra      []smartDevice
+	raidHide       map[string]bool
+	raidNote       string
+	raidBusy       bool
+	raidRunAt      time.Time
+	cliDrives      []storcliDrive
+	cliVDs         []storcliVD
+	cliAt          time.Time
+	cliBusy        bool
+	devicesAt      time.Time
+	devicesTTL     time.Duration
+	state          string
+	stateMsg       string
+	warned         bool
+	sampleInterval time.Duration
+	sampleBusy     bool
+	lastSampleAt   time.Time
+	pendingSample  *smartSample
+	execFn         func(ctx context.Context, bin string, args ...string) ([]byte, error)
+	fileExists     func(path string) bool
+}
+
+var defaultSmartCollector = &smartCollector{}
+
+func init() { Register(defaultSmartCollector) }
+
+func SetSMARTSampleInterval(d time.Duration) {
+	switch {
+	case d <= 0:
+		d = smartSampleDefault
+	case d < smartSampleMin:
+		d = smartSampleMin
+	case d > smartSampleMax:
+		d = smartSampleMax
+	}
+	defaultSmartCollector.mu.Lock()
+	defaultSmartCollector.sampleInterval = d
+	defaultSmartCollector.mu.Unlock()
+}
 
 func (c *smartCollector) Name() string        { return "smart" }
 func (c *smartCollector) Platforms() []string { return []string{"linux", "darwin", "windows"} }
@@ -721,13 +751,53 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		return nil, nil
 	}
 	c.mu.Lock()
-	devices := c.devicesLocked()
-	bin := c.smartctl
-	cliDrives := append([]storcliDrive(nil), c.cliDrives...)
-	cliVDs := append([]storcliVD(nil), c.cliVDs...)
+	var (
+		out     []wire.Point
+		logHint bool
+		msg     string
+	)
+	if c.pendingSample != nil {
+		sample := c.pendingSample
+		c.pendingSample = nil
+		out = sample.points
+		logHint = c.updateReadStateLocked(sample.readOK, sample.failed, sample.nvmeFailed)
+		msg = c.stateMsg
+		c.maybeRefreshStorcliLocked()
+	}
+	interval := c.effectiveSampleIntervalLocked()
+	launch := !c.sampleBusy && time.Since(c.lastSampleAt) >= interval
+	var devices []smartDevice
+	var bin string
+	var cliDrives []storcliDrive
+	var cliVDs []storcliVD
+	if launch {
+		devices = c.devicesLocked()
+		bin = c.smartctl
+		cliDrives = append([]storcliDrive(nil), c.cliDrives...)
+		cliVDs = append([]storcliVD(nil), c.cliVDs...)
+		c.sampleBusy = true
+	}
 	c.mu.Unlock()
+	if launch {
+		go c.sampleSMART(interval, bin, devices, cliDrives, cliVDs)
+	}
+	if logHint {
+		slog.Warn("smart per-device read failed", "collector", "smart", "detail", msg)
+	}
+	return out, nil
+}
 
-	now := time.Now()
+func (c *smartCollector) effectiveSampleIntervalLocked() time.Duration {
+	if c.sampleInterval <= 0 {
+		return smartSampleDefault
+	}
+	return c.sampleInterval
+}
+
+func (c *smartCollector) sampleSMART(interval time.Duration, bin string, devices []smartDevice, cliDrives []storcliDrive, cliVDs []storcliVD) {
+	timeout := min(interval, 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	var (
 		tallyMu    sync.Mutex
 		wg         sync.WaitGroup
@@ -738,12 +808,17 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		nvmeFailed int
 	)
 	sem := make(chan struct{}, smartReadWorkers)
+readLoop:
 	for _, dev := range devices {
 		if ctx.Err() != nil {
 			break
 		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break readLoop
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(dev smartDevice) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -774,7 +849,7 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 			if dev.slot != "" {
 				labels["slot"] = dev.slot
 			}
-			points := smartPoints(now, labels, &s)
+			points := smartPoints(time.Now(), labels, &s)
 			for _, p := range points {
 				if p.Metric == metrics.SmartMediaErrors {
 					mediaSeen[p.Labels["device"]] = true
@@ -787,7 +862,7 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 	for _, drive := range cliDrives {
 		device := storcliDriveLabels(drive)["device"]
 		if drive.cliOnly {
-			for _, p := range storcliDrivePoints(now, drive) {
+			for _, p := range storcliDrivePoints(time.Now(), drive) {
 				if p.Metric == metrics.SmartMediaErrors {
 					if mediaSeen[device] {
 						continue
@@ -799,23 +874,19 @@ func (c *smartCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 			continue
 		}
 		if !mediaSeen[device] {
-			out = append(out, storcliMediaErrorPoint(now, drive))
+			out = append(out, storcliMediaErrorPoint(time.Now(), drive))
 			mediaSeen[device] = true
 		}
 	}
 	for _, vd := range cliVDs {
-		out = append(out, storcliVDPoint(now, vd))
+		out = append(out, storcliVDPoint(time.Now(), vd))
 	}
 
 	c.mu.Lock()
-	logHint := c.updateReadStateLocked(readOK, failed, nvmeFailed)
-	msg := c.stateMsg
-	c.maybeRefreshStorcliLocked()
+	c.pendingSample = &smartSample{points: out, readOK: readOK, failed: failed, nvmeFailed: nvmeFailed}
+	c.lastSampleAt = time.Now()
+	c.sampleBusy = false
 	c.mu.Unlock()
-	if logHint {
-		slog.Warn("smart per-device read failed", "collector", "smart", "detail", msg)
-	}
-	return out, nil
 }
 
 func (c *smartCollector) updateReadStateLocked(readOK, failed, nvmeFailed int) bool {

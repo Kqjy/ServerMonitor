@@ -29,6 +29,7 @@
   let severity = $state('warning');
   let cooldownS = $state(600);
   let channelIds = $state<number[]>([]);
+  const shortSmartWindow = $derived((metric.startsWith('smart_') || metric.startsWith('raid_')) && windowS < 900);
 
   type ScopeMode = 'all' | 'ids' | 'tags';
   let scopeMode = $state<ScopeMode>('all');
@@ -265,6 +266,10 @@
           <input id="rcd" type="number" min="0" bind:value={cooldownS} class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm numeric" />
         </div>
       </div>
+
+      {#if shortSmartWindow}
+        <div class="rounded-md border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/90 numeric">SMART and RAID metrics are sampled about every 5 minutes on current agents. Use a window of at least 15 minutes to avoid alert flapping.</div>
+      {/if}
 
       <div>
         <label class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5" for="rsev">Severity</label>

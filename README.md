@@ -117,7 +117,7 @@ Everything Glances reports, gated by platform:
 | Containers (Docker) | ✓ | ✓ | ✓ | docker/docker — no-op if daemon unreachable |
 | Sensors (temperatures) | ✓ | ✓ | ✓ | gopsutil |
 | NVIDIA GPU | ✓ | ✓ | — | shells `nvidia-smi`; no-op if absent |
-| SMART | ✓ | ✓ | ✓ | shells `smartctl --json`; no-op if absent. Linux NVMe SMART needs `CAP_SYS_ADMIN` (`--enable-smart-nvme`); `--enable-smart`/`CAP_SYS_RAWIO` covers SATA/SAS only |
+| SMART | ✓ | ✓ | ✓ | background `smartctl --json` sampling every 300s by default (`smart_sample_s` / `SM_SMART_SAMPLE_S`); no-op if absent. Linux NVMe SMART needs `CAP_SYS_ADMIN` (`--enable-smart-nvme`); `--enable-smart`/`CAP_SYS_RAWIO` covers SATA/SAS only |
 | RAID arrays | ✓ | — | — | parses `/proc/mdstat` |
 | Wi-Fi signal | ✓ | — | — | parses `/proc/net/wireless` |
 | Uptime | ✓ | ✓ | ✓ | gopsutil |

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,7 +42,7 @@ var storcliCandidates = map[string][]string{
 
 const (
 	storcliCallTimeout = 20 * time.Second
-	storcliRefreshAge  = 60 * time.Second
+	storcliRefreshAge  = 5 * time.Minute
 	storcliRefreshWait = 60 * time.Second
 )
 
@@ -97,7 +99,11 @@ func (c *smartCollector) runBinTimeout(ctx context.Context, timeout time.Duratio
 	if c.execFn != nil {
 		return c.execFn(ctx, bin, args...)
 	}
-	return runTimeout(ctx, timeout, bin, args...)
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, bin, args...)
+	cmd.Dir = os.TempDir()
+	return cmd.Output()
 }
 
 func storcliResponseData(body []byte) (map[string]json.RawMessage, error) {

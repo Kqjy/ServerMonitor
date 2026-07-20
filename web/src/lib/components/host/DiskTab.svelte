@@ -69,6 +69,8 @@
   let smartRead = $state<SeriesEntry[]>([]);
   let smart = $state<SmartRow[]>([]);
   let raid = $state<RaidRow[]>([]);
+  let smartNewestAt = $state<number | null>(null);
+  let freshnessNow = $state(Date.now());
   let fromMs = $state(0);
   let toMs = $state(0);
   let chartZoom = $state<ChartZoom>(null);
@@ -92,6 +94,14 @@
   let detailError = $state<string | null>(null);
   let detailGen = 0;
   let detailInflight: AbortController | null = null;
+
+  const smartFreshness = $derived.by(() => {
+    if (smartNewestAt === null) return null;
+    return {
+      text: `as of ${timeAgo(new Date(smartNewestAt).toISOString())}`,
+      stale: freshnessNow - smartNewestAt > 15 * 60_000
+    };
+  });
 
   const detailAnalysis = $derived.by(() => {
     const pts = detailPoints;
@@ -194,17 +204,17 @@
         api.series({ host: hostId, metric: 'fs_overall_used', from: '-2m', step: 30, signal: ac.signal }),
         api.series({ host: hostId, metric: 'fs_overall_used_pct', from: '-2m', step: 30, signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_temp_c', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_healthy', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_power_on_hours', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_realloc_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_healthy', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_power_on_hours', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_realloc_sectors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_data_written_bytes', from, to, splitBy: 'device', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'smart_data_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-5m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'raid_degraded', from: '-5m', step: 30, splitBy: 'array', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'raid_sync_pct', from: '-5m', step: 30, splitBy: 'array', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'raid_degraded', from: '-20m', step: 30, splitBy: 'array', signal: ac.signal }),
+        api.seriesMulti({ host: hostId, metric: 'raid_sync_pct', from: '-20m', step: 30, splitBy: 'array', signal: ac.signal }),
         api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from, to, splitBy: 'mount', signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
@@ -267,6 +277,13 @@
       smartTemps = sTemp.series;
       smartWritten = sWritten.series;
       smartRead = sRead.series;
+      const smartEntries = [sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe].flatMap((response) => response.series);
+      let newest = 0;
+      for (const entry of smartEntries) {
+        for (const point of entry.points) newest = Math.max(newest, new Date(point.ts).getTime());
+      }
+      smartNewestAt = newest > 0 ? newest : null;
+      freshnessNow = Date.now();
 
       const byArray: Record<string, RaidRow> = {};
       for (const e of raidDegraded.series) {
@@ -548,7 +565,7 @@
         <header class="px-5 py-3 border-b border-amber-900/40 text-xs uppercase tracking-wider text-amber-300/80">SMART health</header>
         <div class="px-5 py-4 text-sm text-amber-100/90 space-y-2">
           <p>The <span class="font-mono text-amber-200">smart</span> collector is enabled, but no devices have reported SMART data yet.</p>
-          <p class="text-amber-100/70 text-xs">If this persists for more than a minute, check that <span class="font-mono">smartctl</span> is installed and the agent has admin/root privileges.</p>
+          <p class="text-amber-100/70 text-xs">If this persists for more than ten minutes, check that <span class="font-mono">smartctl</span> is installed and the agent has admin/root privileges.</p>
         </div>
       </section>
     {/if}
@@ -565,7 +582,10 @@
       </div>
     {/if}
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-      <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">SMART health</header>
+      <header class="flex items-center justify-between gap-3 px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">
+        <span>SMART health</span>
+        {#if smartFreshness}<span class="numeric normal-case tracking-normal {smartFreshness.stale ? 'text-amber-300' : 'text-zinc-500'}">{smartFreshness.text}</span>{/if}
+      </header>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">

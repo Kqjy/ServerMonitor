@@ -137,6 +137,7 @@ export interface BackupRepoStatus {
   one_file_system?: boolean;
   path_stats?: { path: string; bytes: number; files: number }[];
   stats_snapshot?: string;
+  stats_at?: string;
   snapshots?: BackupSnapshot[];
 }
 

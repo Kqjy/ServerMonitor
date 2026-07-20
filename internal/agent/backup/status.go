@@ -51,6 +51,8 @@ type RepoStatus struct {
 	OneFileSystem *bool      `json:"one_file_system,omitempty"`
 	PathStats     []PathStat `json:"path_stats,omitempty"`
 	StatsSnapshot string     `json:"stats_snapshot,omitempty"`
+	StatsAt       *time.Time `json:"stats_at,omitempty"`
+	StatsScope    string     `json:"stats_scope,omitempty"`
 	Snapshots     []Snapshot `json:"snapshots,omitempty"`
 }
 
@@ -215,9 +217,11 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 					update.OneFileSystem = &oneFileSystem
 				}
 			}
-			if update.PathStats == nil && prev.PathStats != nil {
+			if !update.Success && update.PathStats == nil && prev.PathStats != nil {
 				update.PathStats = append([]PathStat(nil), prev.PathStats...)
 				update.StatsSnapshot = prev.StatsSnapshot
+				update.StatsAt = prev.StatsAt
+				update.StatsScope = prev.StatsScope
 			}
 		}
 		out = append(out, update)

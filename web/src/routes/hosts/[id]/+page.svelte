@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/stores';
   import { api, type Host, type ActiveAlert } from '$lib/api';
-  import { statusFor, timeAgo, severityClass, severityRank } from '$lib/format';
+  import { bytes, statusFor, timeAgo, severityClass, severityRank } from '$lib/format';
   import { subscribeAlerts } from '$lib/sse';
   import { rangeLabel, loadRange, saveRange, writeRangeToUrl, rangeEquals, type Range } from '$lib/time';
   import StatusDot from '$lib/components/StatusDot.svelte';
@@ -38,6 +38,8 @@
   let upgradeError = $state<string | null>(null);
   let installBaseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
   let agentHealthCopy = $state<'idle' | 'stale' | 'perms' | 'failed'>('idle');
+  let agentCpuPct = $state<number | null>(null);
+  let agentRssBytes = $state<number | null>(null);
   let agentHealthCopyTimer: ReturnType<typeof setTimeout> | null = null;
   const backupAgentState = $derived(host?.collector_status?.backup?.state ?? '');
   const backupAgentMessage = $derived(host?.collector_status?.backup?.message ?? '');
@@ -61,9 +63,16 @@
 
   async function refresh() {
     try {
-      const [h, alerts] = await Promise.all([api.host(id), api.hostActiveAlerts(id).catch(() => [])]);
+      const [h, alerts, cpu, rss] = await Promise.all([
+        api.host(id),
+        api.hostActiveAlerts(id).catch(() => []),
+        api.series({ host: id, metric: 'agent_cpu_pct', from: '-2m', step: 10 }).catch(() => null),
+        api.series({ host: id, metric: 'agent_rss_bytes', from: '-2m', step: 10 }).catch(() => null)
+      ]);
       host = h;
       activeAlerts = alerts;
+      agentCpuPct = cpu?.points.at(-1)?.v ?? null;
+      agentRssBytes = rss?.points.at(-1)?.v ?? null;
       error = null;
     } catch (e) {
       error = (e as Error).message;
@@ -195,6 +204,7 @@
         <div class="mt-1 text-[11px] sm:text-xs text-zinc-500 numeric break-words">
           {host.os || '—'}{host.arch ? ` · ${host.arch}` : ''}{host.kernel ? ` · ${host.kernel}` : ''}
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
+          {#if agentCpuPct !== null && agentRssBytes !== null}<span> · {agentCpuPct.toFixed(1)}% CPU · {bytes(agentRssBytes)}</span>{/if}
         </div>
         {#if host.update_available || backupAgentState === 'stale_agent' || backupAgentState === 'agent_perms'}
           <div class="mt-3 rounded-lg border px-4 py-3 {backupAgentState === 'agent_perms' && !host.update_available ? 'border-rose-900/50 bg-rose-950/20' : 'border-amber-900/50 bg-amber-950/20'}">

@@ -73,6 +73,7 @@ func TestBatchBackupRoundTrip(t *testing.T) {
 				Files: 421,
 			}},
 			StatsSnapshot: "1a2b3c4d",
+			StatsAt:       &started,
 			Snapshots: []BackupSnapshot{{
 				ID:    "1a2b3c4d",
 				Time:  started,
@@ -91,7 +92,7 @@ func TestBatchBackupRoundTrip(t *testing.T) {
 	if err := dec.Decode(&got); err != nil {
 		t.Fatalf("decode with DisallowUnknownFields: %v", err)
 	}
-	if len(got.Backups) != 1 || got.Backups[0].Name != "vps-a" || got.Backups[0].Snapshots[0].ID != "1a2b3c4d" || len(got.Backups[0].Paths) != 2 || got.Backups[0].Excludes[0] != "/var/lib/docker/overlay2" || got.Backups[0].OneFileSystem == nil || *got.Backups[0].OneFileSystem || got.Backups[0].StatsSnapshot != "1a2b3c4d" || got.Backups[0].PathStats[0].Files != 421 {
+	if len(got.Backups) != 1 || got.Backups[0].Name != "vps-a" || got.Backups[0].Snapshots[0].ID != "1a2b3c4d" || len(got.Backups[0].Paths) != 2 || got.Backups[0].Excludes[0] != "/var/lib/docker/overlay2" || got.Backups[0].OneFileSystem == nil || *got.Backups[0].OneFileSystem || got.Backups[0].StatsSnapshot != "1a2b3c4d" || got.Backups[0].StatsAt == nil || !got.Backups[0].StatsAt.Equal(started) || got.Backups[0].PathStats[0].Files != 421 {
 		t.Fatalf("backup round-trip mismatch: %+v", got.Backups)
 	}
 }

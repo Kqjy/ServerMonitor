@@ -533,6 +533,7 @@ type backupRepoFile struct {
 	OneFileSystem *bool                 `json:"one_file_system,omitempty"`
 	PathStats     []wire.BackupPathStat `json:"path_stats,omitempty"`
 	StatsSnapshot string                `json:"stats_snapshot,omitempty"`
+	StatsAt       *time.Time            `json:"stats_at,omitempty"`
 	Snapshots     []wire.BackupSnapshot `json:"snapshots"`
 }
 
@@ -612,6 +613,7 @@ func backupRepoStatus(repo backupRepoFile) wire.BackupRepoStatus {
 		OneFileSystem: repo.OneFileSystem,
 		PathStats:     repo.PathStats,
 		StatsSnapshot: repo.StatsSnapshot,
+		StatsAt:       repo.StatsAt,
 		Snapshots:     repo.Snapshots,
 	}
 	if repo.Success != nil {

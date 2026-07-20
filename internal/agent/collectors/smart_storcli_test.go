@@ -170,10 +170,7 @@ func TestProbeWithStorcliPromotesDrives(t *testing.T) {
 	if f.called("-i --json=c -d megaraid,0 /dev/sda") {
 		t.Fatalf("storcli-covered controller must not be blindly walked")
 	}
-	points, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	points := collectSmartSample(t, c)
 	byDevice := map[string]map[metrics.ID]float64{}
 	mediaCount := map[string]int{}
 	for _, point := range points {
@@ -236,10 +233,7 @@ func TestProbeWithStorcliUsesScannedMegaRAIDDrive(t *testing.T) {
 	if cached == nil || cached.node != "/dev/bus/0" || cached.cliOnly {
 		t.Fatalf("cached DID 8 = %+v, want readable /dev/bus/0", cached)
 	}
-	points, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	points := collectSmartSample(t, c)
 	mediaCount := 0
 	for _, point := range points {
 		if point.Metric == metrics.SmartMediaErrors && point.Labels["device"] == "bus/0#8" {
@@ -262,10 +256,7 @@ func TestProbeWithStorcliCliOnlyFallback(t *testing.T) {
 	if !c.cliDrives[0].cliOnly || !c.cliDrives[1].cliOnly {
 		t.Fatalf("cli-only markers = %+v", c.cliDrives)
 	}
-	pts, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	pts := collectSmartSample(t, c)
 	byDevice := map[string]map[metrics.ID]float64{}
 	slots := map[string]string{}
 	for _, point := range pts {
@@ -313,10 +304,7 @@ func TestProbeWithStorcliNoVDNodeFallback(t *testing.T) {
 	if len(c.cliDrives) != 2 || c.cliDrives[0].cliOnly || c.cliDrives[1].cliOnly {
 		t.Fatalf("cached storcli drives = %+v, want readable fallback drives", c.cliDrives)
 	}
-	points, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	points := collectSmartSample(t, c)
 	devices := map[string]bool{}
 	for _, point := range points {
 		if device := point.Labels["device"]; device != "" {
@@ -336,10 +324,7 @@ func TestStorcliVDDegradedPoint(t *testing.T) {
 	c.raidRunAt = time.Now()
 	c.cliVDs = []storcliVD{{ctl: 0, vd: 0, typ: "RAID5", state: "Dgrd"}}
 	c.cliAt = time.Now()
-	points, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("collect: %v", err)
-	}
+	points := collectSmartSample(t, c)
 	for _, point := range points {
 		if point.Metric == metrics.RaidDegraded && point.Value == 1 && point.Labels["array"] == "c0/v0" && point.Labels["type"] == "RAID5" {
 			return
@@ -368,6 +353,32 @@ func TestStorcliHealthyMapping(t *testing.T) {
 		if values[metrics.SmartHealthy] != tc.want {
 			t.Errorf("%s healthy = %v, want %v", tc.name, values[metrics.SmartHealthy], tc.want)
 		}
+	}
+}
+
+func TestStorcliRefreshAge(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{"show ctrlcount J": storcliCtrlCountFixture}, fallback: `{"Controllers":[{"Command Status":{"Status":"Failure"},"Response Data":{}}]}`}
+	c := newRAIDTestCollector(f)
+	c.storcli = "/fake/storcli"
+	c.cliDrives = []storcliDrive{{ctl: 0, did: 8}}
+	c.cliAt = time.Now()
+	c.mu.Lock()
+	c.maybeRefreshStorcliLocked()
+	c.mu.Unlock()
+	if f.called("show ctrlcount J") {
+		t.Fatal("fresh storcli cache triggered a refresh")
+	}
+	c.mu.Lock()
+	c.cliAt = time.Now().Add(-storcliRefreshAge - time.Second)
+	c.maybeRefreshStorcliLocked()
+	c.mu.Unlock()
+	waitFor(t, "storcli refresh", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.cliBusy
+	})
+	if !f.called("show ctrlcount J") {
+		t.Fatal("expired storcli cache did not trigger a refresh")
 	}
 }
 

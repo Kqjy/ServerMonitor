@@ -121,6 +121,9 @@ const (
 	BackupProgressTotalBytes ID = 1012
 	BackupAgentStale         ID = 1013
 	BackupAgentUnexecutable  ID = 1014
+
+	AgentCPUPct   ID = 1050
+	AgentRSSBytes ID = 1051
 )
 
 type Meta struct {
@@ -234,6 +237,8 @@ var meta = map[ID]Meta{
 	BackupProgressTotalBytes: {"backup_progress_total_bytes", "B"},
 	BackupAgentStale:         {"backup_agent_stale", "bool"},
 	BackupAgentUnexecutable:  {"backup_agent_unexecutable", "bool"},
+	AgentCPUPct:              {"agent_cpu_pct", "%"},
+	AgentRSSBytes:            {"agent_rss_bytes", "B"},
 }
 
 func (id ID) Meta() Meta {
