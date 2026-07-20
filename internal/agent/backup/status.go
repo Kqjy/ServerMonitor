@@ -197,6 +197,15 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 			update.CheckSuccess = prev.CheckSuccess
 			if !update.Success {
 				update.LastSuccess = prev.LastSuccess
+				if update.SnapshotCount == 0 {
+					update.SnapshotCount = prev.SnapshotCount
+				}
+				if update.TotalBytes == 0 {
+					update.TotalBytes = prev.TotalBytes
+				}
+				if update.Snapshots == nil && prev.Snapshots != nil {
+					update.Snapshots = append([]Snapshot(nil), prev.Snapshots...)
+				}
 			}
 			if update.Paths == nil && prev.Paths != nil {
 				update.Paths = append([]string(nil), prev.Paths...)

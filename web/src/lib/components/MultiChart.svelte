@@ -39,6 +39,7 @@
     zoomed = false,
     loading = false,
     masking = false,
+    stepped = false,
     yMinSpan,
     yClampMin,
     yMaxDigits,
@@ -56,6 +57,7 @@
     zoomed?: boolean;
     loading?: boolean;
     masking?: boolean;
+    stepped?: boolean;
     yMinSpan?: number;
     yClampMin?: number;
     yMaxDigits?: number;
@@ -196,6 +198,7 @@
         { label: 'time' },
         ...series.map((s, i) => {
           const c = s.color ?? chartPalette[i % chartPalette.length];
+          const stepPaths = stepped && uPlot.paths?.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined;
           return {
             label: s.label,
             show: !hidden.has(s.label),
@@ -203,6 +206,7 @@
             width: s.stroke ?? 1.5,
             spanGaps: true,
             fill: fill ? c.replace(')', ' / 0.08)') : undefined,
+            paths: stepPaths,
             points: { size: 5, fill: c, stroke: c, width: 0 }
           } as uPlot.Series;
         })

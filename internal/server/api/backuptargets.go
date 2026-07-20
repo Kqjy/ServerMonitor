@@ -158,6 +158,52 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 	}
 }
 
+type updateBackupTargetRequest struct {
+	QuotaBytes *int64 `json:"quota_bytes"`
+}
+
+func updateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := parseBackupTargetID(w, r)
+		if !ok {
+			return
+		}
+		var req updateBackupTargetRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		quota, err := normalizeQuota(req.QuotaBytes)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := targets.SetQuota(r.Context(), id, quota); err != nil {
+			backupTargetLookupError(w, err)
+			return
+		}
+		updated, err := targets.Get(r.Context(), id)
+		if err != nil {
+			backupTargetLookupError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, toBackupTargetView(updated))
+	}
+}
+
+func normalizeQuota(v *int64) (*int64, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if *v < 0 {
+		return nil, errors.New("quota_bytes must be >= 0")
+	}
+	if *v == 0 {
+		return nil, nil
+	}
+	return v, nil
+}
+
 func rotateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseBackupTargetID(w, r)

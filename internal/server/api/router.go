@@ -150,6 +150,7 @@ func New(d Deps) *Router {
 				if d.BackupTargets != nil {
 					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
 					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
+					r.Patch("/backup-targets/{id}", updateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))

@@ -60,6 +60,8 @@
   let rotated = $state<BackupCredential | null>(null);
   let toRevoke = $state<BackupTarget | null>(null);
   let toDelete = $state<BackupTarget | null>(null);
+  let toEditQuota = $state<BackupTarget | null>(null);
+  let editQuotaGiB = $state<number | null>(null);
 
   let firstBlobSeen = $state(false);
   let linkedRepoStatus = $state<BackupRepoStatus | null>(null);
@@ -317,6 +319,19 @@
     await api.backupTargetDelete(toDelete.id);
     toDelete = null;
     await load();
+  }
+
+  function openQuota(t: BackupTarget) {
+    editQuotaGiB = t.quota_bytes ? Math.round((t.quota_bytes / 1024 ** 3) * 100) / 100 : null;
+    toEditQuota = t;
+  }
+
+  async function saveQuota() {
+    if (!toEditQuota) return;
+    const gib = editQuotaGiB;
+    const quotaBytes = gib != null && gib > 0 ? Math.round(gib * 1024 ** 3) : null;
+    const updated = await api.backupTargetSetQuota(toEditQuota.id, quotaBytes);
+    if (data) data.targets = data.targets.map((t) => (t.id === updated.id ? updated : t));
   }
 
   function copy(text: string, key: string) {
@@ -1164,6 +1179,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                         <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(t.created_at)}</td>
                         <td class="px-4 py-3 align-top">
                           <div class="flex items-center justify-end gap-1.5">
+                            {#if !t.revoked_at}
+                              <button
+                                type="button"
+                                onclick={() => openQuota(t)}
+                                class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
+                                Quota
+                              </button>
+                            {/if}
                             {#if !t.node_host_id}
                               <button
                                 type="button"
@@ -1237,6 +1260,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                       measured {t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'} · created {timeAgo(t.created_at)}
                     </div>
                     <div class="flex justify-end gap-2">
+                      {#if !t.revoked_at}
+                        <button
+                          type="button"
+                          onclick={() => openQuota(t)}
+                          class="text-[11px] px-2.5 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
+                          Quota
+                        </button>
+                      {/if}
                       {#if !t.node_host_id}
                         <button
                           type="button"
@@ -1724,6 +1755,37 @@ restic -r ${publicRepoUrl} backup /etc`;
     Only empty repositories can be deleted. If an upload has landed since this list loaded, the delete is refused and you can
     revoke instead.
   </p>
+{/snippet}
+
+<ConfirmDialog
+  open={toEditQuota !== null}
+  title="Edit repository quota"
+  body={quotaBody}
+  confirmLabel="Save quota"
+  onconfirm={saveQuota}
+  onclose={() => (toEditQuota = null)} />
+
+{#snippet quotaBody()}
+  <p class="text-sm text-zinc-300">
+    Upload quota for <span class="font-mono text-zinc-100">{toEditQuota?.name}</span>.
+  </p>
+  <div class="mt-3">
+    <label for="eq-quota" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Quota <span class="text-zinc-600 normal-case">(GiB)</span></label>
+    <input
+      id="eq-quota"
+      type="number"
+      min="0"
+      step="1"
+      bind:value={editQuotaGiB}
+      placeholder="unlimited"
+      class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm numeric" />
+    <p class="mt-1.5 text-[11px] text-zinc-600">Uploads are refused once the repo exceeds this. Leave blank for no limit.</p>
+  </div>
+  {#if toEditQuota && editQuotaGiB != null && editQuotaGiB > 0 && Math.round(editQuotaGiB * 1024 ** 3) < toEditQuota.used_bytes}
+    <div class="mt-3 rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+      New limit is below current usage ({bytes(toEditQuota.used_bytes)}). Uploads stay blocked until usage drops, but existing backups are kept.
+    </div>
+  {/if}
 {/snippet}
 
 <ConfirmDialog

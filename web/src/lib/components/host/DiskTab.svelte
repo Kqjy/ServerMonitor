@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
-  import { api, type SeriesEntry, type CollectorStatus } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
-  import { bytes, pct, dur } from '$lib/format';
+  import { api, type SeriesEntry, type SeriesPoint, type CollectorStatus } from '$lib/api';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range, type CustomRange } from '$lib/time';
+  import { bytes, pct, dur, timeAgo } from '$lib/format';
+  import { modalFocus } from '$lib/modal';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
@@ -39,6 +40,16 @@
     unsafeShutdowns: number | null;
   };
 
+  const MEDIA_HISTORY_DAYS = 90;
+
+  const smartCounterMeta: Record<string, { label: string; metric: string }> = {
+    mediaErrors: { label: 'Media errors', metric: 'smart_media_errors' },
+    realloc: { label: 'Reallocated sectors', metric: 'smart_realloc_sectors' },
+    pending: { label: 'Pending sectors', metric: 'smart_pending_sectors' }
+  };
+
+  type CounterChange = { ts: string; from: number; to: number };
+
   type RaidRow = {
     array: string;
     type: string | null;
@@ -70,12 +81,86 @@
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
+  let detailOpen = $state(false);
+  let detailDevice = $state('');
+  let detailModel = $state<string | null>(null);
+  let detailSlot = $state<string | null>(null);
+  let detailAttr = $state('');
+  let detailWin = $state<CustomRange>({ fromMs: 0, toMs: 0 });
+  let detailPoints = $state<SeriesPoint[]>([]);
+  let detailLoading = $state(false);
+  let detailError = $state<string | null>(null);
+  let detailGen = 0;
+  let detailInflight: AbortController | null = null;
+
+  const detailAnalysis = $derived.by(() => {
+    const pts = detailPoints;
+    if (pts.length === 0) return null;
+    const firstVal = Math.round(pts[0].v);
+    const current = Math.round(pts[pts.length - 1].v);
+    let runningMax = firstVal;
+    const changes: CounterChange[] = [];
+    for (let i = 1; i < pts.length; i++) {
+      const v = Math.round(pts[i].v);
+      if (v > runningMax) {
+        changes.push({ ts: pts[i].ts, from: runningMax, to: v });
+        runningMax = v;
+      }
+    }
+    return { firstTs: pts[0].ts, firstVal, current, changes };
+  });
+
+  const absDate = (ts: string) => new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
       label: e.labels.device ?? e.labels.mount ?? Object.values(e.labels).join(' '),
       points: e.points
     }));
+  }
+
+  async function openDetail(row: SmartRow, attrKey: string) {
+    const meta = smartCounterMeta[attrKey];
+    if (!meta) return;
+    const gen = ++detailGen;
+    detailInflight?.abort();
+    const ac = new AbortController();
+    detailInflight = ac;
+    detailDevice = row.device;
+    detailModel = row.model;
+    detailSlot = row.slot;
+    detailAttr = attrKey;
+    const toMs = Date.now();
+    const fromMs = toMs - MEDIA_HISTORY_DAYS * 86_400_000;
+    detailWin = { fromMs, toMs };
+    detailOpen = true;
+    detailLoading = true;
+    detailError = null;
+    detailPoints = [];
+    try {
+      const resp = await api.series({
+        host: hostId,
+        metric: meta.metric,
+        from: rangeToFrom(detailWin),
+        to: rangeToTo(detailWin),
+        labels: { device: row.device },
+        signal: ac.signal
+      });
+      if (gen !== detailGen) return;
+      detailPoints = resp.points;
+    } catch (e) {
+      if (gen !== detailGen) return;
+      if ((e as { name?: string })?.name === 'AbortError') return;
+      detailError = (e as Error).message;
+    } finally {
+      if (gen === detailGen) detailLoading = false;
+    }
+  }
+
+  function closeDetail() {
+    detailGen++;
+    detailInflight?.abort();
+    detailOpen = false;
   }
 
   async function refresh() {
@@ -239,6 +324,7 @@
   onDestroy(() => {
     if (timer) clearInterval(timer);
     inflight?.abort();
+    detailInflight?.abort();
   });
 
   const isZoomed = $derived(chartZoom !== null);
@@ -519,10 +605,28 @@
                 <td class="px-3 py-2 text-right numeric text-zinc-300">{row.written !== null ? bytes(row.written) : '—'}</td>
                 <td class="px-3 py-2 text-right numeric text-zinc-400">{row.read !== null ? bytes(row.read) : '—'}</td>
                 <td class="px-3 py-2 text-right numeric {row.percentUsed !== null && row.percentUsed > 90 ? 'text-rose-300' : row.percentUsed !== null && row.percentUsed > 80 ? 'text-amber-300' : 'text-zinc-400'}">{row.percentUsed !== null ? pct(row.percentUsed, 0) : '—'}</td>
-                <td class="px-3 py-2 text-right numeric {row.mediaErrors !== null && row.mediaErrors > 0 ? 'text-rose-300' : 'text-zinc-400'}">{row.mediaErrors ?? '—'}</td>
+                <td class="px-3 py-2 text-right numeric {row.mediaErrors !== null && row.mediaErrors > 0 ? 'text-rose-300' : 'text-zinc-400'}">
+                  {#if row.mediaErrors !== null && row.mediaErrors > 0}
+                    <button type="button" onclick={() => openDetail(row, 'mediaErrors')}
+                      class="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:decoration-rose-300"
+                      title="See when this changed">{row.mediaErrors}</button>
+                  {:else}{row.mediaErrors ?? '—'}{/if}
+                </td>
                 <td class="px-3 py-2 text-right numeric text-zinc-400">{row.unsafeShutdowns ?? '—'}</td>
-                <td class="px-3 py-2 text-right numeric {row.realloc !== null && row.realloc > 0 ? 'text-amber-300' : 'text-zinc-400'}">{row.realloc ?? '—'}</td>
-                <td class="px-5 py-2 text-right numeric {row.pending !== null && row.pending > 0 ? 'text-rose-300' : 'text-zinc-400'}">{row.pending ?? '—'}</td>
+                <td class="px-3 py-2 text-right numeric {row.realloc !== null && row.realloc > 0 ? 'text-amber-300' : 'text-zinc-400'}">
+                  {#if row.realloc !== null && row.realloc > 0}
+                    <button type="button" onclick={() => openDetail(row, 'realloc')}
+                      class="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:decoration-amber-300"
+                      title="See when this changed">{row.realloc}</button>
+                  {:else}{row.realloc ?? '—'}{/if}
+                </td>
+                <td class="px-5 py-2 text-right numeric {row.pending !== null && row.pending > 0 ? 'text-rose-300' : 'text-zinc-400'}">
+                  {#if row.pending !== null && row.pending > 0}
+                    <button type="button" onclick={() => openDetail(row, 'pending')}
+                      class="underline decoration-dotted decoration-zinc-600 underline-offset-2 hover:decoration-rose-300"
+                      title="See when this changed">{row.pending}</button>
+                  {:else}{row.pending ?? '—'}{/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -565,5 +669,83 @@
         </div>
       </section>
     {/if}
+  {/if}
+
+  {#if detailOpen}
+    <div
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      use:modalFocus
+      class="fixed inset-0 z-40 bg-zinc-950/60 backdrop-blur-sm flex items-center justify-center p-4"
+      onclick={(e) => { if (e.target === e.currentTarget) closeDetail(); }}
+      onkeydown={(e) => { if (e.key === 'Escape') closeDetail(); }}>
+      <div class="w-full max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl overflow-hidden">
+        <header class="flex items-start justify-between gap-4 border-b border-zinc-800 px-5 py-4">
+          <div class="min-w-0">
+            <h2 class="truncate text-sm font-medium text-zinc-100">{smartCounterMeta[detailAttr]?.label} — {detailDevice}</h2>
+            <p class="mt-1 truncate text-xs text-zinc-500">{detailModel}{detailSlot ? ' · slot ' + detailSlot : ''}</p>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <DownloadCsv host={hostId} metric={smartCounterMeta[detailAttr]?.metric ?? ''} labels={{ device: detailDevice }} range={detailWin} title="Download history CSV" />
+            <button type="button" onclick={closeDetail} aria-label="Close" class="rounded-md p-1 text-zinc-400 hover:text-zinc-200">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="h-5 w-5" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
+          </div>
+        </header>
+        <div class="space-y-4 px-5 py-4">
+          {#if detailError}
+            <div class="rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{detailError}</div>
+          {:else if !detailLoading}
+            {#if detailAnalysis === null}
+              <div class="rounded-md border border-zinc-800 bg-zinc-950/30 px-3 py-2 text-xs text-zinc-400">
+                No history for this device in the last {MEDIA_HISTORY_DAYS} days.
+              </div>
+            {:else if detailAnalysis.firstVal >= detailAnalysis.current}
+              {#if detailAnalysis.current > 0}
+                <div class="rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+                  {detailAnalysis.current} recorded — unchanged across the last {MEDIA_HISTORY_DAYS} days (first observed {timeAgo(detailAnalysis.firstTs)}). The increase occurred before this window.
+                </div>
+              {:else}
+                <div class="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">No errors recorded.</div>
+              {/if}
+            {:else if detailAnalysis.firstVal === 0 && detailAnalysis.current > 0}
+              <div class="rounded-md border border-emerald-900/50 bg-emerald-950/20 px-3 py-2 text-xs text-zinc-300">
+                Rose from 0 to {detailAnalysis.current}. First non-zero {absDate(detailAnalysis.changes[0].ts)} ({timeAgo(detailAnalysis.changes[0].ts)}); last increase {timeAgo(detailAnalysis.changes.at(-1)?.ts)}.
+              </div>
+            {:else}
+              <div class="rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+                Was {detailAnalysis.firstVal} at the start of this window ({timeAgo(detailAnalysis.firstTs)}) and rose to {detailAnalysis.current} — at least part predates the window.
+              </div>
+            {/if}
+          {/if}
+
+          <MultiChart
+            series={[{ label: detailDevice, points: detailPoints }]}
+            fromMs={detailWin.fromMs}
+            toMs={detailWin.toMs}
+            stepped
+            loading={detailLoading}
+            unit=""
+            yClampMin={0}
+            yMinSpan={4}
+            format={(v, e = 0) => v.toFixed(e)} />
+
+          {#if detailAnalysis && detailAnalysis.changes.length > 0}
+            <div>
+              <div class="mb-1.5 text-[10px] uppercase tracking-wider text-zinc-500">Observed changes in this window</div>
+              <div class="max-h-40 overflow-y-auto rounded-md border border-zinc-800 divide-y divide-zinc-800/70">
+                {#each [...detailAnalysis.changes].reverse() as c}
+                  <div class="px-3 py-2 font-mono text-xs numeric text-zinc-300">{absDate(c.ts)} · {c.from} → {c.to}</div>
+                {/each}
+              </div>
+              <p class="mt-1.5 text-[11px] text-zinc-600">Derived from stored samples; timing is accurate to the sampling interval.</p>
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
   {/if}
 </div>

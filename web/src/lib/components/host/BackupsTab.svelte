@@ -91,6 +91,7 @@
     tunnel: boolean;
     success: boolean;
     pending: boolean;
+    factsAsOf: string | null;
     error?: string;
     lastSuccessIso?: string;
     lastFinishedIso?: string;
@@ -259,6 +260,7 @@
           tunnel: s.tunnel === true,
           success: s.success,
           pending,
+          factsAsOf: !s.success ? s.last_success ?? null : null,
           error: s.error,
           lastSuccessIso: s.last_success,
           lastFinishedIso: s.last_finished,
@@ -845,42 +847,42 @@
         <table class="w-full text-sm">
           <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
             <tr>
-              <th class="text-left font-medium px-4 sm:px-5 py-2.5">Repository</th>
-              <th class="text-left font-medium px-3 py-2.5">Last backup</th>
-              <th class="hidden sm:table-cell text-left font-medium px-3 py-2.5">Last check</th>
-              <th class="hidden sm:table-cell text-right font-medium px-3 py-2.5">Size</th>
-              <th class="text-right font-medium px-4 sm:px-5 py-2.5">Snapshots</th>
+              <th class="text-left font-medium px-3 sm:px-5 py-2.5">Repository</th>
+              <th class="text-left font-medium px-2 sm:px-3 py-2.5">Last backup</th>
+              <th class="hidden sm:table-cell text-left font-medium px-2 sm:px-3 py-2.5">Last check</th>
+              <th class="hidden sm:table-cell text-right font-medium px-2 sm:px-3 py-2.5">Size</th>
+              <th class="text-right font-medium px-3 sm:px-5 py-2.5">Snapshots</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-zinc-800/70">
             {#each views as v (v.repo)}
               <tr class="hover:bg-zinc-900/60">
-                <td class="px-4 sm:px-5 py-2.5">
+                <td class="px-3 sm:px-5 py-2.5">
                   <div class="flex items-center gap-2 min-w-0">
                     <span class="h-1.5 w-1.5 shrink-0 rounded-full {toneDot[v.backupTone]}"></span>
                     <span class="truncate font-mono text-zinc-100">{v.repo}</span>
-                    {#if v.engine}<span class="shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</span>{/if}
+                    {#if v.engine}<span class="hidden sm:inline shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</span>{/if}
                     {#if v.tunnel}<span class="shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}
                   </div>
                 </td>
-                <td class="px-3 py-2.5">
+                <td class="px-2 sm:px-3 py-2.5">
                   {#if isRunning(v.repo)}
                     <div class="flex items-center gap-2 text-emerald-300"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span><span class="whitespace-nowrap">backing up now — started <span class="numeric">{durationText(displayedElapsed(v.repo))}</span> ago</span></div>
                   {:else}
-                    <div class="flex items-center gap-2">
+                    <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                       <span class="numeric whitespace-nowrap {toneText[v.backupTone]}">{v.lastSuccessIso ? timeAgo(v.lastSuccessIso) : v.pending ? 'not yet' : 'never'}</span>
                       {#if v.pending}<span class="text-[10px] uppercase tracking-wider text-zinc-500">scheduled</span>{:else if !v.success}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
                     </div>
                   {/if}
                 </td>
-                <td class="hidden sm:table-cell px-3 py-2.5">
+                <td class="hidden sm:table-cell px-2 sm:px-3 py-2.5">
                   <div class="flex items-center gap-2">
                     <span class="numeric {toneText[v.checkTone]}">{v.checkLastIso ? timeAgo(v.checkLastIso) : 'never'}</span>
                     {#if v.checkSuccess === false}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
                   </div>
                 </td>
-                <td class="hidden sm:table-cell px-3 py-2.5 text-right numeric text-zinc-300">{optionalBytes(v.totalBytes)}</td>
-                <td class="px-4 sm:px-5 py-2.5 text-right numeric text-zinc-300">{optionalCount(v.snapshotCount)}</td>
+                <td class="hidden sm:table-cell px-2 sm:px-3 py-2.5 text-right numeric text-zinc-300" title={v.factsAsOf && v.totalBytes !== null ? `As of the last successful backup (${timeAgo(v.factsAsOf)})` : undefined}>{optionalBytes(v.totalBytes)}</td>
+                <td class="px-3 sm:px-5 py-2.5 text-right numeric text-zinc-300" title={v.factsAsOf && v.snapshotCount !== null ? `As of the last successful backup (${timeAgo(v.factsAsOf)})` : undefined}>{optionalCount(v.snapshotCount)}</td>
               </tr>
             {/each}
           </tbody>
@@ -934,11 +936,11 @@
               </div>
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Total</div>
-                <div class="mt-0.5 numeric text-zinc-300">{optionalBytes(v.totalBytes)}</div>
+                <div class="mt-0.5 numeric text-zinc-300" title={v.factsAsOf && v.totalBytes !== null ? `As of the last successful backup (${timeAgo(v.factsAsOf)})` : undefined}>{optionalBytes(v.totalBytes)}</div>
               </div>
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Snapshots</div>
-                <div class="mt-0.5 numeric text-zinc-300">{optionalCount(v.snapshotCount)}</div>
+                <div class="mt-0.5 numeric text-zinc-300" title={v.factsAsOf && v.snapshotCount !== null ? `As of the last successful backup (${timeAgo(v.factsAsOf)})` : undefined}>{optionalCount(v.snapshotCount)}</div>
               </div>
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500">Check</div>

@@ -685,6 +685,12 @@ export const api = {
     request<BackupCredential>(`/api/v1/backup-targets/${id}/rotate`, { method: 'POST' }),
   backupTargetMeasure: (id: number) =>
     request<BackupTarget>(`/api/v1/backup-targets/${id}/measure`, { method: 'POST' }),
+  backupTargetSetQuota: (id: number, quota_bytes: number | null) =>
+    request<BackupTarget>(`/api/v1/backup-targets/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quota_bytes })
+    }),
   backupTargetRevoke: (id: number) => request<void>(`/api/v1/backup-targets/${id}/revoke`, { method: 'POST' }),
   backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-targets/${id}`, { method: 'DELETE' }),
   backupTunnel: () => request<BackupTunnelResp>('/api/v1/backup-tunnel'),

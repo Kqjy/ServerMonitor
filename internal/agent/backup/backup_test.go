@@ -767,7 +767,7 @@ func TestStatusMergePreservesChecksForeignReposAndLastSuccessOnFailure(t *testin
 	existing := StatusFile{
 		Version: statusVersion,
 		Repos: []RepoStatus{
-			{Name: "repo1", Engine: "restic", LastSuccess: &lastSuccess, CheckLast: &checkLast, CheckSuccess: &checkSuccess, Success: true},
+			{Name: "repo1", Engine: "restic", LastSuccess: &lastSuccess, CheckLast: &checkLast, CheckSuccess: &checkSuccess, Success: true, DurationS: 40, AddedBytes: 300, TotalBytes: 2000, SnapshotCount: 7, Snapshots: []Snapshot{{ID: "abcd1234"}}},
 			{Name: "foreign", Engine: "borg", Success: true},
 		},
 	}
@@ -792,6 +792,15 @@ func TestStatusMergePreservesChecksForeignReposAndLastSuccessOnFailure(t *testin
 	}
 	if repo.CheckLast == nil || !repo.CheckLast.Equal(checkLast) || repo.CheckSuccess == nil || !*repo.CheckSuccess {
 		t.Fatalf("check fields not preserved: %#v", repo)
+	}
+	if repo.Success || repo.Error == "" {
+		t.Fatalf("failure not preserved: %#v", repo)
+	}
+	if repo.SnapshotCount != 7 || repo.TotalBytes != 2000 || len(repo.Snapshots) != 1 || repo.Snapshots[0].ID != "abcd1234" {
+		t.Fatalf("repository facts not preserved: %#v", repo)
+	}
+	if repo.AddedBytes != 0 || repo.DurationS != 0 {
+		t.Fatalf("per-run fields carried forward: %#v", repo)
 	}
 	if got.Repos[1].Name != "foreign" {
 		t.Fatalf("foreign repo not preserved: %#v", got.Repos)
@@ -821,6 +830,22 @@ func TestMergeStatusPreservesPathStatsForPartialUpdate(t *testing.T) {
 	merged := mergeStatus(existing, []RepoStatus{{Name: "repo1", Error: "partial update"}})
 	if len(merged.Repos) != 1 || !reflect.DeepEqual(merged.Repos[0].PathStats, existing.Repos[0].PathStats) || merged.Repos[0].StatsSnapshot != "abcdef12" {
 		t.Fatalf("path stats not preserved: %#v", merged.Repos)
+	}
+}
+
+func TestMergeStatusPreservesRepositoryFactsForPartialFailure(t *testing.T) {
+	existing := StatusFile{Repos: []RepoStatus{{
+		Name:          "repo1",
+		SnapshotCount: 7,
+		TotalBytes:    2000,
+		Snapshots:     []Snapshot{{ID: "abcd1234"}},
+	}}}
+	merged := mergeStatus(existing, []RepoStatus{{Name: "repo1", Success: false, TotalBytes: 500}})
+	if len(merged.Repos) != 1 || merged.Repos[0].TotalBytes != 500 || merged.Repos[0].SnapshotCount != 7 || len(merged.Repos[0].Snapshots) != 1 {
+		t.Fatalf("repository facts not preserved: %#v", merged.Repos)
+	}
+	if &merged.Repos[0].Snapshots[0] == &existing.Repos[0].Snapshots[0] {
+		t.Fatal("snapshots slice was not copied")
 	}
 }
 

@@ -135,6 +135,21 @@ func (b *BackupTargets) SetUsage(ctx context.Context, id int64, used int64) erro
 	return nil
 }
 
+func (b *BackupTargets) SetQuota(ctx context.Context, id int64, quota *int64) error {
+	res, err := b.db.Pool.Exec(ctx, `
+		UPDATE backup_targets SET quota_bytes = $2
+		WHERE id = $1
+	`, id, quota)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	b.invalidate()
+	return nil
+}
+
 func (b *BackupTargets) ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error) {
 	if delta < 0 {
 		return false, errors.New("backup usage reservation must be non-negative")
