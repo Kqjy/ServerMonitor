@@ -31,7 +31,7 @@ func TestEmbeddedInstallerParity(t *testing.T) {
 			canonicalPath: filepath.Join("..", "..", "..", "scripts", "install-agent-linux.sh"),
 			embedded:      installSh,
 			digestPattern: `(?m)^CANONICAL_INSTALLER_SHA256='([0-9a-f]{64})'$`,
-			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "install_bzip2", "refresh_agent_binaries", "agent_binary_version", "refreshed sm-agent binaries", "sm-agent-privileged-sync", "sync-privileged", "agent-signing.pub", "90-servermonitor-smart.rules", "udevadm"},
+			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "install_bzip2", "refresh_agent_binaries", "agent_binary_version", "refreshed sm-agent binaries", "sm-agent-privileged-sync", "sync-privileged", "agent-signing.pub", "90-servermonitor-smart.rules", "udevadm", "SMART_IOCTL_NODES", "ExecStartPre=+"},
 		},
 		{
 			name:          "windows",

@@ -1048,6 +1048,33 @@ func TestPathStatsFailureDoesNotFailBackup(t *testing.T) {
 	}
 }
 
+func TestRunRepoStoresShortStatsSnapshotID(t *testing.T) {
+	cfg := testConfig(t)
+	full := "161a9b4ae42a014b85263f7b1b0d2a5c9e8d7c6b5a4938271605f4e3d2c1b0a9"
+	runner := newFakeResticRunner()
+	runner.enqueue(cfg.Repos[0].URL, "backup", fakeResticResponse{stdout: `{"message_type":"summary","total_duration":1,"snapshot_id":"` + full + `"}`})
+	runner.enqueue(cfg.Repos[0].URL, "ls", fakeResticResponse{stdout: `{"message_type":"node","type":"file","path":"/etc/config","size":42}`})
+	status := runRepo(context.Background(), cfg, cfg.Repos[0], t.TempDir(), Options{Runner: runner}, nil, nil)
+	if !status.Success || status.StatsSnapshot != full[:8] {
+		t.Fatalf("status = %#v", status)
+	}
+	var lsArgs []string
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "ls" {
+			lsArgs = call.Args
+		}
+	}
+	found := false
+	for _, arg := range lsArgs {
+		if arg == full {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ls args = %#v, want full snapshot id", lsArgs)
+	}
+}
+
 func TestRunRepoReusesFreshPathStatsForSameScope(t *testing.T) {
 	cfg := testConfig(t)
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
@@ -1364,6 +1391,97 @@ func TestInitAlreadyFreshAndMissingKey(t *testing.T) {
 	}
 	if !strings.Contains(result.Repos[2].Error, "installer") {
 		t.Fatalf("missing key error should mention installer: %q", result.Repos[2].Error)
+	}
+}
+
+func TestInitSeedsPendingStatusForConfiguredRepos(t *testing.T) {
+	cfg := testConfig(t)
+	key := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(key, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	cfg.Repos = []Repo{
+		{Name: "primary", URL: "rest:https://example.com/primary", PasswordFile: key},
+		{Name: "offsite", URL: "rest:https://example.com/offsite", PasswordFile: key},
+	}
+	if _, err := Init(context.Background(), cfg, Options{Runner: newFakeResticRunner()}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	status, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		t.Fatalf("readStatusFile: %v", err)
+	}
+	if len(status.Repos) != 2 {
+		t.Fatalf("repos = %#v", status.Repos)
+	}
+	for i, name := range []string{"primary", "offsite"} {
+		repo := status.Repos[i]
+		if repo.Name != name || repo.Engine != "restic" {
+			t.Fatalf("repo %d = %#v", i, repo)
+		}
+		if repo.Success || repo.Error != "" || repo.LastStarted != nil || repo.LastFinished != nil || repo.LastSuccess != nil {
+			t.Fatalf("repo %d should have no run facts: %#v", i, repo)
+		}
+		if !reflect.DeepEqual(repo.Paths, cfg.Paths) || !reflect.DeepEqual(repo.Excludes, cfg.Excludes) || repo.OneFileSystem == nil || !*repo.OneFileSystem {
+			t.Fatalf("repo %d scope = %#v", i, repo)
+		}
+	}
+}
+
+func TestInitSeedKeepsExistingFactsAndAddsNewRepo(t *testing.T) {
+	cfg := testConfig(t)
+	key := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(key, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	cfg.Repos = []Repo{
+		{Name: "primary", URL: "rest:https://example.com/primary", PasswordFile: key},
+		{Name: "offsite", URL: "rest:https://example.com/offsite", PasswordFile: key},
+	}
+	lastSuccess := time.Date(2026, 7, 2, 2, 0, 0, 0, time.UTC)
+	existing := StatusFile{Version: statusVersion, Repos: []RepoStatus{{
+		Name:          "primary",
+		Engine:        "restic",
+		LastFinished:  &lastSuccess,
+		LastSuccess:   &lastSuccess,
+		Success:       true,
+		DurationS:     42,
+		AddedBytes:    300,
+		TotalBytes:    2000,
+		SnapshotCount: 7,
+		Snapshots:     []Snapshot{{ID: "abcd1234"}},
+		Paths:         []string{"/opt"},
+	}}}
+	if err := writeStatusAtomic(cfg.StatusPath, existing); err != nil {
+		t.Fatalf("writeStatusAtomic: %v", err)
+	}
+	if _, err := Init(context.Background(), cfg, Options{Runner: newFakeResticRunner()}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	status, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		t.Fatalf("readStatusFile: %v", err)
+	}
+	if len(status.Repos) != 2 {
+		t.Fatalf("repos = %#v", status.Repos)
+	}
+	byName := map[string]RepoStatus{}
+	for _, repo := range status.Repos {
+		byName[repo.Name] = repo
+	}
+	primary := byName["primary"]
+	if !primary.Success || primary.LastSuccess == nil || !primary.LastSuccess.Equal(lastSuccess) || primary.DurationS != 42 || primary.AddedBytes != 300 || primary.TotalBytes != 2000 || primary.SnapshotCount != 7 {
+		t.Fatalf("existing facts not preserved: %#v", primary)
+	}
+	if len(primary.Snapshots) != 1 || primary.Snapshots[0].ID != "abcd1234" || !reflect.DeepEqual(primary.Paths, []string{"/opt"}) {
+		t.Fatalf("existing inventory or scope not preserved: %#v", primary)
+	}
+	offsite := byName["offsite"]
+	if offsite.Engine != "restic" || offsite.Success || offsite.Error != "" || offsite.LastFinished != nil || offsite.LastSuccess != nil {
+		t.Fatalf("new repo should be pending: %#v", offsite)
+	}
+	if !reflect.DeepEqual(offsite.Paths, cfg.Paths) || offsite.OneFileSystem == nil || !*offsite.OneFileSystem {
+		t.Fatalf("new repo scope = %#v", offsite)
 	}
 }
 

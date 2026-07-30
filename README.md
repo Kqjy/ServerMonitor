@@ -254,7 +254,6 @@ ServerMonitor/
   deploy/                    Dockerfile + docker-compose + .env.example
   scripts/                   Linux + Windows agent install + uninstall scripts
   migrations/                see internal/server/storage/migrations/
-  CLAUDE.md                  developer guide
 ```
 
 ---
@@ -272,4 +271,4 @@ ServerMonitor/
 
 ## Status
 
-End-to-end functional: agent → server → Postgres → UI → SSE → alerts → S3 archive. All six implementation milestones (thin slice, auth + full collector set, host detail tabs, alerting, archive, hardening) are merged into the codebase. See [CLAUDE.md](CLAUDE.md) for the milestone log and developer-facing details, and `~/.claude/plans/project-server-monitoring-adaptive-llama.md` for the original design plan.
+End-to-end functional: agent → server → Postgres → UI → SSE → alerts → S3 archive. All six implementation milestones (thin slice, auth + full collector set, host detail tabs, alerting, archive, hardening) are merged into the codebase.

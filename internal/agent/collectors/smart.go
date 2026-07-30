@@ -3,6 +3,7 @@ package collectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -96,6 +97,7 @@ type smartCollector struct {
 	pendingSample  *smartSample
 	execFn         func(ctx context.Context, bin string, args ...string) ([]byte, error)
 	fileExists     func(path string) bool
+	openNode       func(path string) error
 }
 
 var defaultSmartCollector = &smartCollector{}
@@ -176,6 +178,15 @@ func (c *smartCollector) ensure(ctx context.Context) bool {
 		c.fileExists = func(path string) bool {
 			_, err := os.Stat(path)
 			return err == nil
+		}
+	}
+	if c.openNode == nil {
+		c.openNode = func(path string) error {
+			handle, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			return handle.Close()
 		}
 	}
 	if !c.probed {
@@ -308,6 +319,72 @@ type probeFailure struct {
 	message string
 }
 
+var raidFamilyIoctlNodes = map[string][]string{
+	"megaraid": {"/dev/megaraid_sas_ioctl_node", "/dev/megadev0"},
+	"aacraid":  {"/dev/aac0"},
+	"3ware":    {"/dev/twl0", "/dev/twa0", "/dev/twe0"},
+}
+
+func (c *smartCollector) ioctlNodeFailure(goos, family string) (probeFailure, bool) {
+	if goos != "linux" {
+		return probeFailure{}, false
+	}
+	nodes := raidFamilyIoctlNodes[family]
+	if len(nodes) == 0 || c.fileExists == nil || c.openNode == nil {
+		return probeFailure{}, false
+	}
+	present := false
+	denied := ""
+	for _, node := range nodes {
+		if !c.fileExists(node) {
+			continue
+		}
+		present = true
+		err := c.openNode(node)
+		if err == nil {
+			return probeFailure{}, false
+		}
+		if denied == "" && errors.Is(err, os.ErrPermission) {
+			denied = fmt.Sprintf("cannot open %s: permission denied", node)
+		}
+	}
+	switch {
+	case denied != "":
+		return probeFailure{kind: "permission", message: denied}, true
+	case !present:
+		return probeFailure{kind: "nonode", message: fmt.Sprintf("%s is not present", strings.Join(nodes, " or "))}, true
+	}
+	return probeFailure{}, false
+}
+
+func probeFailureWeight(failure probeFailure, primary bool) int {
+	weight := 0
+	switch failure.kind {
+	case "permission":
+		weight = 3
+	case "nonode":
+		weight = 2
+	default:
+		if failure.message != "" {
+			weight = 1
+		}
+	}
+	if weight > 0 && primary {
+		weight += 4
+	}
+	return weight
+}
+
+func preferProbeFailure(current probeFailure, currentPrimary bool, next probeFailure, nextPrimary bool) bool {
+	if next.message == "" {
+		return false
+	}
+	if current.message == "" {
+		return true
+	}
+	return probeFailureWeight(next, nextPrimary) > probeFailureWeight(current, currentPrimary)
+}
+
 type raidCandidateIdentity struct {
 	view   *smartView
 	opened bool
@@ -335,8 +412,10 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 	storcliBin := c.resolveStorcli(goos)
 	coveredNodes := map[string]bool{}
 	storcliProduced := false
+	var storcliErr error
 	if storcliBin != "" && ctx.Err() == nil {
-		enumerated, vds, _ := c.enumerateStorcli(ctx, storcliBin)
+		enumerated, vds, enumErr := c.enumerateStorcli(ctx, storcliBin)
+		storcliErr = enumErr
 		cliVDs = vds
 		coveredControllers := map[int]bool{}
 		fallbackNode := soleMegaRAIDCandidateNode(identities)
@@ -398,6 +477,7 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 	}
 	blockedName, blockedModel := "", ""
 	var failure probeFailure
+	failurePrimary := false
 	for _, cand := range candidates {
 		if ctx.Err() != nil {
 			break
@@ -407,15 +487,22 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 		families, explicit := raidFamiliesFor(identity, opened, goos)
 		hits := 0
 		covered := false
-		for _, fam := range families {
+		for famIndex, fam := range families {
 			if skip[fam] || coveredNodes[cand.name] && (fam == "megaraid" || fam == "cciss") {
 				covered = true
 				continue
 			}
 			var walkFailure probeFailure
 			drives := c.walkFamily(ctx, bin, fam, cand.name, seenSerials, seenDevs, &walkFailure)
-			if failure.message == "" || failure.kind == "" && walkFailure.kind != "" {
+			if len(drives) == 0 {
+				if nodeFailure, ok := c.ioctlNodeFailure(goos, fam); ok {
+					walkFailure = nodeFailure
+				}
+			}
+			primary := explicit && famIndex == 0
+			if preferProbeFailure(failure, failurePrimary, walkFailure, primary) {
 				failure = walkFailure
+				failurePrimary = primary
 			}
 			if len(drives) > 0 {
 				found = append(found, drives...)
@@ -450,18 +537,22 @@ func (c *smartCollector) probeRAIDPassthrough(ctx context.Context, bin, goos str
 				break
 			}
 			var walkFailure probeFailure
-			found = append(found, c.walkFamily(ctx, bin, "megaraid", node, seenSerials, seenDevs, &walkFailure)...)
-			if failure.message == "" || failure.kind == "" && walkFailure.kind != "" {
+			drives := c.walkFamily(ctx, bin, "megaraid", node, seenSerials, seenDevs, &walkFailure)
+			found = append(found, drives...)
+			if len(drives) == 0 {
+				if nodeFailure, ok := c.ioctlNodeFailure(goos, "megaraid"); ok {
+					walkFailure = nodeFailure
+				}
+			}
+			if preferProbeFailure(failure, failurePrimary, walkFailure, true) {
 				failure = walkFailure
+				failurePrimary = true
 			}
 		}
 	}
 	note := ""
 	if blockedName != "" && len(found) == 0 && !storcliProduced {
-		note = raidProbeNote(blockedName, blockedModel, failure)
-		if storcliBin != "" {
-			note += fmt.Sprintf("; storcli at %s reported no drives", storcliBin)
-		}
+		note = raidProbeNote(blockedName, blockedModel, failure, storcliBin, storcliErr)
 	}
 	return found, hide, note, cliDrives, cliVDs
 }
@@ -509,16 +600,31 @@ func soleMegaRAIDCandidateNode(identities map[string]raidCandidateIdentity) stri
 	return node
 }
 
-func raidProbeNote(name, model string, failure probeFailure) string {
+func raidProbeNote(name, model string, failure probeFailure, storcliBin string, storcliErr error) string {
 	message := truncateProbeMessage(failure.message, 120)
+	base := ""
 	switch failure.kind {
 	case "permission":
-		return fmt.Sprintf("hardware RAID virtual disk %s (%s): the controller ioctl node refused access (%s); re-run the installer with --enable-smart to install the udev rule that opens it to the disk group, or install Broadcom storcli/perccli which the agent uses automatically", name, model, message)
+		base = fmt.Sprintf("hardware RAID virtual disk %s (%s): the controller ioctl node is not accessible to the agent (%s); the node is recreated root-owned on every boot, so re-run the installer with --enable-smart to reinstall the device-node fixup, or grant the disk group access to it by hand", name, model, message)
 	case "nonode":
-		return fmt.Sprintf("hardware RAID virtual disk %s (%s): smartctl could not find the controller ioctl node (%s); the kernel driver may predate passthrough support — install Broadcom storcli/perccli which the agent uses automatically", name, model, message)
+		base = fmt.Sprintf("hardware RAID virtual disk %s (%s): the controller ioctl node is missing (%s); the kernel driver may predate passthrough support", name, model, message)
 	default:
-		return fmt.Sprintf("hardware RAID virtual disk %s (%s) hides its member drives and the smartctl passthrough probe found none; install Broadcom storcli/perccli for exact enumeration, check the controller with its own CLI, or run smartctl -d megaraid,N manually", name, model)
+		base = fmt.Sprintf("hardware RAID virtual disk %s (%s) hides its member drives and the smartctl passthrough probe found none; check the controller with its own CLI, or run smartctl -d megaraid,N manually", name, model)
 	}
+	return base + storcliProbeNote(storcliBin, storcliErr, failure.kind)
+}
+
+func storcliProbeNote(bin string, err error, kind string) string {
+	if bin == "" {
+		return "; install Broadcom storcli/perccli for exact enumeration, which the agent uses automatically once present"
+	}
+	if err != nil {
+		return fmt.Sprintf("; storcli at %s failed: %s", bin, truncateProbeMessage(err.Error(), 120))
+	}
+	if kind == "permission" {
+		return fmt.Sprintf("; storcli at %s enumerated no drives either, which the same permission problem explains", bin)
+	}
+	return fmt.Sprintf("; storcli at %s enumerated no drives", bin)
 }
 
 func classifyProbeErr(message string) string {

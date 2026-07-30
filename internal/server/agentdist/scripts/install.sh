@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='58739e6833a59d43fe4aa61e0e986b8211b8f76c367dbfa2b3ac8bfd398cacdc'
+CANONICAL_INSTALLER_SHA256='d21679f3c24222feef2f8c6db036e315eed37eb1490c82792a5dda4e850e6c6b'
 TOKEN="${SM_TOKEN:-}"
 DOWNLOADED_SERVER_PUBKEY=""
 INTERVAL="${SM_INTERVAL:-10}"
@@ -366,9 +366,9 @@ backup_tunnel_value() {
             value=$0
             sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "", value)
             sub(/[[:space:]]*$/, "", value)
-            if (value ~ /^\".*\"$/) {
-                sub(/^\"/, "", value)
-                sub(/\"$/, "", value)
+            if (value ~ /^".*"$/) {
+                sub(/^"/, "", value)
+                sub(/"$/, "", value)
             }
             print value
             exit
@@ -991,6 +991,7 @@ done
 usermod -G "$(IFS=,; printf '%s' "${PRESENT_GROUPS[*]:-}")" sm-agent
 
 SMART_UDEV_RULES=/etc/udev/rules.d/90-servermonitor-smart.rules
+SMART_IOCTL_NODES="/dev/megaraid_sas_ioctl_node /dev/megadev0 /dev/twa0 /dev/twl0 /dev/twe0 /dev/aac0"
 if [ "$ENABLE_SMART" = "1" ]; then
     cat > "$SMART_UDEV_RULES" <<'RULES'
 KERNEL=="megaraid_sas_ioctl_node", GROUP="disk", MODE="0660"
@@ -1002,7 +1003,7 @@ KERNEL=="aac[0-9]*", GROUP="disk", MODE="0660"
 RULES
     chmod 0644 "$SMART_UDEV_RULES"
     udevadm control --reload >/dev/null 2>&1 || true
-    for node in /dev/megaraid_sas_ioctl_node /dev/megadev0 /dev/twa0 /dev/twl0 /dev/twe0 /dev/aac0; do
+    for node in $SMART_IOCTL_NODES; do
         if [ -e "$node" ]; then
             chgrp disk "$node" 2>/dev/null || true
             chmod 0660 "$node" 2>/dev/null || true
@@ -1051,6 +1052,11 @@ if [ "$ENABLE_DOCKER" = "1" ]; then
 Wants=docker.socket"
 fi
 
+SMART_NODE_FIXUP=""
+if [ "$ENABLE_SMART" = "1" ]; then
+  SMART_NODE_FIXUP="ExecStartPre=+/bin/sh -c 'for n in $SMART_IOCTL_NODES; do [ -e \$n ] || continue; chgrp disk \$n || echo \"sm-agent: chgrp disk \$n failed\" >&2; chmod 0660 \$n || echo \"sm-agent: chmod 0660 \$n failed\" >&2; done; exit 0'"
+fi
+
 cat >/etc/systemd/system/sm-agent.service <<UNIT
 [Unit]
 Description=ServerMonitor Agent
@@ -1063,6 +1069,7 @@ Type=simple
 User=sm-agent
 Group=sm-agent
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+$SMART_NODE_FIXUP
 ExecStart=/opt/servermonitor/sm-agent --config /etc/servermonitor/agent.toml
 Restart=always
 RestartSec=5

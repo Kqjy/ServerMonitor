@@ -211,7 +211,7 @@
     newName = '';
     newHostId = hostId ?? null;
     newQuotaGiB = null;
-    newDestination = 'server';
+    newDestination = data?.configured ? 'server' : (nodes.find((n) => n.enrolled)?.host_id ?? nodes[0]?.host_id ?? 'server');
     credential = null;
     createError = null;
     firstBlobSeen = false;
@@ -469,13 +469,13 @@
   const linuxSnippet = $derived.by(() => {
     if (!credential) return '';
     const vars = [
-      'SM_ADMIN_TOKEN=<ADMIN_TOKEN>',
-      'SM_ENABLE_BACKUP=1',
-      `SM_BACKUP_REPOS="${repoSpec}"`,
-      `SM_BACKUP_REPO_NAMES="${credential.name}"`,
-      `SM_BACKUP_REST_USERNAME="${credential.name}"`,
-      `SM_BACKUP_REST_PASSWORD="${credential.password}"`,
-      'SM_BACKUP_PRUNE_MODE=external'
+      "SM_ADMIN_TOKEN='<ADMIN_TOKEN>'",
+      "SM_ENABLE_BACKUP='1'",
+      `SM_BACKUP_REPOS='${repoSpec}'`,
+      `SM_BACKUP_REPO_NAMES='${credential.name}'`,
+      `SM_BACKUP_REST_USERNAME='${credential.name}'`,
+      `SM_BACKUP_REST_PASSWORD='${credential.password}'`,
+      "SM_BACKUP_PRUNE_MODE='external'"
     ];
     const preserve = vars.map((v) => v.split('=')[0]).join(',');
     return `${vars.join(' \\\n  ')} \\\n  sudo --preserve-env=${preserve} bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
@@ -536,13 +536,13 @@ RESTIC_REST_PASSWORD=${credential.password}`;
   const resticSnippet = $derived.by(() => {
     if (!credential) return '';
     if (selectedNode || (tunnelActive && !tunnel?.public_http)) {
-      return `export RESTIC_REST_USERNAME=${credential.name}
-export RESTIC_REST_PASSWORD=${credential.password}
+      return `export RESTIC_REST_USERNAME='${credential.name}'
+export RESTIC_REST_PASSWORD='${credential.password}'
 sm-agent backup proxy --config /etc/servermonitor-backup/backup.toml
 restic -r <printed RESTIC_REPOSITORY> snapshots`;
     }
-    return `export RESTIC_REST_USERNAME=${credential.name}
-export RESTIC_REST_PASSWORD=${credential.password}
+    return `export RESTIC_REST_USERNAME='${credential.name}'
+export RESTIC_REST_PASSWORD='${credential.password}'
 restic -r ${publicRepoUrl} init
 restic -r ${publicRepoUrl} backup /etc`;
   });
@@ -611,7 +611,7 @@ restic -r ${publicRepoUrl} backup /etc`;
     liveUnsub = subscribeHosts(['backup_running'], receiveLive);
     liveTimer = setInterval(() => (liveNow = Date.now()), 5_000);
     const sp = $page.url.searchParams;
-    if (sp.get('new') === '1' && data?.configured) {
+    if (sp.get('new') === '1' && (data?.configured || nodes.length > 0)) {
       const h = sp.get('host');
       const hid = h != null ? Number(h) : NaN;
       openNew(Number.isInteger(hid) && hid > 0 ? hid : undefined);
@@ -1030,7 +1030,7 @@ restic -r ${publicRepoUrl} backup /etc`;
     {/if}
   {:else if data}
     <div class="mt-6 space-y-4">
-      {#if !data.configured && !tunnelActive}
+      {#if !data.configured && !tunnelActive && data.targets.length === 0 && nodes.length === 0}
         {@render howBackupsWork()}
 
         <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">

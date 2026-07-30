@@ -67,20 +67,22 @@
     } catch {}
   }
 
-  let nodeRole = $state<BackupNode | null>(null);
+  let nodes = $state<BackupNode[]>([]);
+  const nodeRole = $derived(nodes.find((n) => n.host_id === hostId) ?? null);
   const isStorageNode = $derived(nodeRole !== null);
+  const canCreateRepo = $derived(endpointConfigured || nodes.length > 0);
 
   async function loadNodeRole() {
     try {
       const resp = await api.backupNodes();
-      nodeRole = resp.nodes.find((n) => n.host_id === hostId) ?? null;
+      nodes = resp.nodes;
     } catch {}
   }
 
   const enableSnippet = $derived(
     isWindows
       ? `$env:SM_ENABLE_BACKUP="1"; $env:SM_BACKUP_REPOS="<rest/s3 url>"; iex (iwr -useb ${baseUrl}/install.ps1).Content`
-      : `SM_ENABLE_BACKUP=1 SM_BACKUP_REPOS="<rest/s3 url>" \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_REPOS bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
+      : `SM_ENABLE_BACKUP='1' SM_BACKUP_REPOS='<rest/s3 url>' \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_REPOS bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
   );
 
   type Tone = 'good' | 'warn' | 'bad' | 'none';
@@ -413,6 +415,12 @@
   }
   function optionalCount(v: number | null): string {
     return v === null ? 'n/a' : Math.round(v).toLocaleString('en-US');
+  }
+  function shortSnapshotId(id: string): string {
+    return id.length > 8 ? id.slice(0, 8) : id;
+  }
+  function snapshotIdTitle(id: string): string | undefined {
+    return id.length > 8 ? id : undefined;
   }
   function absTime(iso?: string): string {
     if (!iso) return '—';
@@ -817,30 +825,43 @@
         {/if}
 
         {#if !isStorageNode && !externallyManaged}
-          {#if endpointConfigured && linkedRepo}
+          {#if canCreateRepo && linkedRepo}
             <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
-              A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists on this server.
+              A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists.
               Point the agent at it, then it will report here. <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
             </div>
-          {:else if endpointConfigured}
+          {:else if canCreateRepo}
             <div class="mt-4">
               <a
                 href="/backups?new=1&host={hostId}"
                 class="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium">
-                Back up this host to this server →
+                {endpointConfigured ? 'Back up this host to this server →' : 'Back up this host to a storage node →'}
               </a>
-              <p class="mt-2 text-[11px] text-zinc-600">Creates a repository on this server and shows the exact install command to run on this host.</p>
+              <p class="mt-2 text-[11px] text-zinc-600">Creates the repository and shows the exact install command to run on this host.</p>
             </div>
           {/if}
 
           <div class="mt-5">
             <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">
-              {endpointConfigured ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
+              {canCreateRepo ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
             </div>
             <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200 select-text">{enableSnippet}</pre>
             <p class="mt-2 text-[11px] text-zinc-500">
               Run this on the host — the installer detects the existing agent and enables backups in place. Full setup — rest-server, S3/B2, TLS, recovery — is in <span class="font-mono text-zinc-600">deploy/BACKUPS.md</span>.
             </p>
+            <p class="mt-1.5 text-[11px] text-zinc-500">
+              An authenticated <span class="font-mono text-zinc-300">rest:</span> endpoint additionally needs
+              <span class="font-mono text-zinc-300">SM_BACKUP_REST_USERNAME</span> and <span class="font-mono text-zinc-300">SM_BACKUP_REST_PASSWORD</span>
+              (plus <span class="font-mono text-zinc-300">SM_BACKUP_PRUNE_MODE=external</span> for append-only endpoints) exported the same way and added to <span class="font-mono text-zinc-300">--preserve-env</span>.
+            </p>
+            {#if !canCreateRepo}
+              <p class="mt-1.5 text-[11px] text-zinc-500">
+                This server can also hold backups itself — set <span class="font-mono text-zinc-300">BACKUP_DIR</span> or
+                <span class="font-mono text-zinc-300">BACKUP_S3_BUCKET</span> on the server, or promote a monitored host into a storage node with
+                <span class="font-mono text-zinc-300">BACKUP_WG_PORT</span>, and repositories can be minted from
+                <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Backups</a>.
+              </p>
+            {/if}
           </div>
         {/if}
       </div>
@@ -983,7 +1004,7 @@
                       </div>
                     {/each}
                   </div>
-                  <div class="mt-2 text-[11px] text-zinc-500 numeric">Measured{scope.stats.measuredAt !== null ? ` ${timeAgo(new Date(scope.stats.measuredAt).toISOString())}` : ''} from snapshot <span class="font-mono text-zinc-400">{scope.stats.snapshot}</span> on <span class="font-mono text-zinc-400">{scope.stats.repo}</span>.</div>
+                  <div class="mt-2 text-[11px] text-zinc-500 numeric break-words">Measured{scope.stats.measuredAt !== null ? ` ${timeAgo(new Date(scope.stats.measuredAt).toISOString())}` : ''} from snapshot <span class="font-mono text-zinc-400" title={snapshotIdTitle(scope.stats.snapshot)}>{shortSnapshotId(scope.stats.snapshot)}</span> on <span class="font-mono text-zinc-400">{scope.stats.repo}</span>.</div>
                 {:else}
                   <div class="flex flex-wrap gap-1.5">
                     {#each scope.paths as path (path)}

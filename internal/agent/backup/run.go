@@ -260,7 +260,7 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 		} else {
 			statsAt := utcSecond(opts.now())
 			status.PathStats = stats
-			status.StatsSnapshot = summary.SnapshotID
+			status.StatsSnapshot = truncateSnapshotID(summary.SnapshotID)
 			status.StatsAt = &statsAt
 			status.StatsScope = statsScope
 		}

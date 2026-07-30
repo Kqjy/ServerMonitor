@@ -2,6 +2,8 @@ package collectors
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -388,8 +390,43 @@ func TestProbePermissionClassification(t *testing.T) {
 	}, fallback: `{"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sda failed: Permission denied","severity":"error"}]}}`}
 	c := newRAIDTestCollector(f)
 	_, _, note, _, _ := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux", []smartDevice{{name: "/dev/sda", devType: "scsi"}}, false, []smartDevice{{name: "/dev/sda", devType: "scsi"}})
-	if !strings.Contains(note, "udev") || !strings.Contains(note, "Permission denied") {
+	if !strings.Contains(note, "not accessible to the agent") || !strings.Contains(note, "Permission denied") {
 		t.Fatalf("permission note = %q", note)
+	}
+}
+
+func TestProbeIoctlNodeOutranksFallbackFamily(t *testing.T) {
+	f := &fakeSmartctl{responses: map[string]string{
+		"-i --json=c /dev/sda": fakeVDIdentity,
+	}, fallback: `{"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sda [cciss_disk_00] [SCSI/SAT] failed: INQUIRY [SAT]: No such device or address","severity":"error"}]}}`}
+	c := newRAIDTestCollector(f)
+	c.fileExists = func(path string) bool { return path == "/dev/megaraid_sas_ioctl_node" }
+	c.openNode = func(string) error { return os.ErrPermission }
+	_, _, note, _, _ := c.probeRAIDPassthrough(context.Background(), c.smartctl, "linux", []smartDevice{{name: "/dev/sda", devType: "scsi"}}, false, []smartDevice{{name: "/dev/sda", devType: "scsi"}})
+	if !strings.Contains(note, "not accessible to the agent") || !strings.Contains(note, "/dev/megaraid_sas_ioctl_node") {
+		t.Fatalf("note = %q", note)
+	}
+	if strings.Contains(note, "No such device or address") {
+		t.Fatalf("cciss fallback message outranked the megaraid ioctl node probe: %q", note)
+	}
+}
+
+func TestRaidProbeNoteStorcliSuffix(t *testing.T) {
+	permission := probeFailure{kind: "permission", message: "cannot open /dev/megaraid_sas_ioctl_node: permission denied"}
+	resolved := raidProbeNote("sda", "AVAGO SMC3108", permission, "/opt/MegaRAID/storcli/storcli64", nil)
+	if strings.Contains(resolved, "install Broadcom") {
+		t.Errorf("note advises installing storcli when it is already resolved: %q", resolved)
+	}
+	if !strings.Contains(resolved, "same permission problem") {
+		t.Errorf("note does not tie storcli's empty result to the permission failure: %q", resolved)
+	}
+	failed := raidProbeNote("sda", "AVAGO SMC3108", permission, "/opt/MegaRAID/storcli/storcli64", fmt.Errorf("storcli physical-drive enumeration failed"))
+	if !strings.Contains(failed, "storcli physical-drive enumeration failed") {
+		t.Errorf("note discards storcli's error: %q", failed)
+	}
+	missing := raidProbeNote("sda", "AVAGO SMC3108", permission, "", nil)
+	if !strings.Contains(missing, "install Broadcom") {
+		t.Errorf("note omits the storcli suggestion when storcli is absent: %q", missing)
 	}
 }
 

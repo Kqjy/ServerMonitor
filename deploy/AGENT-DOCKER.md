@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.3 .
-docker push registry.example.com/servermonitor-agent:0.4.3
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.4 .
+docker push registry.example.com/servermonitor-agent:0.4.4
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.3
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.4
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.

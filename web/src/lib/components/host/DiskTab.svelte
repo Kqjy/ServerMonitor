@@ -543,7 +543,7 @@
         <div class="px-5 py-4 text-sm text-amber-100/90 space-y-1">
           <p>A hardware RAID controller is hiding this host's drives.</p>
           <p class="text-amber-100/70 text-xs">The agent automatically uses Broadcom <span class="font-mono">storcli</span> or Dell <span class="font-mono">perccli</span> when installed at <span class="font-mono">/opt/MegaRAID/storcli/storcli64</span> or standard <span class="font-mono">sbin</span>/<span class="font-mono">bin</span> paths. It is picked up within about five minutes with no reconfiguration. You can still verify passthrough manually with <span class="font-mono">smartctl -d megaraid,N /dev/sdX</span> or check the controller with its vendor CLI.</p>
-          <p class="text-amber-100/70 text-xs">If the detail below says permission denied, the udev rule installed by <span class="font-mono">--enable-smart</span> is missing; re-run the installer with that option.</p>
+          <p class="text-amber-100/70 text-xs">If the detail below says the controller ioctl node is not accessible, the node was recreated root-owned at the last boot. <span class="font-mono">--enable-smart</span> installs a fixup that re-opens it to the <span class="font-mono">disk</span> group every time the agent starts; re-run the installer with that option on hosts installed before it existed.</p>
           {#if smartStatus.message}
             <p class="text-amber-100/60 text-[11px] font-mono pt-1">{smartStatus.message}</p>
           {/if}

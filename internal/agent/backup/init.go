@@ -87,7 +87,40 @@ func Init(ctx context.Context, cfg Config, opts Options) (InitResult, error) {
 		result.Repos = append(result.Repos, entry)
 		logger.Info("backup repo initialized", "repo", repo.Name)
 	}
+	if err := seedScheduledStatus(cfg); err != nil {
+		logger.Warn("could not seed scheduled backup status", "path", cfg.StatusPath, "err", err)
+	}
 	return result, nil
+}
+
+func seedScheduledStatus(cfg Config) error {
+	existing, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(existing.Repos))
+	for _, repo := range existing.Repos {
+		known[repo.Name] = true
+	}
+	oneFileSystem := cfg.OneFileSystem
+	scheduled := make([]RepoStatus, 0, len(cfg.Repos))
+	for _, repo := range cfg.Repos {
+		if known[repo.Name] {
+			continue
+		}
+		scheduled = append(scheduled, RepoStatus{
+			Name:          repo.Name,
+			Engine:        "restic",
+			Tunnel:        repo.UsesTunnel(),
+			Paths:         nonEmptyCopy(cfg.Paths),
+			Excludes:      nonEmptyCopy(cfg.Excludes),
+			OneFileSystem: &oneFileSystem,
+		})
+	}
+	if len(scheduled) == 0 {
+		return nil
+	}
+	return writeStatusAtomic(cfg.StatusPath, mergeStatus(existing, scheduled))
 }
 
 func (r InitResult) Failed() bool {
