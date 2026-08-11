@@ -18,6 +18,63 @@
       .filter((h) => h.hostname.toLowerCase().includes(query.trim().toLowerCase()))
       .sort((a, b) => a.hostname.localeCompare(b.hostname, undefined, { sensitivity: 'base' }) || a.id - b.id)
   );
+  const attentionCap = 6;
+  let attentionExpanded = $state(false);
+
+  const fleet = $derived.by(() => {
+    let offline = 0;
+    let firingHosts = 0;
+    let firingTotal = 0;
+    for (const h of hosts) {
+      const s = statusFor(h.last_seen, h.sample_interval_s || 10);
+      if (s === 'bad' || s === 'idle') offline++;
+      const f = h.firing_alerts ?? 0;
+      if (f > 0) {
+        firingHosts++;
+        firingTotal += f;
+      }
+    }
+    return { total: hosts.length, offline, firingHosts, firingTotal };
+  });
+
+  const attention = $derived.by(() => {
+    const out: { host: Host; rank: number; reasons: string[] }[] = [];
+    for (const h of visible) {
+      const s = statusFor(h.last_seen, h.sample_interval_s || 10);
+      const firing = h.firing_alerts ?? 0;
+      const backupState = storageNodeIds.has(h.id) ? '' : h.collector_status?.backup?.state ?? '';
+      const reasons: string[] = [];
+      let rank = 0;
+      if (firing > 0) {
+        const sev = h.firing_severity ?? 'info';
+        rank = Math.max(rank, sev === 'critical' ? 100 : sev === 'warning' ? 70 : 20);
+        reasons.push(`${firing} alert${firing === 1 ? '' : 's'} firing`);
+      }
+      if (s === 'bad') {
+        rank = Math.max(rank, 90);
+        reasons.push(`offline ${timeAgo(h.last_seen)}`);
+      } else if (s === 'idle') {
+        rank = Math.max(rank, 30);
+        reasons.push('never reported');
+      }
+      if (backupState === 'agent_perms') {
+        rank = Math.max(rank, 80);
+        reasons.push('backups blocked');
+      } else if (backupState === 'stale_agent') {
+        rank = Math.max(rank, 50);
+        reasons.push('stale backup agent');
+      }
+      if (h.upgrade_stalled) {
+        rank = Math.max(rank, 40);
+        reasons.push('agent update stalled');
+      }
+      if (rank > 0) out.push({ host: h, rank, reasons });
+    }
+    return out.sort((a, b) => b.rank - a.rank || a.host.hostname.localeCompare(b.host.hostname, undefined, { sensitivity: 'base' }));
+  });
+
+  const shownAttention = $derived(attentionExpanded ? attention : attention.slice(0, attentionCap));
+
   let timer: ReturnType<typeof setInterval> | null = null;
   let pointsUnsub: (() => void) | null = null;
   let alertUnsub: (() => void) | null = null;
@@ -154,7 +211,16 @@
   <div class="flex flex-wrap items-end justify-between gap-3 mb-5 sm:mb-6">
     <div class="min-w-0">
       <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Hosts</h1>
-      <p class="text-xs sm:text-sm text-zinc-500 mt-1">All servers reporting to this instance</p>
+      <p class="text-xs sm:text-sm text-zinc-500 mt-1 numeric">
+        {#if loading || fleet.total === 0}
+          All servers reporting to this instance
+        {:else}
+          <span class="text-zinc-300">{fleet.total}</span> host{fleet.total === 1 ? '' : 's'}
+          {#if fleet.offline > 0}<span class="text-zinc-600"> · </span><span class="text-rose-300">{fleet.offline} offline</span>{/if}
+          {#if fleet.firingTotal > 0}<span class="text-zinc-600"> · </span><span class="text-amber-300">{fleet.firingTotal} alert{fleet.firingTotal === 1 ? '' : 's'} firing</span>{/if}
+          {#if fleet.offline === 0 && fleet.firingTotal === 0}<span class="text-zinc-600"> · </span><span class="text-emerald-300">all reporting normally</span>{/if}
+        {/if}
+      </p>
     </div>
     <div class="flex items-center gap-2 shrink-0">
       {#if hosts.length > 0}
@@ -205,16 +271,54 @@
       No hosts match <span class="text-zinc-300">{query}</span>.
     </div>
   {:else}
+    {#if attention.length > 0 && attention.length < visible.length}
+      <section class="mb-7">
+        <div class="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-xs uppercase tracking-wider text-zinc-400">
+            Needs attention <span class="text-zinc-600 tabular-nums">({attention.length})</span>
+          </h2>
+          {#if attention.length > attentionCap}
+            <button
+              type="button"
+              onclick={() => (attentionExpanded = !attentionExpanded)}
+              aria-expanded={attentionExpanded}
+              class="rounded-md px-2 py-1 text-[11px] uppercase tracking-wider text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50 transition-colors">
+              {attentionExpanded ? `Show top ${attentionCap}` : `Show all ${attention.length}`}
+            </button>
+          {/if}
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {#each shownAttention as a (a.host.id)}
+            {@render hostCard(a.host, a.reasons.join(' · '), a.rank >= 80 ? 'rose' : 'amber')}
+          {/each}
+        </div>
+      </section>
+      <h2 class="mb-2.5 text-xs uppercase tracking-wider text-zinc-400">
+        All hosts <span class="text-zinc-600 tabular-nums">({visible.length})</span>
+      </h2>
+    {/if}
+    {#if attention.length > 0 && attention.length === visible.length}
+      <p class="mb-4 rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-2.5 text-xs text-zinc-400">
+        Every host below needs attention, so there is nothing to pin above.
+      </p>
+    {/if}
     <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
       {#each visible as h (h.id)}
-        {@const s = statusFor(h.last_seen, h.sample_interval_s || 10)}
-        {@const firing = h.firing_alerts ?? 0}
-        {@const u = usage[h.id] ?? {}}
-        {@const backupState = h.collector_status?.backup?.state}
-        {@const backupMessage = h.collector_status?.backup?.message}
-        {@const showBackupAgentBadge = !storageNodeIds.has(h.id)}
+        {@render hostCard(h)}
+      {/each}
+    </div>
+  {/if}
+</div>
+
+{#snippet hostCard(h: Host, reason?: string, tone?: 'rose' | 'amber')}
+  {@const s = statusFor(h.last_seen, h.sample_interval_s || 10)}
+  {@const firing = h.firing_alerts ?? 0}
+  {@const u = usage[h.id] ?? {}}
+  {@const backupState = h.collector_status?.backup?.state}
+  {@const backupMessage = h.collector_status?.backup?.message}
+  {@const showBackupAgentBadge = !storageNodeIds.has(h.id)}
         <a href={`/hosts/${h.id}`}
-           class="group rounded-lg border border-zinc-800 hover:border-zinc-700 bg-zinc-900/40 hover:bg-zinc-900/70 p-4 transition-colors block">
+           class="group rounded-lg border bg-zinc-900/40 hover:bg-zinc-900/70 p-4 transition-colors block {tone === 'rose' ? 'border-rose-900/60 hover:border-rose-800' : tone === 'amber' ? 'border-amber-900/60 hover:border-amber-800' : 'border-zinc-800 hover:border-zinc-700'}">
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
               <div class="flex items-center gap-2 flex-wrap">
@@ -267,6 +371,9 @@
               <div class="mt-1 text-xs text-zinc-500 numeric">
                 {h.os || '—'}{h.arch ? ` · ${h.arch}` : ''} · seen {timeAgo(h.last_seen)}
               </div>
+              {#if reason}
+                <div class="mt-1.5 text-xs numeric {tone === 'rose' ? 'text-rose-300' : 'text-amber-300'}">{reason}</div>
+              {/if}
             </div>
           </div>
           <div class="mt-4 space-y-1.5">
@@ -275,7 +382,4 @@
             {@render usageBar('DISK', u.disk, u.diskOverall && u.diskUsed !== undefined && u.diskTotal !== undefined ? `${bytes(u.diskUsed)} of ${bytes(u.diskTotal)} used across local filesystems` : u.disk !== undefined ? `fullest mount at ${u.disk.toFixed(0)}%` : undefined)}
           </div>
         </a>
-      {/each}
-    </div>
-  {/if}
-</div>
+{/snippet}

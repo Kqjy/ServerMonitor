@@ -277,10 +277,16 @@
             class="hover:bg-zinc-900/60 cursor-pointer {open ? 'bg-zinc-900/60' : ''}"
             onclick={() => onRowClick(p.pid)}>
             <td class="px-3 py-1.5 text-right text-zinc-500 numeric">
-              <span class="inline-flex items-center gap-1.5">
-                <svg viewBox="0 0 24 24" class="h-3 w-3 transition-transform {open ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+              <button
+                type="button"
+                onclick={(e) => { e.stopPropagation(); toggleExpand(p.pid); }}
+                aria-expanded={open}
+                aria-controls={open ? `process-detail-${p.pid}` : undefined}
+                aria-label={`${open ? 'Hide' : 'Show'} details for ${p.name}, pid ${p.pid}`}
+                class="inline-flex items-center gap-1.5 rounded px-1 -mx-1 py-0.5 -my-0.5 hover:text-zinc-300 transition-colors">
+                <svg viewBox="0 0 24 24" aria-hidden="true" class="h-3 w-3 transition-transform {open ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
                 {p.pid}
-              </span>
+              </button>
             </td>
             <td class="px-3 py-1.5 text-zinc-200 font-mono text-xs whitespace-nowrap">{p.name}</td>
             <td class="px-3 py-1.5 text-zinc-500 text-xs whitespace-nowrap">{p.user || ''}</td>
@@ -292,7 +298,7 @@
           </tr>
           {#if open}
             <tr class="bg-zinc-950/60">
-              <td colspan="6" class="p-0">
+              <td colspan="6" class="p-0" id={`process-detail-${p.pid}`}>
                 <ProcessDetail {hostId} {sampleIntervalS} pid={p.pid} name={p.name} at={atMs ?? lastDataMs} live={isLive} />
               </td>
             </tr>

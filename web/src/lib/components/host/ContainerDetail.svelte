@@ -2,10 +2,28 @@
   import { onDestroy, untrack } from 'svelte';
   import { api, type ContainerSeriesPoint } from '$lib/api';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
-  import { bytes } from '$lib/format';
+  import { bytes, pct } from '$lib/format';
   import { chooseStepSec, loadPresetWin, savePresetWin } from '$lib/time';
 
-  let { hostId, cid, at = null, pinned = false, sampleIntervalS = 10 }: { hostId: number; cid: string; at?: number | null; pinned?: boolean; sampleIntervalS?: number } = $props();
+  let {
+    hostId,
+    cid,
+    name = '',
+    image = '',
+    memLimit = null,
+    at = null,
+    pinned = false,
+    sampleIntervalS = 10
+  }: {
+    hostId: number;
+    cid: string;
+    name?: string;
+    image?: string;
+    memLimit?: number | null;
+    at?: number | null;
+    pinned?: boolean;
+    sampleIntervalS?: number;
+  } = $props();
 
   type Win = '15m' | '1h' | '6h' | '24h';
   const windows: { key: Win; ms: number; label: string }[] = [
@@ -41,6 +59,7 @@
   let zoomFetched = false;
   let fetchGen = 0;
   const minDeltaMs = 1_000;
+  const exclusiveEndPadMs = 1;
 
   async function runFetch(from: Date, to: Date, masked: boolean) {
     const gen = ++fetchGen;
@@ -82,7 +101,7 @@
     lastWin = win;
     lastAt = at;
     lastPinned = pinned;
-    const to = new Date(anchor);
+    const to = new Date(anchor + exclusiveEndPadMs);
     const from = new Date(anchor - span);
     windowFromMs = from.getTime();
     windowToMs = to.getTime();
@@ -133,6 +152,20 @@
     }
   ]);
 
+  const peaks = $derived.by(() => {
+    let cpu = 0;
+    let mem = 0;
+    let net = 0;
+    for (const p of points) {
+      if (p.cpu_max > cpu) cpu = p.cpu_max;
+      if (p.mem_max > mem) mem = p.mem_max;
+      if (p.io_rate_max > net) net = p.io_rate_max;
+    }
+    return { cpu, mem, net, has: points.length > 0 };
+  });
+  const peakMemPct = $derived(memLimit && memLimit > 0 ? (peaks.mem / memLimit) * 100 : null);
+  const peakHint = 'Highest single sample in the window; the plotted line averages each bucket';
+
   const isZoomed = $derived(chartZoom !== null);
   function handleZoom(f: number, t: number) {
     chartZoom = { fromMs: f, toMs: t };
@@ -153,9 +186,10 @@
 </script>
 
 <div class="px-5 py-4 bg-zinc-950/60">
-  <div class="flex items-center justify-between mb-3">
-    <div class="text-[10px] uppercase tracking-wider text-zinc-500 font-mono">
-      {cid} · last {win}
+  <div class="flex flex-wrap items-start justify-between gap-2 mb-3">
+    <div class="min-w-0 font-mono text-xs">
+      <div class="truncate text-zinc-200" title={name || cid}>{name || cid}</div>
+      <div class="truncate text-[10px] text-zinc-500" title={image}>{cid}{image ? ` · ${image}` : ''}</div>
     </div>
     <div class="inline-flex rounded-md border border-zinc-800 overflow-hidden text-[11px]">
       {#each windows as w (w.key)}
@@ -171,7 +205,10 @@
 
   <div class="grid lg:grid-cols-3 gap-4">
     <div>
-      <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">CPU</div>
+      <div class="flex items-baseline justify-between mb-1">
+        <span class="text-[10px] uppercase tracking-wider text-zinc-500">CPU</span>
+        {#if peaks.has}<span class="numeric text-[10px] text-zinc-500" title={peakHint}>peak {pct(peaks.cpu, 1)}</span>{/if}
+      </div>
       <MultiChart
         series={cpuSeries}
         unit="%"
@@ -190,7 +227,16 @@
         emptyText="No samples in window" />
     </div>
     <div>
-      <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">Memory</div>
+      <div class="flex items-baseline justify-between mb-1">
+        <span class="text-[10px] uppercase tracking-wider text-zinc-500">Memory</span>
+        {#if peaks.has}
+          <span
+            title={peakHint}
+            class="numeric text-[10px] {peakMemPct !== null && peakMemPct > 90 ? 'text-rose-300' : peakMemPct !== null && peakMemPct > 75 ? 'text-amber-300' : 'text-zinc-500'}">
+            peak {bytes(peaks.mem)}{peakMemPct !== null ? ` · ${pct(peakMemPct, 0)} of limit` : ''}
+          </span>
+        {/if}
+      </div>
       <MultiChart
         series={memSeries}
         height={140}
@@ -207,7 +253,10 @@
         emptyText="No samples in window" />
     </div>
     <div>
-      <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">Net I/O</div>
+      <div class="flex items-baseline justify-between mb-1">
+        <span class="text-[10px] uppercase tracking-wider text-zinc-500">Net I/O</span>
+        {#if peaks.has}<span class="numeric text-[10px] text-zinc-500" title={peakHint}>peak {bytes(peaks.net)}/s</span>{/if}
+      </div>
       <MultiChart
         series={netSeries}
         height={140}

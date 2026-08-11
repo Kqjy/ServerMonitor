@@ -266,9 +266,12 @@ export interface ProcessSeriesResp {
 export interface ContainerSeriesPoint {
   ts: string;
   cpu_pct: number;
+  cpu_max: number;
   mem_used: number;
+  mem_max: number;
   rx_rate: number;
   tx_rate: number;
+  io_rate_max: number;
 }
 
 export interface ContainerSeriesResp {

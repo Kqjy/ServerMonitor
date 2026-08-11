@@ -98,7 +98,7 @@
             type="checkbox"
             bind:checked={autoUpgrade}
             disabled={host.externally_managed}
-            class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-emerald-500 focus:ring-emerald-500/40 focus:ring-offset-0 disabled:opacity-50 disabled:cursor-not-allowed"
+            class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <span class="text-xs text-zinc-300 leading-relaxed">
             {#if host.externally_managed}

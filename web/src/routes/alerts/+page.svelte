@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { api, type AlertRule, type AlertHistoryRow, type Channel } from '$lib/api';
   import { timeAgo, severityClass } from '$lib/format';
+  import { announcer } from '$lib/announce.svelte';
   import AlertRuleEditor from '$lib/components/AlertRuleEditor.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
@@ -54,6 +55,7 @@
     const result = await api.alertHistoryClear(clearOlderThanDays || undefined);
     await refresh();
     historyNotice = `Cleared ${result.deleted} ${result.deleted === 1 ? 'entry' : 'entries'}`;
+    announcer.say(historyNotice);
     if (historyNoticeTimer) clearTimeout(historyNoticeTimer);
     historyNoticeTimer = setTimeout(() => {
       historyNotice = null;

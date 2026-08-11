@@ -356,11 +356,14 @@ type processSeriesResp struct {
 }
 
 type containerPoint struct {
-	Ts      time.Time `json:"ts"`
-	CPUPct  float64   `json:"cpu_pct"`
-	MemUsed int64     `json:"mem_used"`
-	RxRate  float64   `json:"rx_rate"`
-	TxRate  float64   `json:"tx_rate"`
+	Ts        time.Time `json:"ts"`
+	CPUPct    float64   `json:"cpu_pct"`
+	CPUMax    float64   `json:"cpu_max"`
+	MemUsed   int64     `json:"mem_used"`
+	MemMax    int64     `json:"mem_max"`
+	RxRate    float64   `json:"rx_rate"`
+	TxRate    float64   `json:"tx_rate"`
+	IORateMax float64   `json:"io_rate_max"`
 }
 
 type containerSeriesResp struct {
@@ -550,18 +553,41 @@ func hostContainerSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.Handl
 		}
 
 		rows, err := db.Pool.Query(r.Context(), `
-			WITH bucketed AS (
+			WITH samples AS (
+			  SELECT time, cpu_pct, mem_used, rx_bytes, tx_bytes,
+			         lag(rx_bytes) OVER s AS rx_prev,
+			         lag(tx_bytes) OVER s AS tx_prev,
+			         EXTRACT(EPOCH FROM (time - lag(time) OVER s)) AS dt
+			  FROM containers
+			  WHERE host_id = $2 AND cid = $3 AND time >= $4 AND time < $5
+			  WINDOW s AS (ORDER BY time)
+			),
+			rated AS (
+			  SELECT time, cpu_pct, mem_used, rx_bytes, tx_bytes,
+			         CASE
+			           WHEN rx_bytes IS NULL OR rx_prev IS NULL OR dt IS NULL OR rx_bytes < rx_prev THEN 0
+			           ELSE (rx_bytes - rx_prev)::float8 / GREATEST(dt, 1)
+			         END
+			       + CASE
+			           WHEN tx_bytes IS NULL OR tx_prev IS NULL OR dt IS NULL OR tx_bytes < tx_prev THEN 0
+			           ELSE (tx_bytes - tx_prev)::float8 / GREATEST(dt, 1)
+			         END AS io_rate
+			  FROM samples
+			),
+			bucketed AS (
 			  SELECT time_bucket($1::interval, time) AS b,
 			         max(time) AS bmax,
 			         COALESCE(avg(cpu_pct), 0)::float8 AS cpu,
+			         COALESCE(max(cpu_pct), 0)::float8 AS cpu_max,
 			         COALESCE(avg(mem_used), 0)::bigint AS mem,
+			         COALESCE(max(mem_used), 0)::bigint AS mem_max,
+			         COALESCE(max(io_rate), 0)::float8 AS io_rate_max,
 			         last(rx_bytes, time) AS rx_last,
 			         last(tx_bytes, time) AS tx_last
-			  FROM containers
-			  WHERE host_id = $2 AND cid = $3 AND time >= $4 AND time < $5
+			  FROM rated
 			  GROUP BY b
 			)
-			SELECT b, cpu, mem,
+			SELECT b, cpu, cpu_max, mem, mem_max,
 			       CASE
 			         WHEN rx_last IS NULL OR lag(rx_last) OVER w IS NULL THEN 0
 			         WHEN rx_last < lag(rx_last) OVER w THEN 0
@@ -573,7 +599,8 @@ func hostContainerSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.Handl
 			         WHEN tx_last < lag(tx_last) OVER w THEN 0
 			         ELSE (tx_last - lag(tx_last) OVER w)::float8
 			              / GREATEST(EXTRACT(EPOCH FROM (bmax - lag(bmax) OVER w)), 1)
-			       END AS tx_rate
+			       END AS tx_rate,
+			       io_rate_max
 			FROM bucketed
 			WINDOW w AS (ORDER BY b)
 			ORDER BY b ASC
@@ -589,7 +616,7 @@ func hostContainerSeriesHandler(db *storage.DB, hosts *storage.Hosts) http.Handl
 		points := make([]containerPoint, 0, 256)
 		for rows.Next() {
 			var p containerPoint
-			if err := rows.Scan(&p.Ts, &p.CPUPct, &p.MemUsed, &p.RxRate, &p.TxRate); err != nil {
+			if err := rows.Scan(&p.Ts, &p.CPUPct, &p.CPUMax, &p.MemUsed, &p.MemMax, &p.RxRate, &p.TxRate, &p.IORateMax); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}

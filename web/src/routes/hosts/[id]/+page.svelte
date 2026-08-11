@@ -4,6 +4,7 @@
   import { api, type Host, type ActiveAlert } from '$lib/api';
   import { bytes, statusFor, timeAgo, severityClass, severityRank } from '$lib/format';
   import { subscribeAlerts } from '$lib/sse';
+  import { announcer } from '$lib/announce.svelte';
   import { rangeLabel, loadRange, saveRange, writeRangeToUrl, rangeEquals, type Range } from '$lib/time';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import Tabs from '$lib/components/Tabs.svelte';
@@ -48,6 +49,62 @@
     : `sudo bash -c "curl -fsSL ${installBaseUrl}/install.sh | bash"`);
   const agentPermsCommand = 'sudo chown root:root /usr/local/bin/sm-agent && sudo chmod 0755 /usr/local/bin/sm-agent';
 
+  type HealthTone = 'rose' | 'amber' | 'sky';
+  let healthOpen = $state(false);
+  let healthInitId = $state<number | null>(null);
+
+  const healthConditions = $derived.by(() => {
+    const out: { tone: HealthTone; headline: string }[] = [];
+    if (!host) return out;
+    if (backupAgentState === 'agent_perms') {
+      out.push({ tone: 'rose', headline: 'Backups blocked — the privileged agent copy is not executable' });
+    }
+    if (backupAgentState === 'stale_agent') {
+      out.push({ tone: 'amber', headline: 'The privileged backup agent copy is out of date' });
+    }
+    if (host.update_available) {
+      if (host.externally_managed) {
+        out.push({ tone: 'sky', headline: `Update to v${host.latest_agent_version} available — managed externally` });
+      } else if (host.upgrade_stalled) {
+        out.push({ tone: 'amber', headline: `Agent self-update failing — still on v${host.agent_version || '?'}` });
+      } else if (host.upgrading) {
+        out.push({ tone: 'sky', headline: `Updating agent to v${host.latest_agent_version}…` });
+      } else if (host.upgrade_pending) {
+        out.push({ tone: 'sky', headline: `Update to v${host.latest_agent_version} pending next check-in` });
+      } else if (!host.supports_remote_upgrade) {
+        out.push({ tone: 'amber', headline: 'Manual upgrade required (agent < v0.1.1)' });
+      } else {
+        out.push({ tone: 'sky', headline: `Update to v${host.latest_agent_version} available` });
+      }
+    }
+    return out;
+  });
+
+  const healthPrimary = $derived(healthConditions[0] ?? null);
+  const healthSecondaryCount = $derived(Math.max(0, healthConditions.length - 1));
+  const updateNeedsExplaining = $derived(
+    !!host?.update_available && (!!host.externally_managed || !!host.upgrade_stalled || !host.supports_remote_upgrade)
+  );
+  const hasHealthDetails = $derived(
+    updateNeedsExplaining || backupAgentState === 'stale_agent' || backupAgentState === 'agent_perms'
+  );
+  const healthToneClass = $derived(
+    healthPrimary?.tone === 'rose'
+      ? 'border-rose-900/50 bg-rose-950/20'
+      : healthPrimary?.tone === 'amber'
+        ? 'border-amber-900/50 bg-amber-950/20'
+        : 'border-sky-900/50 bg-sky-950/20'
+  );
+  const healthHeadlineClass = $derived(
+    healthPrimary?.tone === 'rose' ? 'text-rose-200' : healthPrimary?.tone === 'amber' ? 'text-amber-200' : 'text-sky-300'
+  );
+
+  $effect(() => {
+    if (!host || healthInitId === host.id) return;
+    healthInitId = host.id;
+    healthOpen = host.collector_status?.backup?.state === 'agent_perms';
+  });
+
   const tabs: { value: TabName; label: string }[] = [
     { value: 'overview', label: 'Overview' },
     { value: 'memory', label: 'Memory' },
@@ -88,6 +145,7 @@
       host = updated;
     } catch (e) {
       upgradeError = (e as Error).message;
+      announcer.say(`Update request failed: ${upgradeError}`);
     } finally {
       upgradeBusy = false;
     }
@@ -107,8 +165,10 @@
     try {
       await navigator.clipboard.writeText(command);
       agentHealthCopy = key;
+      announcer.say('Command copied to clipboard');
     } catch {
       agentHealthCopy = 'failed';
+      announcer.say('Could not copy the command to the clipboard');
     }
     agentHealthCopyTimer = setTimeout(() => (agentHealthCopy = 'idle'), 1500);
   }
@@ -162,6 +222,46 @@
   });
 </script>
 
+{#snippet updateActions(h: Host)}
+  {#if !h.externally_managed && h.upgrade_stalled && h.supports_remote_upgrade}
+    {#if h.upgrade_pending}
+      <span class="shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+        <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+        Pending next check-in
+      </span>
+    {:else}
+      <button
+        type="button"
+        onclick={requestUpgrade}
+        disabled={upgradeBusy}
+        class="shrink-0 px-2.5 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-200 hover:bg-amber-500/25 disabled:opacity-50">
+        {upgradeBusy ? 'Sending…' : 'Retry update'}
+      </button>
+    {/if}
+  {:else if !h.externally_managed && !h.upgrade_stalled && h.supports_remote_upgrade}
+    {#if h.upgrading}
+      <span class="shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+        <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+        Updating…
+      </span>
+    {:else if h.upgrade_pending}
+      <span class="shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
+        <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
+        Pending next check-in
+      </span>
+    {:else}
+      <button
+        type="button"
+        onclick={requestUpgrade}
+        disabled={upgradeBusy}
+        class="shrink-0 px-2.5 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/40 text-sky-200 hover:bg-sky-500/25 disabled:opacity-50">
+        {upgradeBusy ? 'Sending…' : 'Update now'}
+      </button>
+    {/if}
+    <span class="shrink-0 text-zinc-500">{h.auto_upgrade ? 'auto-update on' : 'auto-update off'}</span>
+  {/if}
+{/snippet}
+
 <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4 sm:py-6">
   <div class="mb-2">
     <a href="/" class="text-xs text-zinc-500 hover:text-zinc-300 transition-colors">← All hosts</a>
@@ -206,107 +306,79 @@
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
           {#if agentCpuPct !== null && agentRssBytes !== null}<span> · {agentCpuPct.toFixed(1)}% CPU · {bytes(agentRssBytes)}</span>{/if}
         </div>
-        {#if host.update_available || backupAgentState === 'stale_agent' || backupAgentState === 'agent_perms'}
-          <div class="mt-3 rounded-lg border px-4 py-3 {backupAgentState === 'agent_perms' && !host.update_available ? 'border-rose-900/50 bg-rose-950/20' : 'border-amber-900/50 bg-amber-950/20'}">
-            <div class="space-y-3">
-            {#if host.update_available}
-              <div class="flex flex-wrap items-center gap-2 text-xs">
-            <span class="text-sky-300">Update to v{host.latest_agent_version} available</span>
-            {#if host.externally_managed}
-              <span
-                class="text-zinc-400"
-                title="This agent runs from a container image (or a read-only filesystem) and cannot replace its own binary. Rebuild the agent image, bump SM_AGENT_IMAGE, and redeploy to update."
-              >
-                Managed externally — redeploy a new agent image to update
-              </span>
-            {:else if host.upgrade_stalled}
-              <span
-                class="text-amber-400"
-                title="The agent kept failing to replace its own binary — typically a read-only filesystem or a containerized deploy. Auto-update is paused. If this host runs the agent from a container image, redeploy a new image tag; otherwise re-run the install script or check the agent logs."
-              >
-                Self-update failing — still on v{host.agent_version || '?'}; redeploy or re-install to update
-              </span>
-              {#if host.supports_remote_upgrade}
-                {#if host.upgrade_pending}
-                  <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
-                    <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
-                    Pending next check-in
+        {#if healthPrimary}
+          <div class="mt-3 rounded-lg border {healthToneClass}">
+            <div class="flex items-start justify-between gap-3 px-4 py-2.5 text-xs">
+              <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+                <span class="inline-flex min-w-0 items-center gap-2 {healthHeadlineClass}">
+                  <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-current"></span>
+                  <span class="min-w-0">{healthPrimary.headline}</span>
+                </span>
+                {#if healthSecondaryCount > 0}
+                  <span class="shrink-0 rounded-full border border-zinc-700 bg-zinc-900/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-400 tabular-nums">
+                    +{healthSecondaryCount} more
                   </span>
-                {:else}
-                  <button
-                    type="button"
-                    onclick={requestUpgrade}
-                    disabled={upgradeBusy}
-                    class="px-2.5 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
-                  >
-                    {upgradeBusy ? 'Sending…' : 'Retry update'}
-                  </button>
                 {/if}
-              {/if}
-            {:else if host.supports_remote_upgrade}
-              {#if host.upgrading}
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
-                  <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
-                  Updating…
-                </span>
-              {:else if host.upgrade_pending}
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-sky-200 bg-sky-500/10 border border-sky-500/30">
-                  <span class="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse"></span>
-                  Pending next check-in
-                </span>
-              {:else}
+                {#if host.update_available}
+                  {@render updateActions(host)}
+                {/if}
+                {#if upgradeError}
+                  <span class="text-rose-300">{upgradeError}</span>
+                {/if}
+              </div>
+              {#if hasHealthDetails}
                 <button
                   type="button"
-                  onclick={requestUpgrade}
-                  disabled={upgradeBusy}
-                  class="px-2.5 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/40 text-sky-200 hover:bg-sky-500/25 disabled:opacity-50"
-                >
-                  {upgradeBusy ? 'Sending…' : 'Update now'}
+                  onclick={() => (healthOpen = !healthOpen)}
+                  aria-expanded={healthOpen}
+                  aria-controls="agent-health-details"
+                  class="shrink-0 inline-flex items-center gap-1 rounded-md px-2 py-1 text-zinc-300 hover:bg-zinc-800/50 transition-colors">
+                  <span>{healthOpen ? 'Hide details' : 'Details'}</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true" class="h-3 w-3 transition-transform {healthOpen ? 'rotate-180' : ''}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
                 </button>
               {/if}
-              {#if host.auto_upgrade}
-                <span class="text-zinc-500">auto-update on</span>
-              {:else}
-                <span class="text-zinc-500">auto-update off</span>
-              {/if}
-            {:else}
-              <span
-                class="text-amber-400"
-                title="Agent versions older than 0.1.1 cannot self-upgrade. Re-run the install script on this host."
-              >
-                Manual upgrade required (agent &lt; v0.1.1)
-              </span>
-            {/if}
-            {#if upgradeError}
-              <span class="text-rose-300">{upgradeError}</span>
-            {/if}
-              </div>
-            {/if}
-            {#if backupAgentState === 'stale_agent'}
-              <div class="text-xs text-amber-100/90 {host.update_available ? 'border-t border-amber-900/40 pt-3' : ''}">
-                <div>{backupAgentMessage}</div>
-                <div class="mt-1 text-amber-100/70">Re-run the install script to refresh the privileged backup agent copy.</div>
-                <div class="mt-2 flex items-center gap-2">
-                  <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{staleAgentInstallCommand}</code>
-                  <button type="button" onclick={() => copyAgentHealthCommand(staleAgentInstallCommand, 'stale')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
-                    {agentHealthCopy === 'stale' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
-                  </button>
-                </div>
-              </div>
-            {/if}
-            {#if backupAgentState === 'agent_perms'}
-              <div class="text-xs text-rose-100/90 {host.update_available ? 'rounded-md border border-rose-900/40 bg-rose-950/30 p-3' : ''}">
-                <div>{backupAgentMessage}</div>
-                <div class="mt-2 flex items-center gap-2">
-                  <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{agentPermsCommand}</code>
-                  <button type="button" onclick={() => copyAgentHealthCommand(agentPermsCommand, 'perms')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
-                    {agentHealthCopy === 'perms' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
-                  </button>
-                </div>
-                <div class="mt-2 text-rose-100/70">Upgrading the agent makes the privileged sync service repair this automatically going forward. Re-running the installer also fixes it.</div>
-              </div>
-            {/if}
             </div>
+            {#if healthOpen && hasHealthDetails}
+              <div id="agent-health-details" class="border-t border-zinc-800/60 px-4 py-3 space-y-3 text-xs">
+                {#if backupAgentState === 'agent_perms'}
+                  <div class="text-rose-100/90">
+                    <div>{backupAgentMessage}</div>
+                    <div class="mt-2 flex items-center gap-2">
+                      <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{agentPermsCommand}</code>
+                      <button type="button" onclick={() => copyAgentHealthCommand(agentPermsCommand, 'perms')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+                        {agentHealthCopy === 'perms' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
+                      </button>
+                    </div>
+                    <div class="mt-2 text-rose-100/70">Upgrading the agent makes the privileged sync service repair this automatically going forward. Re-running the installer also fixes it.</div>
+                  </div>
+                {/if}
+                {#if backupAgentState === 'stale_agent'}
+                  <div class="text-amber-100/90">
+                    <div>{backupAgentMessage}</div>
+                    <div class="mt-1 text-amber-100/70">Re-run the install script to refresh the privileged backup agent copy.</div>
+                    <div class="mt-2 flex items-center gap-2">
+                      <code class="min-w-0 flex-1 overflow-x-auto rounded-md bg-zinc-950/70 px-2.5 py-1.5 text-zinc-200 select-text">{staleAgentInstallCommand}</code>
+                      <button type="button" onclick={() => copyAgentHealthCommand(staleAgentInstallCommand, 'stale')} class="shrink-0 text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 {agentHealthCopy === 'failed' ? 'text-rose-300' : 'text-zinc-200'}">
+                        {agentHealthCopy === 'stale' ? 'copied' : agentHealthCopy === 'failed' ? 'copy failed' : 'copy'}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+                {#if updateNeedsExplaining}
+                  <div class="text-zinc-400">
+                    {#if host.externally_managed}
+                      This agent runs from a container image (or a read-only filesystem) and cannot replace its own binary. Rebuild the agent image, bump SM_AGENT_IMAGE, and redeploy to update.
+                    {:else if host.upgrade_stalled}
+                      The agent kept failing to replace its own binary — typically a read-only filesystem or a containerized deploy. Auto-update is paused. If this host runs the agent from a container image, redeploy a new image tag; otherwise re-run the install script or check the agent logs.
+                    {:else}
+                      Agent versions older than 0.1.1 cannot self-upgrade. Re-run the install script on this host.
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/if}
       </div>

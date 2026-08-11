@@ -4,6 +4,7 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { updated } from '$app/state';
   import { auth } from '$lib/auth.svelte';
+  import { announcer } from '$lib/announce.svelte';
 
   let { children } = $props();
 
@@ -27,6 +28,8 @@
     }
   });
 </script>
+
+<div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcer.message}</div>
 
 {#if updated.current}
   <div class="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-amber-800/60 bg-amber-950 px-4 py-2 text-xs text-amber-100" role="status">

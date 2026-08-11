@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, type Host, type RetentionResp, type StorageResp } from '$lib/api';
   import { statusFor, timeAgo, bytes } from '$lib/format';
+  import { announcer } from '$lib/announce.svelte';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import EditHostDialog from '$lib/components/EditHostDialog.svelte';
@@ -92,10 +93,12 @@
     pwInfo = null;
     if (pwNext.length < 8) {
       pwError = 'New password must be at least 8 characters.';
+      announcer.say(pwError);
       return;
     }
     if (pwNext !== pwConfirm) {
       pwError = 'New password and confirmation do not match.';
+      announcer.say(pwError);
       return;
     }
     pwBusy = true;
@@ -105,8 +108,10 @@
       pwNext = '';
       pwConfirm = '';
       pwInfo = 'Password updated. Other sessions have been signed out.';
+      announcer.say(pwInfo);
     } catch (err) {
       pwError = (err as Error).message;
+      announcer.say(`Password change failed: ${pwError}`);
     } finally {
       pwBusy = false;
     }
