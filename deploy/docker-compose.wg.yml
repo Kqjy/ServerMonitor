@@ -1,0 +1,4 @@
+services:
+  app:
+    ports:
+      - "${BACKUP_WG_PORT:-51820}:${BACKUP_WG_PORT:-51820}/udp"

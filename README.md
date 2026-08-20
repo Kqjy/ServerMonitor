@@ -32,10 +32,12 @@ Three loosely coupled services for a job that should be one process. Glances has
 ```bash
 cp deploy/.env.example deploy/.env
 $EDITOR deploy/.env
-docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.publish.yml --env-file deploy/.env up -d
 ```
 
 Then open `http://localhost:8080`. The first visit takes you to a setup wizard that creates the admin account.
+
+`docker-compose.yml` on its own publishes **no host ports** — the app and Postgres are reachable only over the Compose network, which is what a reverse proxy (Traefik, Caddy, Coolify, Dokploy) wants. `docker-compose.publish.yml` is what binds `${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}` on the host for the UI and `127.0.0.1:5432` for Postgres; drop it from the command when a proxy fronts the app, and the host-port collisions that break redeploys go away with it. Tunnel backups need their own UDP port on the host — add `-f deploy/docker-compose.wg.yml` when `BACKUP_WG_PORT` is set.
 
 The `.env` you must set:
 
