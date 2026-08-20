@@ -82,15 +82,23 @@ func (n *BackupNodes) UpdateEndpoint(ctx context.Context, hostID int64, udpPort 
 	return nil
 }
 
-func (n *BackupNodes) Demote(ctx context.Context, hostID int64) error {
+func (n *BackupNodes) HasActiveTargets(ctx context.Context, hostID int64) (bool, error) {
 	var targetCount int
 	err := n.db.Pool.QueryRow(ctx, `
 		SELECT count(*) FROM backup_targets WHERE node_host_id = $1 AND revoked_at IS NULL
 	`, hostID).Scan(&targetCount)
 	if err != nil {
+		return false, err
+	}
+	return targetCount > 0, nil
+}
+
+func (n *BackupNodes) Demote(ctx context.Context, hostID int64) error {
+	hasTargets, err := n.HasActiveTargets(ctx, hostID)
+	if err != nil {
 		return err
 	}
-	if targetCount > 0 {
+	if hasTargets {
 		return ErrNodeHasTargets
 	}
 	res, err := n.db.Pool.Exec(ctx, `DELETE FROM backup_nodes WHERE host_id = $1`, hostID)

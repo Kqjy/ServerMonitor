@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"servermonitor/internal/agent/transport"
 	"servermonitor/pkg/restserver"
 	"servermonitor/pkg/wgtunnel"
 	"servermonitor/pkg/wire"
@@ -75,6 +76,7 @@ func New(serverURL, token string, insecureSkip bool, dataDir string, logger *slo
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkip},
 			},
+			CheckRedirect: transport.RefuseRedirect,
 		},
 	}
 }
@@ -428,6 +430,9 @@ func (m *Manager) reportUsage(ctx context.Context) {
 		Error:   lastStartError,
 	}, nil); err != nil {
 		m.logger.Debug("backup node usage report failed", "err", err)
+		if rt != nil && len(entries) > 0 {
+			rt.registry.restoreDirty(entries)
+		}
 	}
 }
 
@@ -545,6 +550,16 @@ func (r *localRegistry) usageSnapshot() []wire.NodeUsageEntry {
 		t.dirty = false
 	}
 	return out
+}
+
+func (r *localRegistry) restoreDirty(entries []wire.NodeUsageEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range entries {
+		if t, ok := r.byName[e.Name]; ok {
+			t.dirty = true
+		}
+	}
 }
 
 func (r *localRegistry) ResolveTarget(ctx context.Context, repo, secret string) (int64, int64, int64, bool, error) {

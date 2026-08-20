@@ -321,7 +321,7 @@ func finishRepoStatus(status RepoStatus, opts Options, err error, logger *slog.L
 }
 
 func runBackupCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options, progress *backupProgress) (backupSummary, error) {
-	result, err := resticCommandStream(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos()), "backup", opts.HostRoot, opts, func(line []byte) {
+	result, err := resticCommandStream(ctx, cfg, repo, cacheDir, backupArgs(cfg, opts.goos(), opts.host()), "backup", opts.HostRoot, opts, func(line []byte) {
 		if update, ok := parseBackupProgressLine(line); ok && progress != nil {
 			progress.update(update)
 		}
@@ -349,8 +349,16 @@ func parseBackupProgressLine(line []byte) (backupProgressUpdate, bool) {
 	}, true
 }
 
+func snapshotsArgs(opts Options, extra ...string) []string {
+	args := []string{"snapshots", "--json"}
+	if host := opts.host(); host != "" {
+		args = append(args, "--host", host)
+	}
+	return append(args, extra...)
+}
+
 func runSnapshotsCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) ([]Snapshot, error) {
-	result, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"snapshots", "--json"}, opts)
+	result, err := resticCommand(ctx, cfg, repo, cacheDir, snapshotsArgs(opts), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -358,12 +366,15 @@ func runSnapshotsCommand(ctx context.Context, cfg Config, repo Repo, cacheDir st
 }
 
 func runForgetCommand(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) error {
-	_, err := resticCommandAction(ctx, cfg, repo, cacheDir, forgetArgs(effectiveRetention(cfg.Retention, repo.Retention)), "retention prune", opts)
+	_, err := resticCommandAction(ctx, cfg, repo, cacheDir, forgetArgs(effectiveRetention(cfg.Retention, repo.Retention), opts.host()), "retention prune", opts)
 	return err
 }
 
-func backupArgs(cfg Config, goos string) []string {
+func backupArgs(cfg Config, goos string, host string) []string {
 	args := []string{"backup", "--json"}
+	if host != "" {
+		args = append(args, "--host", host)
+	}
 	for _, exclude := range cfg.Excludes {
 		if exclude != "" {
 			args = append(args, "--exclude", exclude)
@@ -379,8 +390,11 @@ func backupArgs(cfg Config, goos string) []string {
 	return args
 }
 
-func forgetArgs(retention Retention) []string {
+func forgetArgs(retention Retention, host string) []string {
 	args := []string{"forget", "--prune", "--group-by", "host"}
+	if host != "" {
+		args = append(args, "--host", host)
+	}
 	if retention.Daily > 0 {
 		args = append(args, "--keep-daily", strconv.Itoa(retention.Daily))
 	}

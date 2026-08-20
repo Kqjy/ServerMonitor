@@ -45,6 +45,7 @@ type Config struct {
 	RetentionAggregate5m string
 	RetentionProcesses   string
 	RetentionContainers  string
+	RetentionPorts       string
 	CompressionAfter     string
 	TrustedProxies       []*net.IPNet
 	TLSCertFile          string
@@ -121,6 +122,7 @@ func Load() (*Config, error) {
 		RetentionAggregate5m: getenv("RETENTION_AGGREGATE_5M", "6 months"),
 		RetentionProcesses:   getenv("RETENTION_PROCESSES", "7 days"),
 		RetentionContainers:  getenv("RETENTION_CONTAINERS", "30 days"),
+		RetentionPorts:       getenv("RETENTION_PORTS", "30 days"),
 		CompressionAfter:     getenv("COMPRESSION_AFTER", "7 days"),
 		TLSCertFile:          getenv("TLS_CERT_FILE", ""),
 		TLSKeyFile:           getenv("TLS_KEY_FILE", ""),
@@ -184,6 +186,7 @@ func Load() (*Config, error) {
 		{"RETENTION_AGGREGATE_5M", c.RetentionAggregate5m},
 		{"RETENTION_PROCESSES", c.RetentionProcesses},
 		{"RETENTION_CONTAINERS", c.RetentionContainers},
+		{"RETENTION_PORTS", c.RetentionPorts},
 		{"COMPRESSION_AFTER", c.CompressionAfter},
 	} {
 		if err := ValidateInterval(p.value); err != nil {
@@ -337,6 +340,8 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
+func EnvBool(key string, def bool) bool { return getenvBool(key, def) }
 
 func getenvBool(key string, def bool) bool {
 	v := strings.TrimSpace(os.Getenv(key))

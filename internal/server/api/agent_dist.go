@@ -47,6 +47,10 @@ func downloadAgentHandler(hosts *storage.Hosts, signer *agentsig.Signer) http.Ha
 				writeError(w, http.StatusGone, "host deregistered")
 				return
 			}
+			if errors.Is(err, storage.ErrArchived) {
+				writeError(w, http.StatusForbidden, "host archived")
+				return
+			}
 			if errors.Is(err, storage.ErrNotFound) {
 				writeError(w, http.StatusForbidden, "invalid agent token")
 				return

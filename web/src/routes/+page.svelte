@@ -12,11 +12,18 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let storageNodeIds = $state<Set<number>>(new Set());
+  let archived = $state<Host[]>([]);
+  let archivedExpanded = $state(false);
   let query = $state('');
   const visible = $derived(
     hosts
       .filter((h) => h.hostname.toLowerCase().includes(query.trim().toLowerCase()))
       .sort((a, b) => a.hostname.localeCompare(b.hostname, undefined, { sensitivity: 'base' }) || a.id - b.id)
+  );
+  const visibleArchived = $derived(
+    archived
+      .filter((h) => h.hostname.toLowerCase().includes(query.trim().toLowerCase()))
+      .sort((a, b) => (b.archived_at ?? '').localeCompare(a.archived_at ?? '') || a.id - b.id)
   );
   const attentionCap = 6;
   let attentionExpanded = $state(false);
@@ -125,8 +132,13 @@
 
   async function refreshHosts() {
     try {
-      const [list, nodeResp] = await Promise.all([api.hosts(), api.backupNodes().catch(() => null)]);
+      const [list, nodeResp, archivedList] = await Promise.all([
+        api.hosts(),
+        api.backupNodes().catch(() => null),
+        api.hosts('only').catch(() => null)
+      ]);
       hosts = list;
+      if (archivedList) archived = archivedList;
       if (nodeResp) storageNodeIds = new Set(nodeResp.nodes.map((n) => n.host_id));
       const fresh = list.filter((h) => usage[h.id] === undefined);
       if (fresh.length > 0) void loadUsage(fresh);
@@ -136,8 +148,13 @@
 
   async function bootstrap() {
     try {
-      const [list, nodeResp] = await Promise.all([api.hosts(), api.backupNodes().catch(() => null)]);
+      const [list, nodeResp, archivedList] = await Promise.all([
+        api.hosts(),
+        api.backupNodes().catch(() => null),
+        api.hosts('only').catch(() => null)
+      ]);
       hosts = list;
+      if (archivedList) archived = archivedList;
       if (nodeResp) storageNodeIds = new Set(nodeResp.nodes.map((n) => n.host_id));
       error = null;
       await loadUsage(list);
@@ -307,6 +324,43 @@
         {@render hostCard(h)}
       {/each}
     </div>
+  {/if}
+
+  {#if visibleArchived.length > 0}
+    <section class="mt-8 border-t border-zinc-800 pt-6">
+      <div class="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-xs uppercase tracking-wider text-zinc-400">
+          Archived <span class="text-zinc-600 tabular-nums">({visibleArchived.length})</span>
+        </h2>
+        <button
+          type="button"
+          onclick={() => (archivedExpanded = !archivedExpanded)}
+          aria-expanded={archivedExpanded}
+          class="rounded-md px-2 py-1 text-[11px] uppercase tracking-wider text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50 transition-colors">
+          {archivedExpanded ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {#if archivedExpanded}
+        <p class="mb-3 text-xs text-zinc-500">
+          Retired hosts. They no longer report, count toward fleet health, or evaluate alert rules — their recorded history stays browsable.
+        </p>
+        <div class="rounded-lg border border-zinc-800 divide-y divide-zinc-800/70 overflow-hidden">
+          {#each visibleArchived as h (h.id)}
+            <a
+              href={`/hosts/${h.id}`}
+              class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2.5 hover:bg-zinc-900/60 transition-colors">
+              <span class="flex min-w-0 items-center gap-2">
+                <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-600"></span>
+                <span class="truncate text-sm text-zinc-300">{h.hostname}</span>
+              </span>
+              <span class="text-xs text-zinc-500 numeric">
+                {h.os || '—'}{h.arch ? ` · ${h.arch}` : ''} · last seen {timeAgo(h.last_seen)} · archived {timeAgo(h.archived_at)}
+              </span>
+            </a>
+          {/each}
+        </div>
+      {/if}
+    </section>
   {/if}
 </div>
 

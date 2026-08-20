@@ -37,6 +37,9 @@
   let pickerOpen = $state(false);
   let upgradeBusy = $state(false);
   let upgradeError = $state<string | null>(null);
+  let restoreBusy = $state(false);
+  let restoreError = $state<string | null>(null);
+  const isArchived = $derived(!!host?.archived_at);
   let installBaseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
   let agentHealthCopy = $state<'idle' | 'stale' | 'perms' | 'failed'>('idle');
   let agentCpuPct = $state<number | null>(null);
@@ -160,6 +163,21 @@
     }
   }
 
+  async function restoreHost() {
+    if (!host || restoreBusy) return;
+    restoreBusy = true;
+    restoreError = null;
+    try {
+      host = await api.unarchiveHost(host.id);
+      announcer.say(`${host.hostname} restored to the fleet`);
+    } catch (e) {
+      restoreError = (e as Error).message;
+      announcer.say(restoreError);
+    } finally {
+      restoreBusy = false;
+    }
+  }
+
   async function copyAgentHealthCommand(command: string, key: 'stale' | 'perms') {
     if (agentHealthCopyTimer) clearTimeout(agentHealthCopyTimer);
     try {
@@ -277,6 +295,31 @@
     {/if}
   {:else}
     {@const s = statusFor(host.last_seen, host.sample_interval_s || 10)}
+    {#if isArchived}
+      <div class="mb-4 rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">
+              <span class="h-2 w-2 shrink-0 rounded-full bg-zinc-500"></span>
+              Archived {timeAgo(host.archived_at)}
+            </div>
+            <p class="mt-1 text-xs text-zinc-500">
+              This host is retired. It is excluded from the fleet list, alert evaluation, and agent updates, and its agent's uploads are refused. Everything below is its recorded history.
+            </p>
+          </div>
+          <button
+            type="button"
+            onclick={restoreHost}
+            disabled={restoreBusy}
+            class="shrink-0 rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 transition-colors hover:bg-zinc-800/60 hover:text-zinc-100 disabled:opacity-50">
+            {restoreBusy ? 'Restoring…' : 'Restore to fleet'}
+          </button>
+        </div>
+        {#if restoreError}
+          <p class="mt-2 text-xs text-rose-300">{restoreError}</p>
+        {/if}
+      </div>
+    {/if}
     {#if activeAlerts.length > 0}
       <div class="mb-4 rounded-lg border px-4 py-3 {severityClass(topSeverity, 'banner')}">
         <div class="flex items-center gap-2 text-sm font-medium">
@@ -298,15 +341,19 @@
     <div class="flex flex-wrap items-end gap-x-6 gap-y-3 mb-4">
       <div class="min-w-0 flex-1">
         <h1 class="flex items-baseline gap-3 text-xl sm:text-2xl font-semibold tracking-tight">
-          <StatusDot status={s} size="lg" />
-          <span class="truncate">{host.hostname}</span>
+          {#if isArchived}
+            <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-600"></span>
+          {:else}
+            <StatusDot status={s} size="lg" />
+          {/if}
+          <span class="truncate {isArchived ? 'text-zinc-400' : ''}">{host.hostname}</span>
         </h1>
         <div class="mt-1 text-[11px] sm:text-xs text-zinc-500 numeric break-words">
           {host.os || '—'}{host.arch ? ` · ${host.arch}` : ''}{host.kernel ? ` · ${host.kernel}` : ''}
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
           {#if agentCpuPct !== null && agentRssBytes !== null}<span> · {agentCpuPct.toFixed(1)}% CPU · {bytes(agentRssBytes)}</span>{/if}
         </div>
-        {#if healthPrimary}
+        {#if healthPrimary && !isArchived}
           <div class="mt-3 rounded-lg border {healthToneClass}">
             <div class="flex items-start justify-between gap-3 px-4 py-2.5 text-xs">
               <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
@@ -410,6 +457,7 @@
           </div>
           <span class="h-4 w-px bg-zinc-800 shrink-0"></span>
         {/if}
+        {#if !isArchived}
         <button
           type="button"
           aria-label="Reconfigure agent"
@@ -435,6 +483,7 @@
           </svg>
           <span class="hidden sm:inline">Edit</span>
         </button>
+        {/if}
       </div>
     </div>
 

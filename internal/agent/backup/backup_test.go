@@ -666,7 +666,7 @@ func TestRunUsesRepoRetentionForForget(t *testing.T) {
 	}
 	runner := newFakeResticRunner()
 
-	if _, err := Run(context.Background(), cfg, Options{Runner: runner}); err != nil {
+	if _, err := Run(context.Background(), cfg, Options{Runner: runner, Host: "vps-a"}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -677,8 +677,8 @@ func TestRunUsesRepoRetentionForForget(t *testing.T) {
 		}
 	}
 	want := map[string][]string{
-		cfg.Repos[0].URL: {"forget", "--prune", "--group-by", "host", "--keep-daily", "30", "--keep-monthly", "6"},
-		cfg.Repos[1].URL: {"forget", "--prune", "--group-by", "host", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "2"},
+		cfg.Repos[0].URL: {"forget", "--prune", "--group-by", "host", "--host", "vps-a", "--keep-daily", "30", "--keep-monthly", "6"},
+		cfg.Repos[1].URL: {"forget", "--prune", "--group-by", "host", "--host", "vps-a", "--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "2"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forget args by repo = %#v, want %#v", got, want)
@@ -686,10 +686,26 @@ func TestRunUsesRepoRetentionForForget(t *testing.T) {
 }
 
 func TestForgetArgsOmitZeroRetentionValues(t *testing.T) {
-	got := forgetArgs(Retention{Daily: 0, Weekly: 4, Monthly: 0})
+	got := forgetArgs(Retention{Daily: 0, Weekly: 4, Monthly: 0}, "")
 	want := []string{"forget", "--prune", "--group-by", "host", "--keep-weekly", "4"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forget args = %#v, want %#v", got, want)
+	}
+}
+
+func TestForgetAndSnapshotsScopeToHost(t *testing.T) {
+	got := forgetArgs(Retention{Daily: 7}, "vps-a")
+	want := []string{"forget", "--prune", "--group-by", "host", "--host", "vps-a", "--keep-daily", "7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("forget args = %#v, want %#v", got, want)
+	}
+	snaps := snapshotsArgs(Options{Host: "vps-a"}, "--latest", "1")
+	wantSnaps := []string{"snapshots", "--json", "--host", "vps-a", "--latest", "1"}
+	if !reflect.DeepEqual(snaps, wantSnaps) {
+		t.Fatalf("snapshots args = %#v, want %#v", snaps, wantSnaps)
+	}
+	if backed := backupArgs(testConfig(t), "linux", "vps-a"); !containsArg(backed, "--host") {
+		t.Fatalf("backup args missing host scope: %#v", backed)
 	}
 }
 
@@ -713,14 +729,14 @@ func TestRunRepoRecordsScopeOnSuccessAndFailure(t *testing.T) {
 
 func TestBackupArgsPlatformFlags(t *testing.T) {
 	cfg := testConfig(t)
-	linuxArgs := backupArgs(cfg, "linux")
+	linuxArgs := backupArgs(cfg, "linux", "")
 	if !containsArg(linuxArgs, "--one-file-system") {
 		t.Fatalf("linux args missing one-file-system: %#v", linuxArgs)
 	}
 	if containsArg(linuxArgs, "--use-fs-snapshot") {
 		t.Fatalf("linux args should not include fs snapshot: %#v", linuxArgs)
 	}
-	windowsArgs := backupArgs(cfg, "windows")
+	windowsArgs := backupArgs(cfg, "windows", "")
 	if containsArg(windowsArgs, "--one-file-system") {
 		t.Fatalf("windows args should not include one-file-system: %#v", windowsArgs)
 	}

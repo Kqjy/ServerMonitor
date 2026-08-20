@@ -137,6 +137,14 @@
       error = 'Name is required';
       return;
     }
+    if (scopeMode === 'ids' && scopeIds.length === 0) {
+      error = 'Select at least one host, or switch the scope to All hosts';
+      return;
+    }
+    if (scopeMode === 'tags' && Object.keys(parsePairs(scopeTagsText)).length === 0) {
+      error = 'Enter at least one key=value tag, or switch the scope to All hosts';
+      return;
+    }
     busy = true;
     error = null;
     const payload: AlertRuleInput = {

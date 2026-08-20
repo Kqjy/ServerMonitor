@@ -19,6 +19,7 @@ import (
 var (
 	ErrNotFound      = errors.New("not found")
 	ErrTombstoned    = errors.New("host deregistered")
+	ErrArchived      = errors.New("host archived")
 	ErrHostnameTaken = errors.New("hostname already in use")
 )
 
@@ -41,6 +42,7 @@ type Host struct {
 	LastSeen            *time.Time
 	CreatedAt           time.Time
 	DeletedAt           *time.Time
+	ArchivedAt          *time.Time
 	AutoUpgrade         bool
 	UpgradeRequestedAt  *time.Time
 	ExternallyManaged   bool
@@ -56,19 +58,22 @@ func tokenHash(token string) []byte {
 type Hosts struct {
 	db *DB
 
-	mu       sync.RWMutex
-	byToken  map[[32]byte]int64
-	byID     map[int64]Host
-	cachedAt time.Time
-	cacheTTL time.Duration
+	mu           sync.RWMutex
+	byToken      map[[32]byte]int64
+	byID         map[int64]Host
+	cachedAt     time.Time
+	cacheTTL     time.Duration
+	missRefresh  time.Time
+	missCooldown time.Duration
 }
 
 func NewHosts(db *DB) *Hosts {
 	return &Hosts{
-		db:       db,
-		byToken:  map[[32]byte]int64{},
-		byID:     map[int64]Host{},
-		cacheTTL: 30 * time.Second,
+		db:           db,
+		byToken:      map[[32]byte]int64{},
+		byID:         map[int64]Host{},
+		cacheTTL:     30 * time.Second,
+		missCooldown: time.Second,
 	}
 }
 
@@ -81,7 +86,7 @@ func (h *Hosts) Register(ctx context.Context, hostname, token string, intervalS 
 	err := h.db.Pool.QueryRow(ctx, `
 		INSERT INTO hosts (hostname, agent_token_hash, sample_interval_s)
 		VALUES ($1, $2, $3)
-		ON CONFLICT (hostname) WHERE deleted_at IS NULL
+		ON CONFLICT (hostname) WHERE deleted_at IS NULL AND archived_at IS NULL
 		DO UPDATE SET agent_token_hash = EXCLUDED.agent_token_hash,
 		              sample_interval_s = EXCLUDED.sample_interval_s
 		WHERE hosts.last_seen IS NULL
@@ -120,7 +125,7 @@ func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
 		    WHEN $4::boolean IS FALSE AND upgrade_requested_at IS NULL THEN NULL
 		    ELSE upgrade_dispatched_at
 		  END
-		WHERE id = $1 AND deleted_at IS NULL
+		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NULL
 	`, id, u.Hostname, u.SampleIntervalS, u.AutoUpgrade)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -139,7 +144,7 @@ func (h *Hosts) Update(ctx context.Context, id int64, u HostUpdate) error {
 func (h *Hosts) RequestUpgrade(ctx context.Context, id int64) error {
 	res, err := h.db.Pool.Exec(ctx, `
 		UPDATE hosts SET upgrade_requested_at = now(), upgrade_stall_since = NULL, upgrade_dispatched_at = NULL
-		WHERE id = $1 AND deleted_at IS NULL
+		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NULL
 	`, id)
 	if err != nil {
 		return err
@@ -178,6 +183,41 @@ func (h *Hosts) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (h *Hosts) Archive(ctx context.Context, id int64) error {
+	res, err := h.db.Pool.Exec(ctx, `
+		UPDATE hosts SET archived_at = now(), auto_upgrade = FALSE, upgrade_requested_at = NULL,
+		                 upgrade_stall_since = NULL, upgrade_dispatched_at = NULL
+		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NULL
+	`, id)
+	if err != nil {
+		return err
+	}
+	h.invalidate()
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (h *Hosts) Unarchive(ctx context.Context, id int64) error {
+	res, err := h.db.Pool.Exec(ctx, `
+		UPDATE hosts SET archived_at = NULL
+		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NOT NULL
+	`, id)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrHostnameTaken
+		}
+		return err
+	}
+	h.invalidate()
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (h *Hosts) ResolveToken(ctx context.Context, token string) (int64, error) {
 	candidate := tokenHash(token)
 
@@ -191,11 +231,17 @@ func (h *Hosts) ResolveToken(ctx context.Context, token string) (int64, error) {
 			if hostOK && host.DeletedAt != nil {
 				return 0, ErrTombstoned
 			}
+			if hostOK && host.ArchivedAt != nil {
+				return 0, ErrArchived
+			}
 			return id, nil
 		}
 	}
 	h.mu.RUnlock()
 
+	if !h.claimMissRefresh() {
+		return 0, ErrNotFound
+	}
 	if err := h.refresh(ctx); err != nil {
 		return 0, err
 	}
@@ -206,8 +252,13 @@ func (h *Hosts) ResolveToken(ctx context.Context, token string) (int64, error) {
 	if !hit {
 		return 0, ErrNotFound
 	}
-	if host, hostOK := h.byID[id]; hostOK && host.DeletedAt != nil {
-		return 0, ErrTombstoned
+	if host, hostOK := h.byID[id]; hostOK {
+		if host.DeletedAt != nil {
+			return 0, ErrTombstoned
+		}
+		if host.ArchivedAt != nil {
+			return 0, ErrArchived
+		}
 	}
 	return id, nil
 }
@@ -232,7 +283,7 @@ func (h *Hosts) refresh(ctx context.Context) error {
 		SELECT id, hostname, agent_token_hash, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(kernel,''), COALESCE(agent_version,''),
 		       sample_interval_s, enabled_collectors, tags, collector_status,
-		       last_seen, created_at, deleted_at,
+		       last_seen, created_at, deleted_at, archived_at,
 		       auto_upgrade, upgrade_requested_at, externally_managed, upgrade_stall_since,
 		       upgrade_dispatched_at
 		FROM hosts
@@ -255,7 +306,7 @@ func (h *Hosts) refresh(ctx context.Context) error {
 			&host.ID, &host.Hostname, &hash, &host.OS, &host.Arch,
 			&host.Kernel, &host.AgentVersion,
 			&host.SampleIntervalS, &host.EnabledCollectors, &tags, &collStatus,
-			&host.LastSeen, &host.CreatedAt, &host.DeletedAt,
+			&host.LastSeen, &host.CreatedAt, &host.DeletedAt, &host.ArchivedAt,
 			&host.AutoUpgrade, &host.UpgradeRequestedAt, &host.ExternallyManaged, &host.UpgradeStallSince,
 			&host.UpgradeDispatchedAt,
 		); err != nil {
@@ -284,9 +335,23 @@ func (h *Hosts) refresh(ctx context.Context) error {
 	return nil
 }
 
+func (h *Hosts) claimMissRefresh() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cachedAt.IsZero() {
+		return true
+	}
+	if time.Since(h.missRefresh) < h.missCooldown {
+		return false
+	}
+	h.missRefresh = time.Now()
+	return true
+}
+
 func (h *Hosts) invalidate() {
 	h.mu.Lock()
 	h.cachedAt = time.Time{}
+	h.missRefresh = time.Time{}
 	h.mu.Unlock()
 }
 
@@ -381,7 +446,7 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) (*time
 		    ELSE NULL
 		  END,
 		  last_seen = now()
-		WHERE id = $1 AND deleted_at IS NULL
+		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NULL
 		RETURNING upgrade_stall_since, upgrade_dispatched_at
 	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus, info.ExternallyManaged, info.ShouldSelfUpgrade).Scan(&stallSince, &dispatchedAt)
 	if err != nil {

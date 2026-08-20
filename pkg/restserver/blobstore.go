@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrExists   = errors.New("object already exists")
-	ErrNotFound = errors.New("object not found")
+	ErrExists     = errors.New("object already exists")
+	ErrNotFound   = errors.New("object not found")
+	ErrInvalidRef = errors.New("invalid object reference")
 )
 
 const configType = "config"
@@ -27,14 +28,14 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 func validName(s string) error {
 	if s == "" || s == "." || s == ".." || !nameRE.MatchString(s) {
-		return fmt.Errorf("invalid name %q", s)
+		return fmt.Errorf("%w: name %q", ErrInvalidRef, s)
 	}
 	return nil
 }
 
 func validType(typ string) error {
 	if !objectTypes[typ] {
-		return fmt.Errorf("invalid type %q", typ)
+		return fmt.Errorf("%w: type %q", ErrInvalidRef, typ)
 	}
 	return nil
 }
@@ -55,7 +56,7 @@ type Store interface {
 	Open(ctx context.Context, repo, typ, name string) (io.ReadSeekCloser, int64, error)
 	Stat(ctx context.Context, repo, typ, name string) (int64, error)
 	List(ctx context.Context, repo, typ string) ([]BlobInfo, error)
-	DeleteLock(ctx context.Context, repo, name string) error
+	DeleteLock(ctx context.Context, repo, name string) (int64, error)
 	RepoUsage(ctx context.Context, repo string) (int64, error)
 	RepoHasObjects(ctx context.Context, repo string) (bool, error)
 	Backend() BackendInfo

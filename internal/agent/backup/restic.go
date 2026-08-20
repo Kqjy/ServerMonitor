@@ -44,6 +44,7 @@ type Options struct {
 	ProgressInterval time.Duration
 	HostRoot         string
 	Containerized    bool
+	Host             string
 }
 
 func (ExecRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
@@ -364,6 +365,17 @@ func (o Options) goos() string {
 		return o.GOOS
 	}
 	return runtime.GOOS
+}
+
+func (o Options) host() string {
+	if strings.TrimSpace(o.Host) != "" {
+		return strings.TrimSpace(o.Host)
+	}
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(name)
 }
 
 func (o Options) progressInterval() time.Duration {

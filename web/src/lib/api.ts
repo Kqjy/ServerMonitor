@@ -24,6 +24,7 @@ export interface Host {
   tags?: Record<string, string>;
   last_seen?: string;
   created_at: string;
+  archived_at?: string;
   firing_alerts?: number;
   firing_severity?: 'info' | 'warning' | 'critical' | '';
 }
@@ -481,7 +482,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ current_password, new_password })
     }),
-  hosts: () => request<Host[]>('/api/v1/hosts'),
+  hosts: (scope?: 'include' | 'only') =>
+    request<Host[]>(`/api/v1/hosts${scope ? `?archived=${scope}` : ''}`),
   host: (id: number) => request<Host>(`/api/v1/hosts/${id}`),
   hostActiveAlerts: (id: number) => request<ActiveAlert[]>(`/api/v1/hosts/${id}/alerts/active`),
   series: (params: {
@@ -674,6 +676,10 @@ export const api = {
     request<Host>(`/api/v1/admin/hosts/${id}/upgrade`, { method: 'POST' }),
   deleteHost: (id: number) =>
     request<void>(`/api/v1/admin/hosts/${id}`, { method: 'DELETE' }),
+  archiveHost: (id: number) =>
+    request<Host>(`/api/v1/admin/hosts/${id}/archive`, { method: 'POST' }),
+  unarchiveHost: (id: number) =>
+    request<Host>(`/api/v1/admin/hosts/${id}/unarchive`, { method: 'POST' }),
   agentPlatforms: () => request<AgentPlatform[]>('/api/v1/agent/platforms'),
   serverInfo: () => request<ServerInfo>('/api/v1/server/info'),
   retention: () => request<RetentionResp>('/api/v1/retention'),

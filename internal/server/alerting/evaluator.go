@@ -338,14 +338,14 @@ type ruleHost struct {
 func (e *Engine) matchedHosts(ctx context.Context, r Rule) ([]ruleHost, error) {
 	switch {
 	case r.HostSelector.All:
-		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts`)
+		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts WHERE deleted_at IS NULL AND archived_at IS NULL`)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
 		return scanHosts(rows)
 	case len(r.HostSelector.IDs) > 0:
-		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts WHERE id = ANY($1)`, r.HostSelector.IDs)
+		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts WHERE id = ANY($1) AND deleted_at IS NULL AND archived_at IS NULL`, r.HostSelector.IDs)
 		if err != nil {
 			return nil, err
 		}
@@ -353,7 +353,7 @@ func (e *Engine) matchedHosts(ctx context.Context, r Rule) ([]ruleHost, error) {
 		return scanHosts(rows)
 	case len(r.HostSelector.Tags) > 0:
 		tags, _ := json.Marshal(r.HostSelector.Tags)
-		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts WHERE tags @> $1::jsonb`, tags)
+		rows, err := e.pool.Query(ctx, `SELECT id, hostname FROM hosts WHERE tags @> $1::jsonb AND deleted_at IS NULL AND archived_at IS NULL`, tags)
 		if err != nil {
 			return nil, err
 		}
@@ -465,13 +465,19 @@ func (e *Engine) transition(
 	now := time.Now()
 	switch {
 	case predicate && state == "ok":
-		_, err := e.pool.Exec(ctx, `
+		if _, err := e.pool.Exec(ctx, `
 			INSERT INTO alert_states (rule_id, host_id, label_key, state, since, last_value)
 			VALUES ($1, $2, $3, 'pending', now(), $4)
 			ON CONFLICT (rule_id, host_id, label_key) DO UPDATE
 			  SET state='pending', since=now(), last_value=EXCLUDED.last_value
-		`, r.ID, h.id, key, value)
-		return err
+		`, r.ID, h.id, key, value); err != nil {
+			return err
+		}
+		if r.ForS > 0 {
+			return nil
+		}
+		since = now
+		fallthrough
 
 	case predicate && state == "pending":
 		if now.Sub(since) < time.Duration(r.ForS)*time.Second {

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"servermonitor/internal/agent/transport"
 	"servermonitor/pkg/agentsig"
 	"servermonitor/pkg/version"
 )
@@ -95,6 +96,7 @@ func Run(ctx context.Context, opts Options) error {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkip},
 		},
+		CheckRedirect: transport.RefuseRedirect,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -446,15 +448,28 @@ func verifyStagedBinary(path string, want []byte) error {
 	return nil
 }
 
+func renameWithRetry(from, to string) error {
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		if err = os.Rename(from, to); err == nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return err
+}
+
 func swap(selfPath, newPath string) error {
 	if runtime.GOOS == "windows" {
 		oldPath := selfPath + ".old"
 		_ = os.Remove(oldPath)
-		if err := os.Rename(selfPath, oldPath); err != nil {
+		if err := renameWithRetry(selfPath, oldPath); err != nil {
 			return fmt.Errorf("rename running exe: %w", err)
 		}
-		if err := os.Rename(newPath, selfPath); err != nil {
-			_ = os.Rename(oldPath, selfPath)
+		if err := renameWithRetry(newPath, selfPath); err != nil {
+			if rollbackErr := renameWithRetry(oldPath, selfPath); rollbackErr != nil {
+				return fmt.Errorf("install new exe: %w; rollback also failed: %v; %s is missing, restore it by renaming %s (previous version) or %s (new version) back to it", err, rollbackErr, selfPath, oldPath, newPath)
+			}
 			return fmt.Errorf("install new exe: %w", err)
 		}
 		return nil

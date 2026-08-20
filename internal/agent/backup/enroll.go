@@ -15,6 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"servermonitor/internal/agent/transport"
 	"servermonitor/pkg/wgtunnel"
 	"servermonitor/pkg/wire"
 )
@@ -55,21 +56,37 @@ func EnsureTunnelEnrolled(ctx context.Context, configPath string, opts EnrollOpt
 		return err
 	}
 	settings := trimmedTunnel(raw.Tunnel)
+	usable := false
 	if settings != nil && settings.validate(needServer) == nil {
-		complete := true
+		usable = true
 		for _, host := range nodeHosts {
 			if settings.Node(host) == nil {
-				complete = false
+				usable = false
 				break
 			}
 		}
-		if complete {
-			return nil
-		}
+	}
+	if usable && tunnelEnrollmentFresh(configPath) {
+		return nil
 	}
 	opts.ConfigPath = configPath
-	_, err = TunnelEnroll(ctx, opts)
-	return err
+	if _, err = TunnelEnroll(ctx, opts); err != nil {
+		if usable {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+const tunnelRefreshInterval = 6 * time.Hour
+
+func tunnelEnrollmentFresh(configPath string) bool {
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) < tunnelRefreshInterval
 }
 
 func TunnelEnroll(ctx context.Context, opts EnrollOptions) (EnrollResult, error) {
@@ -115,6 +132,11 @@ func TunnelEnroll(ctx context.Context, opts EnrollOptions) (EnrollResult, error)
 		ServerIP:        resp.ServerTunnelIP,
 		RestPort:        resp.RestPort,
 		Nodes:           nodes,
+	}
+	if existing, existingErr := readRawConfig(opts.ConfigPath); existingErr == nil {
+		if prior := trimmedTunnel(existing.Tunnel); prior != nil && prior.MTU > 0 {
+			settings.MTU = prior.MTU
+		}
 	}
 	if err := settings.validate(needServer); err != nil {
 		return EnrollResult{}, fmt.Errorf("server returned an incomplete enrollment: %w", err)
@@ -237,6 +259,19 @@ func loadOrCreateTunnelKey(path string) (wgtunnel.Key, bool, error) {
 	return key, true, nil
 }
 
+func enrollClient(opts EnrollOptions) *http.Client {
+	if opts.HTTPClient != nil {
+		return opts.HTTPClient
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkip},
+		},
+		CheckRedirect: transport.RefuseRedirect,
+	}
+}
+
 func postEnroll(ctx context.Context, opts EnrollOptions, publicKey wgtunnel.Key) (wire.TunnelEnrollResponse, error) {
 	body, err := json.Marshal(wire.TunnelEnrollRequest{PublicKey: publicKey.String()})
 	if err != nil {
@@ -250,16 +285,7 @@ func postEnroll(ctx context.Context, opts EnrollOptions, publicKey wgtunnel.Key)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", opts.Token)
 
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkip},
-			},
-		}
-	}
-	resp, err := client.Do(req)
+	resp, err := enrollClient(opts).Do(req)
 	if err != nil {
 		return wire.TunnelEnrollResponse{}, fmt.Errorf("tunnel enroll request: %w", err)
 	}
@@ -282,16 +308,7 @@ func getJSON(ctx context.Context, opts EnrollOptions, path string, out any) erro
 		return err
 	}
 	req.Header.Set("X-Agent-Token", opts.Token)
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: opts.InsecureSkip},
-			},
-		}
-	}
-	resp, err := client.Do(req)
+	resp, err := enrollClient(opts).Do(req)
 	if err != nil {
 		return err
 	}
@@ -322,6 +339,9 @@ func writeTunnelSettings(configPath string, settings TunnelSettings) error {
 		"local_ip":          settings.LocalIP,
 		"server_ip":         settings.ServerIP,
 		"rest_port":         settings.RestPort,
+	}
+	if settings.MTU > 0 {
+		tunnelDoc["mtu"] = settings.MTU
 	}
 	if len(settings.Nodes) > 0 {
 		nodeDocs := make([]map[string]any, 0, len(settings.Nodes))

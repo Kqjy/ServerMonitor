@@ -205,15 +205,24 @@ func (d *diskStore) List(ctx context.Context, repo, typ string) ([]BlobInfo, err
 	return out, nil
 }
 
-func (d *diskStore) DeleteLock(ctx context.Context, repo, name string) error {
+func (d *diskStore) DeleteLock(ctx context.Context, repo, name string) (int64, error) {
 	path, err := d.objectPath(repo, "locks", name)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	var freed int64
+	if info, err := os.Lstat(path); err == nil {
+		freed = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, err
 	}
-	return nil
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return freed, nil
 }
 
 func (d *diskStore) RepoUsage(ctx context.Context, repo string) (int64, error) {

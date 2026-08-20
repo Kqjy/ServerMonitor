@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$KeepData
+    [switch]$KeepData,
+    [switch]$PurgeBackupKeys
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,9 +15,10 @@ function Assert-Elevated {
 }
 Assert-Elevated
 
-$syncTask = Get-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -ErrorAction SilentlyContinue
-if ($syncTask) {
-    Unregister-ScheduledTask -TaskName 'ServerMonitor Privileged Agent Sync' -Confirm:$false
+foreach ($taskName in @('ServerMonitor Privileged Agent Sync', 'ServerMonitor Backup', 'ServerMonitor Backup Check')) {
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
 }
 
 function Get-VirtualServiceSid {
@@ -66,10 +68,24 @@ Remove-Tree -Path $installDir
 
 Remove-Item -Force -Path (Join-Path $configDir 'deregistered') -ErrorAction SilentlyContinue
 
+$backupDir = Join-Path $configDir 'Backup'
+$keptBackupDir = $false
+
 if ($KeepData) {
     "keeping $configDir (agent.toml identity + spool.db)"
-} else {
+} elseif ($PurgeBackupKeys) {
     Remove-Tree -Path $configDir
+} else {
+    if (Test-Path -Path $configDir) {
+        Get-ChildItem -Path $configDir -Force | Where-Object { $_.FullName -ne $backupDir } | ForEach-Object {
+            Remove-Tree -Path $_.FullName
+        }
+    }
+    if (Test-Path -Path $backupDir) {
+        $keptBackupDir = $true
+    } else {
+        Remove-Tree -Path $configDir
+    }
 }
 
 if (Get-Service -Name 'sm-agent' -ErrorAction SilentlyContinue) {
@@ -79,5 +95,9 @@ if (Get-Service -Name 'sm-agent' -ErrorAction SilentlyContinue) {
 }
 if ($KeepData) {
     "config + spool retained; reinstall with install-agent-windows.ps1 to reuse this host identity"
+}
+if ($keptBackupDir) {
+    "kept $backupDir (backup.key, tunnel.key, recovery-kit.txt): deleting it makes existing encrypted snapshots unreadable forever."
+    "re-run with -PurgeBackupKeys once those snapshots are gone, or remove the folder by hand."
 }
 "note: this does not deregister the host on the server. Use Settings -> Remove in the web UI to drop its stored history."

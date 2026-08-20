@@ -192,6 +192,9 @@
   let selectedSnap = $state<string | null>(null);
   let includePaths = $state<string[]>([]);
   const snapSort = new TableSort<'time' | 'id'>('time');
+  const snapPageSizes = [8, 16, 50];
+  let snapPage = $state(0);
+  let snapPageSize = $state(snapPageSizes[0]);
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
   let browseOpen = $state(false);
@@ -512,6 +515,35 @@
   );
   const selectedSnapshot = $derived(activeSnapshots.find((s) => s.id === selectedSnap) ?? null);
 
+  const snapPageCount = $derived(Math.max(1, Math.ceil(sortedSnapshots.length / snapPageSize)));
+  const snapPageIndex = $derived(Math.min(Math.max(snapPage, 0), snapPageCount - 1));
+  const snapFrom = $derived(snapPageIndex * snapPageSize);
+  const snapTo = $derived(Math.min(snapFrom + snapPageSize, sortedSnapshots.length));
+  const pagedSnapshots = $derived(sortedSnapshots.slice(snapFrom, snapTo));
+
+  function clearSnapSelection() {
+    selectedSnap = null;
+    includePaths = [];
+    resetBrowser();
+  }
+
+  function gotoSnapPage(page: number) {
+    snapPage = Math.min(Math.max(page, 0), snapPageCount - 1);
+    clearSnapSelection();
+  }
+
+  function setSnapPageSize(size: number) {
+    snapPageSize = size;
+    snapPage = 0;
+    clearSnapSelection();
+  }
+
+  function sortSnapshots(key: 'time' | 'id') {
+    snapSort.toggle(key);
+    snapPage = 0;
+    clearSnapSelection();
+  }
+
   function selectSnapshot(s: BackupSnapshot) {
     if (selectedSnap === s.id) {
       selectedSnap = null;
@@ -526,6 +558,7 @@
 
   function selectRepo(repo: string) {
     selectedRepo = repo;
+    snapPage = 0;
     selectedSnap = null;
     includePaths = [];
     resetBrowser();
@@ -1131,10 +1164,10 @@
             <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
               <tr>
                 <th class="text-left font-medium px-4 sm:px-5 py-2.5 w-32" aria-sort={snapSort.ariaSort('id')}>
-                  <button type="button" onclick={() => snapSort.toggle('id')} class="uppercase tracking-wider hover:text-zinc-300">Snapshot{snapSort.indicator('id')}</button>
+                  <button type="button" onclick={() => sortSnapshots('id')} class="uppercase tracking-wider hover:text-zinc-300">Snapshot{snapSort.indicator('id')}</button>
                 </th>
                 <th class="text-left font-medium px-3 py-2.5" aria-sort={snapSort.ariaSort('time')}>
-                  <button type="button" onclick={() => snapSort.toggle('time')} class="uppercase tracking-wider hover:text-zinc-300">Time{snapSort.indicator('time')}</button>
+                  <button type="button" onclick={() => sortSnapshots('time')} class="uppercase tracking-wider hover:text-zinc-300">Time{snapSort.indicator('time')}</button>
                 </th>
                 <th class="text-right font-medium px-3 py-2.5">Size</th>
                 <th class="text-right font-medium px-3 py-2.5">Added</th>
@@ -1143,11 +1176,30 @@
               </tr>
             </thead>
             <tbody class="divide-y divide-zinc-800/70">
-              {#each sortedSnapshots as s (s.id)}
+              {#each pagedSnapshots as s (s.id)}
                 <tr
-                  class="cursor-pointer hover:bg-zinc-900/60 {selectedSnap === s.id ? 'bg-zinc-900/70' : ''}"
+                  class="cursor-pointer transition-colors hover:bg-zinc-900/60 {selectedSnap === s.id ? 'bg-sky-950/20' : ''}"
                   onclick={() => selectSnapshot(s)}>
-                  <td class="px-4 sm:px-5 py-2 font-mono text-zinc-100">{s.id}</td>
+                  <td class="px-4 sm:px-5 py-2 font-mono text-zinc-100">
+                    <button
+                      type="button"
+                      onclick={(event) => {
+                        event.stopPropagation();
+                        selectSnapshot(s);
+                      }}
+                      aria-expanded={selectedSnap === s.id}
+                      aria-controls={`snapshot-restore-${s.id}`}
+                      class="group inline-flex items-center gap-2 text-left">
+                      <svg
+                        aria-hidden="true"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        class="h-3 w-3 shrink-0 transition-transform {selectedSnap === s.id ? 'rotate-90 text-sky-400' : 'text-zinc-600 group-hover:text-zinc-400'}">
+                        <path d="M4 2.25 7.75 6 4 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                      <span>{s.id}</span>
+                    </button>
+                  </td>
                   <td class="px-3 py-2 text-zinc-300">
                     <span class="numeric">{absTime(s.time)}</span>
                     <span class="ml-2 hidden text-xs text-zinc-500 numeric sm:inline">{s.time ? timeAgo(s.time) : ''}</span>
@@ -1157,15 +1209,71 @@
                   <td class="hidden sm:table-cell px-3 py-2 text-right numeric text-zinc-300">{s.file_count == null ? '—' : optionalCount(s.file_count)}</td>
                   <td class="hidden sm:table-cell px-4 sm:px-5 py-2 text-xs text-zinc-400 font-mono truncate max-w-md" title={(s.paths ?? []).join('\n')}>{(s.paths ?? []).join(', ') || '—'}</td>
                 </tr>
+                {#if selectedSnap === s.id}
+                  <tr class="bg-zinc-950/30">
+                    <td colspan="6" class="p-0">
+                      {@render restorePanel(s)}
+                    </td>
+                  </tr>
+                {/if}
               {/each}
             </tbody>
           </table>
         </div>
 
-        {#if selectedSnapshot}
-          <div class="border-t border-zinc-800 px-4 sm:px-5 py-4 space-y-3">
+        {#if sortedSnapshots.length > snapPageSizes[0]}
+          <div class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-5 py-2.5 border-t border-zinc-800">
+            <div class="flex items-center gap-2">
+              <div class="text-[10px] uppercase tracking-wider text-zinc-500">Rows</div>
+              <div class="flex items-center gap-0.5">
+                {#each snapPageSizes as size (size)}
+                  <button
+                    type="button"
+                    onclick={() => setSnapPageSize(size)}
+                    aria-pressed={snapPageSize === size}
+                    class="px-2 py-1 rounded-md text-xs font-medium numeric transition-colors {snapPageSize === size ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">{size}</button>
+                {/each}
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <div class="text-xs text-zinc-500 numeric">{snapFrom + 1}–{snapTo} of {sortedSnapshots.length} · page {snapPageIndex + 1} of {snapPageCount}</div>
+              <button
+                type="button"
+                onclick={() => gotoSnapPage(snapPageIndex - 1)}
+                disabled={snapPageIndex === 0}
+                aria-label="Newer snapshots"
+                title="Newer"
+                class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
+                <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
+                  <path d="M8 2.25 4.25 6 8 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onclick={() => gotoSnapPage(snapPageIndex + 1)}
+                disabled={snapPageIndex >= snapPageCount - 1}
+                aria-label="Older snapshots"
+                title="Older"
+                class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
+                <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
+                  <path d="M4 2.25 7.75 6 4 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        {#snippet restorePanel(snapshot: BackupSnapshot)}
+          <div
+            id={`snapshot-restore-${snapshot.id}`}
+            role="region"
+            aria-label={`Restore options for snapshot ${snapshot.id}`}
+            class="sticky left-0 w-[calc(100vw-3rem)] border-l-2 border-sky-900/70 px-4 py-4 space-y-3 sm:static sm:w-auto sm:px-5">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="text-[11px] uppercase tracking-wider text-zinc-500">Restore command</div>
+              <div class="flex min-w-0 items-baseline gap-2">
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Restore command</div>
+                <div class="truncate font-mono text-[11px] text-zinc-400">{snapshot.id}</div>
+              </div>
               <button
                 type="button"
                 onclick={copyCommand}
@@ -1174,11 +1282,11 @@
               </button>
             </div>
 
-            {#if (selectedSnapshot.paths ?? []).length > 0}
+            {#if (snapshot.paths ?? []).length > 0}
               <div>
                 <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1.5">Include paths (optional)</div>
                 <div class="flex flex-wrap gap-1.5">
-                  {#each selectedSnapshot.paths ?? [] as p (p)}
+                  {#each snapshot.paths ?? [] as p (p)}
                     <button
                       type="button"
                       onclick={() => togglePath(p)}
@@ -1294,7 +1402,7 @@
               </section>
             {/if}
           </div>
-        {/if}
+        {/snippet}
       {/if}
     </section>
   {/if}

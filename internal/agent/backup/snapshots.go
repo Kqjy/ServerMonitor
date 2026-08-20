@@ -255,7 +255,7 @@ func ListSnapshots(ctx context.Context, cfg Config, repoName string, opts Option
 	}
 	result := SnapshotListResult{Repos: make([]SnapshotRepoResult, 0, len(targets))}
 	for _, repo := range targets {
-		commandResult, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"snapshots", "--json"}, opts)
+		commandResult, err := resticCommand(ctx, cfg, repo, cacheDir, snapshotsArgs(opts), opts)
 		entry := SnapshotRepoResult{Name: repo.Name, Raw: commandResult.Stdout}
 		if err != nil {
 			entry.Error = err.Error()

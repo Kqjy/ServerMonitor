@@ -13,6 +13,7 @@ type RetentionPolicies struct {
 	Aggregate5m   string
 	Processes     string
 	Containers    string
+	Ports         string
 	CompressAfter string
 }
 
@@ -33,6 +34,7 @@ func ApplyRetentionPolicies(ctx context.Context, pool *pgxpool.Pool, p Retention
 		{"metric_points_5m", "retention", p.Aggregate5m},
 		{"processes", "retention", p.Processes},
 		{"containers", "retention", p.Containers},
+		{"ports", "retention", p.Ports},
 	}
 
 	applied := make([]AppliedPolicy, 0, len(specs))

@@ -49,6 +49,7 @@ type hostDTO struct {
 	Tags                  map[string]string             `json:"tags,omitempty"`
 	LastSeenISO           string                        `json:"last_seen,omitempty"`
 	CreatedAtISO          string                        `json:"created_at"`
+	ArchivedAtISO         string                        `json:"archived_at,omitempty"`
 	FiringAlerts          int                           `json:"firing_alerts,omitempty"`
 	FiringSeverity        string                        `json:"firing_severity,omitempty"`
 }
@@ -95,6 +96,9 @@ func toDTO(h storage.Host) hostDTO {
 	}
 	if h.LastSeen != nil {
 		d.LastSeenISO = h.LastSeen.UTC().Format("2006-01-02T15:04:05Z")
+	}
+	if h.ArchivedAt != nil {
+		d.ArchivedAtISO = h.ArchivedAt.UTC().Format("2006-01-02T15:04:05Z")
 	}
 	return d
 }
@@ -189,8 +193,21 @@ func listHostsHandler(db *storage.DB, hosts *storage.Hosts) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, listErr.Error())
 			return
 		}
+		scope := r.URL.Query().Get("archived")
 		out := make([]hostDTO, 0, len(all))
 		for _, h := range all {
+			archived := h.ArchivedAt != nil
+			switch scope {
+			case "only":
+				if !archived {
+					continue
+				}
+			case "include":
+			default:
+				if archived {
+					continue
+				}
+			}
 			d := toDTO(h)
 			if f, ok := firing[h.ID]; ok {
 				d.FiringAlerts = f.Count
@@ -440,13 +457,89 @@ func requestHostUpgradeHandler(db *storage.DB, hosts *storage.Hosts) http.Handle
 	}
 }
 
-func deleteHostHandler(hosts *storage.Hosts, tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore) http.HandlerFunc {
+func archiveHostHandler(hosts *storage.Hosts, nodes *storage.BackupNodes) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idStr := chi.URLParam(r, "id")
 		id, err := strconv.ParseInt(idStr, 10, 64)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid id")
 			return
+		}
+		if nodes != nil {
+			hasTargets, targetsErr := nodes.HasActiveTargets(r.Context(), id)
+			if targetsErr != nil {
+				writeError(w, http.StatusInternalServerError, targetsErr.Error())
+				return
+			}
+			if hasTargets {
+				writeError(w, http.StatusConflict, storage.ErrNodeHasTargets.Error())
+				return
+			}
+		}
+		if err := hosts.Archive(r.Context(), id); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found or already archived")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		h, err := hosts.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, toDTO(h))
+	}
+}
+
+func unarchiveHostHandler(hosts *storage.Hosts) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if err := hosts.Unarchive(r.Context(), id); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found or not archived")
+				return
+			}
+			if errors.Is(err, storage.ErrHostnameTaken) {
+				writeError(w, http.StatusConflict, "another live host already uses that hostname")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		h, err := hosts.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, toDTO(h))
+	}
+}
+
+func deleteHostHandler(hosts *storage.Hosts, tunnel *restserver.Tunnel, peers *storage.BackupTunnelStore, nodes *storage.BackupNodes) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if nodes != nil {
+			hasTargets, targetsErr := nodes.HasActiveTargets(r.Context(), id)
+			if targetsErr != nil {
+				writeError(w, http.StatusInternalServerError, targetsErr.Error())
+				return
+			}
+			if hasTargets {
+				writeError(w, http.StatusConflict, storage.ErrNodeHasTargets.Error())
+				return
+			}
 		}
 		if err := hosts.Delete(r.Context(), id); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
@@ -455,6 +548,12 @@ func deleteHostHandler(hosts *storage.Hosts, tunnel *restserver.Tunnel, peers *s
 			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if nodes != nil {
+			if demoteErr := nodes.Demote(r.Context(), id); demoteErr != nil && !errors.Is(demoteErr, storage.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, demoteErr.Error())
+				return
+			}
 		}
 		if tunnel != nil && peers != nil {
 			if peer, peerErr := peers.GetPeer(r.Context(), id); peerErr == nil {

@@ -123,8 +123,8 @@ func TestPostBytesRefusesRedirect(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when the server redirects, got nil")
 	}
-	if !errors.Is(err, errUnexpectedRedirect) {
-		t.Fatalf("expected errUnexpectedRedirect, got %v", err)
+	if !errors.Is(err, ErrUnexpectedRedirect) {
+		t.Fatalf("expected ErrUnexpectedRedirect, got %v", err)
 	}
 	if !isRetryable(err) {
 		t.Fatalf("a redirect is a recoverable misconfiguration and must be retryable so data spools; got isRetryable=false for %v", err)

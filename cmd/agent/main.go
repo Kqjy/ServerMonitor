@@ -1184,6 +1184,7 @@ func callRegister(server, adminToken, hostname string, intervalS int, insecure b
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 		},
+		CheckRedirect: transport.RefuseRedirect,
 	}
 	url := strings.TrimRight(server, "/") + "/api/v1/admin/hosts"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))

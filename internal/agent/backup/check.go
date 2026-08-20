@@ -235,7 +235,7 @@ const (
 )
 
 func runDrill(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts Options) error {
-	snapResult, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"snapshots", "--json", "--latest", "1"}, opts)
+	snapResult, err := resticCommand(ctx, cfg, repo, cacheDir, snapshotsArgs(opts, "--latest", "1"), opts)
 	if err != nil {
 		return err
 	}

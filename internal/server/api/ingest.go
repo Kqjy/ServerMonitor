@@ -189,10 +189,13 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 				auto = false
 			}
 			ack.AutoUpgrade = &auto
-			if !selfUpgradeStalled && host.UpgradeRequestedAt != nil && version.IsNewer(version.Version, batch.Host.AgentVersion) {
-				ack.UpgradeNow = true
-				if clrErr := hosts.ClearUpgradeRequest(r.Context(), hostID); clrErr != nil {
-					logger.Warn("clear upgrade request", "host", hostID, "err", clrErr)
+			if host.UpgradeRequestedAt != nil {
+				if !version.IsNewer(version.Version, batch.Host.AgentVersion) {
+					if clrErr := hosts.ClearUpgradeRequest(r.Context(), hostID); clrErr != nil {
+						logger.Warn("clear upgrade request", "host", hostID, "err", clrErr)
+					}
+				} else if !selfUpgradeStalled {
+					ack.UpgradeNow = true
 				}
 			}
 		}

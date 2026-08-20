@@ -191,9 +191,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, repo strin
 		http.Error(w, "append-only: only locks may be removed", http.StatusForbidden)
 		return
 	}
-	if err := s.store.DeleteLock(r.Context(), repo, chi.URLParam(r, "name")); err != nil {
+	freed, err := s.store.DeleteLock(r.Context(), repo, chi.URLParam(r, "name"))
+	if err != nil {
 		s.storeError(w, err)
 		return
+	}
+	if freed > 0 {
+		if releaseErr := s.registry.ReleaseUsage(context.WithoutCancel(r.Context()), t.id, freed); releaseErr != nil {
+			s.logger.Warn("backup usage release after lock delete", "err", releaseErr)
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -242,7 +248,7 @@ func (s *Server) post(w http.ResponseWriter, r *http.Request, repo, typ, name st
 	body := http.MaxBytesReader(w, r.Body, r.ContentLength)
 	if err := s.store.Create(r.Context(), repo, typ, name, r.ContentLength, body); err != nil {
 		var maxErr *http.MaxBytesError
-		definitelyNotCommitted := errors.Is(err, ErrExists) || errors.As(err, &maxErr)
+		definitelyNotCommitted := errors.Is(err, ErrExists) || errors.Is(err, ErrInvalidRef) || errors.As(err, &maxErr)
 		if definitelyNotCommitted {
 			if releaseErr := s.registry.ReleaseUsage(context.WithoutCancel(r.Context()), t.id, r.ContentLength); releaseErr != nil {
 				s.logger.Warn("backup usage reservation release", "err", releaseErr)
@@ -270,6 +276,8 @@ func (s *Server) storeError(w http.ResponseWriter, err error) {
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, ErrExists):
 		http.Error(w, "object already exists", http.StatusForbidden)
+	case errors.Is(err, ErrInvalidRef):
+		http.Error(w, "invalid object reference", http.StatusBadRequest)
 	default:
 		s.logger.Warn("backup store error", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

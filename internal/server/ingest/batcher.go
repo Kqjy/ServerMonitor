@@ -28,18 +28,19 @@ type Row struct {
 }
 
 type Batcher struct {
-	pool      *pgxpool.Pool
-	in        chan Row
-	enqueueMu sync.Mutex
-	reserved  int
-	maxRows   int
-	maxAge    time.Duration
-	dropped   atomic.Uint64
-	flushed   atomic.Uint64
-	logger    *slog.Logger
-	wg        sync.WaitGroup
-	stopOnce  sync.Once
-	stopCh    chan struct{}
+	pool       *pgxpool.Pool
+	in         chan Row
+	enqueueMu  sync.Mutex
+	reserved   int
+	maxRows    int
+	retainRows int
+	maxAge     time.Duration
+	dropped    atomic.Uint64
+	flushed    atomic.Uint64
+	logger     *slog.Logger
+	wg         sync.WaitGroup
+	stopOnce   sync.Once
+	stopCh     chan struct{}
 }
 
 func NewBatcher(pool *pgxpool.Pool, maxRows int, maxAge time.Duration, logger *slog.Logger) *Batcher {
@@ -50,12 +51,13 @@ func NewBatcher(pool *pgxpool.Pool, maxRows int, maxAge time.Duration, logger *s
 		maxAge = 2 * time.Second
 	}
 	return &Batcher{
-		pool:    pool,
-		in:      make(chan Row, 200_000),
-		maxRows: maxRows,
-		maxAge:  maxAge,
-		logger:  logger,
-		stopCh:  make(chan struct{}),
+		pool:       pool,
+		in:         make(chan Row, 200_000),
+		maxRows:    maxRows,
+		retainRows: maxRows * 4,
+		maxAge:     maxAge,
+		logger:     logger,
+		stopCh:     make(chan struct{}),
 	}
 }
 
@@ -135,6 +137,7 @@ func (b *Batcher) loop(ctx context.Context) {
 	buf := make([]Row, 0, b.maxRows)
 	t := time.NewTimer(b.maxAge)
 	defer t.Stop()
+	var retryAt time.Time
 
 	flush := func(flushCtx context.Context) {
 		defer func() {
@@ -150,10 +153,17 @@ func (b *Batcher) loop(ctx context.Context) {
 			return
 		}
 		if err := b.copyRows(flushCtx, buf); err != nil {
-			b.logger.Error("ingest copy failed", "err", err, "rows", len(buf))
-		} else {
-			b.flushed.Add(uint64(len(buf)))
+			retryAt = time.Now().Add(b.maxAge)
+			if overflow := len(buf) - b.retainRows; overflow > 0 {
+				b.dropped.Add(uint64(overflow))
+				buf = append(buf[:0], buf[overflow:]...)
+				b.logger.Error("ingest copy failed, retained rows overflowed", "err", err, "dropped", overflow, "retained", len(buf))
+			} else {
+				b.logger.Error("ingest copy failed, rows retained for retry", "err", err, "rows", len(buf))
+			}
+			return
 		}
+		b.flushed.Add(uint64(len(buf)))
 		buf = buf[:0]
 	}
 
@@ -163,9 +173,15 @@ func (b *Batcher) loop(ctx context.Context) {
 			case r := <-b.in:
 				buf = append(buf, r)
 			default:
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				flush(shutdownCtx)
-				cancel()
+				for attempt := 0; attempt < 3 && len(buf) > 0; attempt++ {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					flush(shutdownCtx)
+					cancel()
+				}
+				if n := len(buf); n > 0 {
+					b.dropped.Add(uint64(n))
+					b.logger.Error("ingest shutdown could not flush rows", "rows", n)
+				}
 				return
 			}
 		}
@@ -181,7 +197,7 @@ func (b *Batcher) loop(ctx context.Context) {
 			return
 		case r := <-b.in:
 			buf = append(buf, r)
-			if len(buf) >= b.maxRows {
+			if len(buf) >= b.maxRows && !time.Now().Before(retryAt) {
 				flush(ctx)
 			}
 		case <-t.C:

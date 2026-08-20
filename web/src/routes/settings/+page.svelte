@@ -11,6 +11,7 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let toRemove = $state<Host | null>(null);
+  let toArchive = $state<Host | null>(null);
 
   let editing = $state<Host | null>(null);
 
@@ -54,7 +55,7 @@
 
   async function refresh() {
     try {
-      hosts = await api.hosts();
+      hosts = await api.hosts('include');
       error = null;
     } catch (e) {
       error = (e as Error).message;
@@ -77,6 +78,32 @@
       await refresh();
     } catch (e) {
       error = (e as Error).message;
+    }
+  }
+
+  async function doArchive() {
+    if (!toArchive) return;
+    const name = toArchive.hostname;
+    try {
+      await api.archiveHost(toArchive.id);
+      error = null;
+      announcer.say(`${name} archived`);
+      await refresh();
+    } catch (e) {
+      error = (e as Error).message;
+      announcer.say(error);
+    }
+  }
+
+  async function restore(h: Host) {
+    try {
+      await api.unarchiveHost(h.id);
+      error = null;
+      announcer.say(`${h.hostname} restored`);
+      await refresh();
+    } catch (e) {
+      error = (e as Error).message;
+      announcer.say(error);
     }
   }
 
@@ -158,11 +185,23 @@
           <tbody class="divide-y divide-zinc-800/70">
             {#each hosts as h (h.id)}
               {@const s = statusFor(h.last_seen, h.sample_interval_s || 10)}
-              <tr class="hover:bg-zinc-900/60">
+              {@const isArchived = !!h.archived_at}
+              <tr class="hover:bg-zinc-900/60 {isArchived ? 'bg-zinc-950/40' : ''}">
                 <td class="px-4 sm:px-5 py-2.5 whitespace-nowrap">
                   <div class="flex items-center gap-2">
-                    <StatusDot status={s} />
-                    <a href={`/hosts/${h.id}`} class="text-zinc-100 hover:underline">{h.hostname}</a>
+                    {#if isArchived}
+                      <span class="h-2 w-2 shrink-0 rounded-full bg-zinc-600"></span>
+                    {:else}
+                      <StatusDot status={s} />
+                    {/if}
+                    <a href={`/hosts/${h.id}`} class="{isArchived ? 'text-zinc-400' : 'text-zinc-100'} hover:underline">{h.hostname}</a>
+                    {#if isArchived}
+                      <span
+                        class="rounded-full border border-zinc-700 bg-zinc-800/40 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-zinc-400"
+                        title={`archived ${timeAgo(h.archived_at)}`}>
+                        archived
+                      </span>
+                    {/if}
                   </div>
                 </td>
                 <td class="px-3 py-2.5 text-zinc-400 font-mono text-xs whitespace-nowrap">{h.os || '—'}{h.arch ? ' · ' + h.arch : ''}</td>
@@ -170,17 +209,30 @@
                 <td class="px-3 py-2.5 text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(h.last_seen)}</td>
                 <td class="px-4 sm:px-5 py-2.5 text-xs whitespace-nowrap">
                   <div class="flex items-center gap-1">
-                    <button
-                      type="button"
-                      aria-label="Edit"
-                      title="Edit hostname and interval"
-                      onclick={() => (editing = h)}
-                      class="p-1.5 rounded-md hover:bg-zinc-800/60 text-zinc-400 hover:text-zinc-200">
-                      <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 20h9" />
-                        <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" />
-                      </svg>
-                    </button>
+                    {#if isArchived}
+                      <button
+                        type="button"
+                        title="Return this host to the fleet and let its agent report again"
+                        onclick={() => restore(h)}
+                        class="px-2 py-1 rounded-md hover:bg-zinc-800/60 text-zinc-300">Restore</button>
+                    {:else}
+                      <button
+                        type="button"
+                        aria-label="Edit"
+                        title="Edit hostname and interval"
+                        onclick={() => (editing = h)}
+                        class="p-1.5 rounded-md hover:bg-zinc-800/60 text-zinc-400 hover:text-zinc-200">
+                        <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M12 20h9" />
+                          <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        title="Retire this host but keep its history"
+                        onclick={() => (toArchive = h)}
+                        class="px-2 py-1 rounded-md hover:bg-zinc-800/60 text-zinc-300">Archive</button>
+                    {/if}
                     <button type="button" onclick={() => (toRemove = h)} class="px-2 py-1 rounded-md hover:bg-rose-950/40 text-rose-300">Remove</button>
                   </div>
                 </td>
@@ -440,7 +492,8 @@
         <span class="font-medium text-zinc-100">{toRemove.hostname}</span>
         <span class="text-xs text-zinc-500 numeric">· seen {timeAgo(toRemove.last_seen)}</span>
       </div>
-      <p>This stops accepting metrics from the agent immediately and drops the stored history.</p>
+      <p>This stops accepting metrics from the agent immediately and makes the stored history unreachable.</p>
+      <p class="mt-2 text-zinc-400">To retire a host that is gone for good but keep its charts, use <span class="text-zinc-200">Archive</span> instead.</p>
       <p class="mt-2 text-zinc-400">
         {#if rs === 'good'}
           The agent is currently live. It will self-terminate on its next upload attempt.
@@ -461,6 +514,36 @@
     danger
     onconfirm={doRemove}
     onclose={() => (toRemove = null)}
+  />
+
+  {#snippet archiveBody()}
+    {#if toArchive}
+      {@const as = statusFor(toArchive.last_seen, toArchive.sample_interval_s || 10)}
+      <div class="flex items-center gap-2 mb-3">
+        <StatusDot status={as} />
+        <span class="font-medium text-zinc-100">{toArchive.hostname}</span>
+        <span class="text-xs text-zinc-500 numeric">· seen {timeAgo(toArchive.last_seen)}</span>
+      </div>
+      <p>Its recorded history stays browsable. It drops out of the fleet list and counts, stops evaluating alert rules, and stops receiving agent updates.</p>
+      <p class="mt-2 text-zinc-400">
+        {#if as === 'good' || as === 'warn'}
+          The agent is still reporting. It will keep running but its uploads will be refused until you restore the host.
+        {:else}
+          The agent is offline. If it ever reconnects, its uploads will be refused until you restore the host.
+        {/if}
+      </p>
+      <p class="mt-2 text-zinc-400">Restoring is one click, and the hostname is freed for a replacement in the meantime.</p>
+      <p class="mt-2 text-zinc-500">Retention still applies: history ages out on the normal schedule.</p>
+    {/if}
+  {/snippet}
+
+  <ConfirmDialog
+    open={toArchive !== null}
+    title="Archive host"
+    body={archiveBody}
+    confirmLabel="Archive"
+    onconfirm={doArchive}
+    onclose={() => (toArchive = null)}
   />
 
   {#if editing}

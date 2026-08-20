@@ -34,6 +34,7 @@ const (
 var (
 	browseSnapshotPattern = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
 	errBrowseHostCap      = errors.New("too many backup browse jobs for this host")
+	errBrowseGlobalCap    = errors.New("all backup browse slots are busy; retry once a running browse finishes")
 )
 
 type browseJob struct {
@@ -88,9 +89,9 @@ func (s *browseStore) cleanupLocked(now time.Time) {
 	}
 }
 
-func (s *browseStore) makeRoomLocked() {
+func (s *browseStore) makeRoomLocked() bool {
 	if len(s.jobs) < browseGlobalCap {
-		return
+		return true
 	}
 	all := make([]*browseJob, 0, len(s.jobs))
 	for _, job := range s.jobs {
@@ -112,7 +113,11 @@ func (s *browseStore) makeRoomLocked() {
 		}
 		return iTime.Before(jTime)
 	})
+	if all[0].State != "done" && all[0].State != "failed" {
+		return false
+	}
 	delete(s.jobs, all[0].ID)
+	return true
 }
 
 func (s *browseStore) create(hostID int64, repo, snapshot, path string) (*browseJob, error) {
@@ -147,7 +152,9 @@ func (s *browseStore) create(hostID int64, repo, snapshot, path string) (*browse
 	if active >= browseHostCap {
 		return nil, errBrowseHostCap
 	}
-	s.makeRoomLocked()
+	if !s.makeRoomLocked() {
+		return nil, errBrowseGlobalCap
+	}
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
 		return nil, err
@@ -325,7 +332,7 @@ func createBackupBrowseHandlerWithRepoLookup(store *browseStore, hosts browseHos
 			return
 		}
 		job, err := store.create(hostID, body.Repo, body.Snapshot, body.Path)
-		if errors.Is(err, errBrowseHostCap) {
+		if errors.Is(err, errBrowseHostCap) || errors.Is(err, errBrowseGlobalCap) {
 			writeError(w, http.StatusTooManyRequests, err.Error())
 			return
 		}

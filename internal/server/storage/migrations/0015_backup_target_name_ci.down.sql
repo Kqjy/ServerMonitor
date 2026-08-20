@@ -1,0 +1,1 @@
+DROP INDEX backup_targets_name_lower_idx;

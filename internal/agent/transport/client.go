@@ -54,7 +54,7 @@ type ControlUpdate struct {
 
 var ErrDeregistered = errors.New("host deregistered by server")
 
-var errUnexpectedRedirect = errors.New("server responded with a redirect; set the agent server URL to the redirect's final destination so ingest POSTs are not silently downgraded to GET")
+var ErrUnexpectedRedirect = errors.New("server responded with a redirect; set the agent server URL to the redirect's final destination so requests are not silently downgraded and credentials are never forwarded to another origin")
 
 func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger *slog.Logger, sp *spool.Spool) *Client {
 	t := &http.Transport{
@@ -69,7 +69,7 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 		http: &http.Client{
 			Timeout:       timeout,
 			Transport:     t,
-			CheckRedirect: refuseRedirect,
+			CheckRedirect: RefuseRedirect,
 		},
 		logger:         logger,
 		spool:          sp,
@@ -80,8 +80,8 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 	}
 }
 
-func refuseRedirect(req *http.Request, via []*http.Request) error {
-	return fmt.Errorf("%w (redirect target %s)", errUnexpectedRedirect, req.URL)
+func RefuseRedirect(req *http.Request, via []*http.Request) error {
+	return fmt.Errorf("%w (redirect target %s)", ErrUnexpectedRedirect, req.URL)
 }
 
 func (c *Client) ControlUpdates() <-chan ControlUpdate {
@@ -310,6 +310,14 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 				select {
 				case c.intervalCh <- ack.IntervalS:
 				default:
+					select {
+					case <-c.intervalCh:
+					default:
+					}
+					select {
+					case c.intervalCh <- ack.IntervalS:
+					default:
+					}
 				}
 			}
 		}

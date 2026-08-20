@@ -102,6 +102,22 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 }
 
 func ensureBackupKey(path string) (bool, error) {
+	if info, err := os.Stat(path); err == nil {
+		if info.Size() > 0 {
+			return false, nil
+		}
+		if err := os.Remove(path); err != nil {
+			return false, fmt.Errorf("remove truncated backup key %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat backup key: %w", err)
+	}
+
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return false, err
+	}
+
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
@@ -109,12 +125,18 @@ func ensureBackupKey(path string) (bool, error) {
 		}
 		return false, fmt.Errorf("create backup key: %w", err)
 	}
-	defer file.Close()
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
+	if _, err := file.WriteString(base64.StdEncoding.EncodeToString(key) + "\n"); err != nil {
+		file.Close()
+		os.Remove(path)
 		return false, err
 	}
-	if _, err := file.WriteString(base64.StdEncoding.EncodeToString(key) + "\n"); err != nil {
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(path)
+		return false, err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
 		return false, err
 	}
 	return true, nil
@@ -350,18 +372,16 @@ func RenderRecoveryKit(configPath string) (string, error) {
 	b.WriteString("KEEP THIS SECRET AND OFFLINE. It holds the repository password that decrypts your backups.\n")
 	b.WriteString("Without it the backups are unrecoverable ciphertext, and it is never stored on the backup destination.\n\n")
 
-	pwPath := ""
-	for _, repo := range cfg.Repos {
-		if repo.PasswordFile != "" {
-			pwPath = repo.PasswordFile
-			break
-		}
+	passwordFiles, reposByPassword := groupReposByFile(cfg.Repos, func(r Repo) string { return r.PasswordFile })
+	if len(passwordFiles) == 0 {
+		b.WriteString("No repository password file is configured for any repository.\n\n")
 	}
-	if pwPath != "" {
-		if pw, err := os.ReadFile(pwPath); err == nil {
-			fmt.Fprintf(&b, "Repository password (contents of %s):\n\n    %s\n\n", pwPath, strings.TrimRight(string(pw), "\n"))
+	for _, path := range passwordFiles {
+		fmt.Fprintf(&b, "Repository password for %s (contents of %s):\n\n", strings.Join(reposByPassword[path], ", "), path)
+		if pw, err := os.ReadFile(path); err == nil {
+			fmt.Fprintf(&b, "    %s\n\n", strings.TrimRight(string(pw), "\n"))
 		} else {
-			fmt.Fprintf(&b, "Repository password file %s could not be read: %v\n\n", pwPath, err)
+			fmt.Fprintf(&b, "    <could not be read: %v>\n\n", err)
 		}
 	}
 
@@ -389,18 +409,30 @@ func RenderRecoveryKit(configPath string) (string, error) {
 		}
 	}
 
-	credsPath := filepath.Join(filepath.Dir(configPath), "repo-credentials.env")
-	if creds, readErr := os.ReadFile(credsPath); readErr == nil {
-		fmt.Fprintf(&b, "\nEndpoint credentials (KEEP THIS SECRET AND OFFLINE; contents of %s):\n\n    %s\n", credsPath, strings.ReplaceAll(strings.TrimRight(string(creds), "\n"), "\n", "\n    "))
-	} else if !os.IsNotExist(readErr) {
-		fmt.Fprintf(&b, "\nEndpoint credentials file %s could not be read: %v\n", credsPath, readErr)
+	credsFiles, reposByCreds := groupReposByFile(cfg.Repos, func(r Repo) string { return r.EnvFile })
+	conventionalCreds := filepath.Join(filepath.Dir(configPath), "repo-credentials.env")
+	if _, referenced := reposByCreds[conventionalCreds]; !referenced {
+		if _, statErr := os.Stat(conventionalCreds); statErr == nil {
+			credsFiles = append(credsFiles, conventionalCreds)
+		}
+	}
+	for _, path := range credsFiles {
+		owner := "no repository references this file"
+		if names := reposByCreds[path]; len(names) > 0 {
+			owner = strings.Join(names, ", ")
+		}
+		if creds, readErr := os.ReadFile(path); readErr == nil {
+			fmt.Fprintf(&b, "\nEndpoint credentials for %s (KEEP THIS SECRET AND OFFLINE; contents of %s):\n\n    %s\n", owner, path, strings.ReplaceAll(strings.TrimRight(string(creds), "\n"), "\n", "\n    "))
+		} else if !os.IsNotExist(readErr) {
+			fmt.Fprintf(&b, "\nEndpoint credentials file %s could not be read: %v\n", path, readErr)
+		}
 	}
 
 	b.WriteString("\nPer-repository restore instructions:\n")
 	for _, repo := range cfg.Repos {
 		fmt.Fprintf(&b, "\n%s:\n", repo.Name)
 		if repo.URL != "" {
-			b.WriteString("  export RESTIC_PASSWORD='<the password above>'\n")
+			fmt.Fprintf(&b, "  export RESTIC_PASSWORD='<%s above>'\n", passwordSource(repo))
 			fmt.Fprintf(&b, "  restic -r %s snapshots\n", repo.URL)
 			fmt.Fprintf(&b, "  restic -r %s restore latest --target /some/empty/dir\n", repo.URL)
 			continue
@@ -419,7 +451,7 @@ func RenderRecoveryKit(configPath string) (string, error) {
 		}
 		fmt.Fprintf(&b, "  1. The data physically lives on %s at endpoint %s.\n", location, endpoint)
 		fmt.Fprintf(&b, "  2. The endpoint exists only inside the ServerMonitor WireGuard tunnel. From this host, or any host holding this backup.toml and tunnel.key, run:\n     sm-agent backup proxy --config %s\n     The command brings the tunnel up and prints a local RESTIC_REPOSITORY URL.\n", configPath)
-		b.WriteString("  3. Export RESTIC_REST_USERNAME and RESTIC_REST_PASSWORD from the endpoint credentials above, export RESTIC_PASSWORD='<the password above>', then run:\n     restic -r \"$RESTIC_REPOSITORY\" snapshots\n     restic -r \"$RESTIC_REPOSITORY\" restore latest --target /some/empty/dir\n")
+		fmt.Fprintf(&b, "  3. Export RESTIC_REST_USERNAME and RESTIC_REST_PASSWORD from the endpoint credentials above, export RESTIC_PASSWORD='<%s above>', then run:\n     restic -r \"$RESTIC_REPOSITORY\" snapshots\n     restic -r \"$RESTIC_REPOSITORY\" restore latest --target /some/empty/dir\n", passwordSource(repo))
 		fmt.Fprintf(&b, "  4. If the original host is gone, install sm-agent on a recovery machine, register it with the same monitoring server, recreate backup.toml with tunnel_name = %q", repo.TunnelName)
 		if repo.TunnelNode != "" {
 			fmt.Fprintf(&b, " and tunnel_node = %q", repo.TunnelNode)
@@ -427,6 +459,29 @@ func RenderRecoveryKit(configPath string) (string, error) {
 		b.WriteString(", run sm-agent backup tunnel-enroll, then run the proxy command above.\n")
 	}
 	return b.String(), nil
+}
+
+func groupReposByFile(repos []Repo, pick func(Repo) string) ([]string, map[string][]string) {
+	order := []string{}
+	byFile := map[string][]string{}
+	for _, repo := range repos {
+		path := strings.TrimSpace(pick(repo))
+		if path == "" {
+			continue
+		}
+		if _, seen := byFile[path]; !seen {
+			order = append(order, path)
+		}
+		byFile[path] = append(byFile[path], repo.Name)
+	}
+	return order, byFile
+}
+
+func passwordSource(repo Repo) string {
+	if path := strings.TrimSpace(repo.PasswordFile); path != "" {
+		return "password for " + path
+	}
+	return "the password"
 }
 
 func isCredentialRepo(url string) bool {

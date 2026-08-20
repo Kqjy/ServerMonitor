@@ -11,6 +11,7 @@ type RetentionConfig struct {
 	Aggregate5m   string
 	Processes     string
 	Containers    string
+	Ports         string
 	CompressAfter string
 
 	RawCutoff         time.Duration
@@ -74,6 +75,15 @@ func retentionHandler(cfg RetentionConfig) http.HandlerFunc {
 					Configured:  cfg.Containers,
 					Default:     "30 days",
 					Description: "Docker container CPU / mem / I/O per tick. No-op on hosts without a Docker daemon.",
+				},
+				{
+					Key:         "ports",
+					Label:       "Listening port snapshots",
+					Target:      "ports",
+					Env:         "RETENTION_PORTS",
+					Configured:  cfg.Ports,
+					Default:     "30 days",
+					Description: "Open listening sockets per host per tick. Uncompressed and one row per port, so this table grows fast on busy hosts.",
 				},
 				{
 					Key:         "compression",

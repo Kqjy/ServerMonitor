@@ -219,16 +219,25 @@ func (s *s3Store) List(ctx context.Context, repo, typ string) ([]BlobInfo, error
 	return out, nil
 }
 
-func (s *s3Store) DeleteLock(ctx context.Context, repo, name string) error {
+func (s *s3Store) DeleteLock(ctx context.Context, repo, name string) (int64, error) {
 	key, err := s.key(repo, "locks", name)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	freed, err := s.Stat(ctx, repo, "locks", name)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return 0, err
+		}
+		freed = 0
+	}
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
-	})
-	return err
+	}); err != nil {
+		return 0, err
+	}
+	return freed, nil
 }
 
 func (s *s3Store) RepoUsage(ctx context.Context, repo string) (int64, error) {

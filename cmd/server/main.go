@@ -6,12 +6,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -93,6 +95,7 @@ func main() {
 		Aggregate5m:   cfg.RetentionAggregate5m,
 		Processes:     cfg.RetentionProcesses,
 		Containers:    cfg.RetentionContainers,
+		Ports:         cfg.RetentionPorts,
 		CompressAfter: cfg.CompressionAfter,
 	})
 	if err != nil {
@@ -297,6 +300,7 @@ func main() {
 			Aggregate5m:       cfg.RetentionAggregate5m,
 			Processes:         cfg.RetentionProcesses,
 			Containers:        cfg.RetentionContainers,
+			Ports:             cfg.RetentionPorts,
 			CompressAfter:     cfg.CompressionAfter,
 			RawCutoff:         config.IntervalToDuration(cfg.RetentionRaw),
 			Aggregate5mCutoff: config.IntervalToDuration(cfg.RetentionAggregate5m),
@@ -310,18 +314,23 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	listenErr := make(chan error, 1)
 	go func() {
+		fail := func(err error) {
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("listen", "err", err)
+				listenErr <- err
+				cancel()
+			}
+		}
 		switch {
 		case cfg.ServesTLS():
 			logger.Info("server listening (TLS)", "addr", cfg.HTTPAddr, "cert", cfg.TLSCertFile)
-			if err := srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("listen", "err", err)
-				cancel()
-			}
+			fail(srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile))
 		case cfg.ACMEEnabled():
 			cacheDir := cfg.ACMECacheDir
 			if cacheDir == "" {
-				cacheDir = "acme-certs"
+				cacheDir = defaultACMECacheDir(cfg)
 			}
 			mgr := &autocert.Manager{
 				Prompt:     autocert.AcceptTOS,
@@ -336,21 +345,15 @@ func main() {
 				}
 			}()
 			srv.TLSConfig = mgr.TLSConfig()
-			logger.Info("server listening (TLS via ACME)", "addr", cfg.HTTPAddr, "domain", cfg.BackupACMEDomain)
-			if err := srv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("listen", "err", err)
-				cancel()
-			}
+			logger.Info("server listening (TLS via ACME)", "addr", cfg.HTTPAddr, "domain", cfg.BackupACMEDomain, "cache", cacheDir)
+			fail(srv.ListenAndServeTLS("", ""))
 		default:
 			mode := "behind-tls-proxy"
 			if cfg.InsecureAllowHTTP {
 				mode = "INSECURE_ALLOW_HTTP"
 			}
 			logger.Info("server listening (plaintext)", "addr", cfg.HTTPAddr, "mode", mode)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("listen", "err", err)
-				cancel()
-			}
+			fail(srv.ListenAndServe())
 		}
 	}()
 
@@ -369,14 +372,31 @@ func main() {
 	if archiveScheduler != nil {
 		archiveScheduler.Stop()
 	}
+	select {
+	case err := <-listenErr:
+		logger.Error("exiting after listener failure", "err", err)
+		os.Exit(1)
+	default:
+	}
+}
+
+func defaultACMECacheDir(cfg *config.Config) string {
+	if key := strings.TrimSpace(cfg.AgentSigningKeyFile); key != "" {
+		if dir := filepath.Dir(key); dir != "" && dir != "." {
+			return filepath.Join(dir, "acme-certs")
+		}
+	}
+	return "acme-certs"
 }
 
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  sm-server                              run the server (env: DATABASE_URL, ADMIN_TOKEN, ...)")
-	fmt.Fprintln(os.Stderr, "  sm-server reset-password -username U -password P [-database-url URL]")
+	fmt.Fprintln(os.Stderr, "  sm-server reset-password -username U [-password-file F] [-database-url URL]")
 	fmt.Fprintln(os.Stderr, "    overwrite a user's password and invalidate all of their sessions.")
-	fmt.Fprintln(os.Stderr, "    -username defaults to admin; -password must be supplied; -database-url falls back to $DATABASE_URL.")
+	fmt.Fprintln(os.Stderr, "    -username defaults to admin; -database-url falls back to $DATABASE_URL.")
+	fmt.Fprintln(os.Stderr, "    supply the password via -password-file, piped stdin, or $SM_RESET_PASSWORD;")
+	fmt.Fprintln(os.Stderr, "    -password still works but leaks it into shell history and process listings.")
 	fmt.Fprintln(os.Stderr, "  sm-server healthz")
 	fmt.Fprintln(os.Stderr, "    probe /healthz on the local listener and exit 0 on 200; used by Docker HEALTHCHECK.")
 }
@@ -393,8 +413,10 @@ func healthzCmd() error {
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
+	servesTLS := strings.TrimSpace(os.Getenv("TLS_CERT_FILE")) != "" && strings.TrimSpace(os.Getenv("TLS_KEY_FILE")) != ""
+	acme := strings.TrimSpace(os.Getenv("BACKUP_ACME_DOMAIN")) != "" && !servesTLS && !config.EnvBool("TRUST_PROXY_TLS", false)
 	scheme := "http"
-	if strings.TrimSpace(os.Getenv("TLS_CERT_FILE")) != "" && strings.TrimSpace(os.Getenv("TLS_KEY_FILE")) != "" {
+	if servesTLS || acme {
 		scheme = "https"
 	}
 	url := fmt.Sprintf("%s://%s/healthz", scheme, net.JoinHostPort(host, port))
@@ -418,13 +440,15 @@ func healthzCmd() error {
 func resetPasswordCmd(args []string) error {
 	fs := flag.NewFlagSet("reset-password", flag.ContinueOnError)
 	username := fs.String("username", "admin", "username to reset")
-	password := fs.String("password", "", "new password (>=8 chars)")
+	password := fs.String("password", "", "new password (>=8 chars); exposes it in shell history and process listings, prefer -password-file or stdin")
+	passwordFile := fs.String("password-file", "", "read the new password from this file (first line)")
 	dbURL := fs.String("database-url", strings.TrimSpace(os.Getenv("DATABASE_URL")), "PostgreSQL DSN (defaults to $DATABASE_URL)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *password == "" {
-		return errors.New("-password is required")
+	newPassword, err := resolveResetPassword(*password, *passwordFile)
+	if err != nil {
+		return err
 	}
 	if *dbURL == "" {
 		return errors.New("DATABASE_URL not set and -database-url not provided")
@@ -439,7 +463,7 @@ func resetPasswordCmd(args []string) error {
 	}
 	defer db.Close()
 
-	if err := auth.New(db.Pool).ResetPassword(ctx, *username, *password); err != nil {
+	if err := auth.New(db.Pool).ResetPassword(ctx, *username, newPassword); err != nil {
 		if errors.Is(err, auth.ErrNoUser) {
 			return fmt.Errorf("no user named %q", *username)
 		}
@@ -447,6 +471,51 @@ func resetPasswordCmd(args []string) error {
 	}
 	fmt.Printf("password reset for user %q; all existing sessions invalidated\n", *username)
 	return nil
+}
+
+func resolveResetPassword(flagValue, file string) (string, error) {
+	sources := 0
+	if flagValue != "" {
+		sources++
+	}
+	if strings.TrimSpace(file) != "" {
+		sources++
+	}
+	envPassword := strings.TrimSpace(os.Getenv("SM_RESET_PASSWORD"))
+	if envPassword != "" {
+		sources++
+	}
+	if sources > 1 {
+		return "", errors.New("set only one of -password, -password-file, or SM_RESET_PASSWORD")
+	}
+	switch {
+	case flagValue != "":
+		return flagValue, nil
+	case envPassword != "":
+		return envPassword, nil
+	case strings.TrimSpace(file) != "":
+		data, err := os.ReadFile(strings.TrimSpace(file))
+		if err != nil {
+			return "", fmt.Errorf("read password file: %w", err)
+		}
+		line, _, _ := strings.Cut(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		if line == "" {
+			return "", errors.New("password file is empty")
+		}
+		return line, nil
+	}
+	stat, err := os.Stdin.Stat()
+	if err == nil && stat.Mode()&os.ModeCharDevice == 0 {
+		data, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		if err != nil {
+			return "", fmt.Errorf("read password from stdin: %w", err)
+		}
+		line, _, _ := strings.Cut(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		if line != "" {
+			return line, nil
+		}
+	}
+	return "", errors.New("no password supplied: use -password-file, pipe it on stdin, or set SM_RESET_PASSWORD")
 }
 
 func sessionSweeper(ctx context.Context, svc *auth.Service, logger *slog.Logger) {

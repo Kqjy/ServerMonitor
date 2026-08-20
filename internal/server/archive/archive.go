@@ -314,6 +314,31 @@ func (a *Archiver) CoverageIntervals(ctx context.Context, hostID int64, from, to
 	return out, rows.Err()
 }
 
+const archiveMemoryLimit = 64 << 20
+
+func archiveObjectReader(body io.Reader, contentLength *int64) (io.ReaderAt, func(), error) {
+	if contentLength != nil && *contentLength >= 0 && *contentLength <= archiveMemoryLimit {
+		buf := bytes.NewBuffer(make([]byte, 0, *contentLength))
+		if _, err := buf.ReadFrom(io.LimitReader(body, archiveMemoryLimit)); err != nil {
+			return nil, nil, err
+		}
+		return bytes.NewReader(buf.Bytes()), func() {}, nil
+	}
+	tmp, err := os.CreateTemp("", "sm-archive-*.parquet")
+	if err != nil {
+		return nil, nil, err
+	}
+	release := func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}
+	if _, err := io.Copy(tmp, body); err != nil {
+		release()
+		return nil, nil, err
+	}
+	return tmp, release, nil
+}
+
 func (a *Archiver) readKey(ctx context.Context, key string, hostID int64, metric int16, from, to time.Time, labelSel map[string]string) ([]Record, error) {
 	resp, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(a.cfg.Bucket),
@@ -323,11 +348,12 @@ func (a *Archiver) readKey(ctx context.Context, key string, hostID int64, metric
 		return nil, err
 	}
 	defer resp.Body.Close()
-	buf := bytes.NewBuffer(nil)
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
+	src, release, err := archiveObjectReader(resp.Body, resp.ContentLength)
+	if err != nil {
 		return nil, err
 	}
-	reader := parquet.NewGenericReader[Record](bytes.NewReader(buf.Bytes()))
+	defer release()
+	reader := parquet.NewGenericReader[Record](src)
 	defer reader.Close()
 	out := []Record{}
 	for {
