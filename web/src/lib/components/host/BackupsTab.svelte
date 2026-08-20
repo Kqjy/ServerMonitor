@@ -10,7 +10,7 @@
     type BackupNode
   } from '$lib/api';
   import { type Range } from '$lib/time';
-  import { bytes, timeAgo, timeUntil } from '$lib/format';
+  import { bytes, statusFor, timeAgo, timeUntil } from '$lib/format';
   import { TableSort } from '$lib/sort.svelte';
   import { chartPalette } from '$lib/components/MultiChart.svelte';
   import BackupBarChart, { type BarEvent } from '$lib/components/BackupBarChart.svelte';
@@ -77,6 +77,35 @@
       const resp = await api.backupNodes();
       nodes = resp.nodes;
     } catch {}
+  }
+
+  type NodeAvailability = 'removed' | 'archived' | 'offline' | null;
+
+  function nodeAvailability(node: BackupNode | null | undefined): NodeAvailability {
+    if (!node) return null;
+    if (node.host_missing) return 'removed';
+    if (node.archived) return 'archived';
+    if (statusFor(node.last_seen, node.sample_interval_s ?? 10) === 'bad') return 'offline';
+    return null;
+  }
+
+  function storageNodeForRepo(repo: string): BackupNode | null {
+    const target = endpoint?.targets.find((candidate) => candidate.host_id === hostId && candidate.name === repo);
+    if (target?.node_host_id == null) return null;
+    return nodes.find((node) => node.host_id === target.node_host_id) ?? null;
+  }
+
+  function condenseRepoError(error: string): string | null {
+    const lower = error.toLowerCase();
+    const reasons = ['connection reset by peer', 'connection refused', 'i/o timeout', 'no route to host', 'context deadline exceeded'];
+    const reason = reasons.find((candidate) => lower.includes(candidate));
+    const retryCount = error.match(/retrying after/gi)?.length ?? 0;
+    if (!reason && retryCount === 0) return null;
+    if (!reason) return `backup failed after ${retryCount} ${retryCount === 1 ? 'retry' : 'retries'}`;
+    const details: string[] = [];
+    details.push(reason);
+    if (retryCount > 0) details.push(`${retryCount} ${retryCount === 1 ? 'retry' : 'retries'}`);
+    return `backup failed: destination unreachable (${details.join('; ')})`;
   }
 
   const enableSnippet = $derived(
@@ -506,6 +535,7 @@
 
   const activeRepo = $derived(views.find((v) => v.repo === selectedRepo) ?? null);
   const activeSnapshots = $derived(activeRepo?.snapshots ?? []);
+  const selectedRepoNodeAvailability = $derived(nodeAvailability(storageNodeForRepo(selectedRepo)));
   const sortedSnapshots = $derived(
     snapSort.apply(
       activeSnapshots,
@@ -947,6 +977,9 @@
 
       <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-4 border-t border-zinc-800">
         {#each views as v (v.repo)}
+          {@const condensedError = v.error ? condenseRepoError(v.error) : null}
+          {@const storageNode = v.tunnel ? storageNodeForRepo(v.repo) : null}
+          {@const storageNodeAvailability = nodeAvailability(storageNode)}
           <section class="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
             <header class="flex items-center justify-between gap-3">
               <div class="min-w-0">
@@ -1008,7 +1041,20 @@
               </div>
             </div>
             {#if !v.success && v.error}
-              <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-2.5 py-1.5 text-xs text-rose-300 break-words">{v.error}</div>
+              {#if condensedError}
+                <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-2.5 py-1.5 text-xs text-rose-300 break-words">
+                  <div>{condensedError}</div>
+                  <details class="mt-1.5">
+                    <summary class="w-fit cursor-pointer select-none text-[11px] text-zinc-500 hover:text-zinc-300">full output</summary>
+                    <pre class="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words border-t border-zinc-800/80 pt-1.5 font-mono text-[11px] text-zinc-400 select-text">{v.error}</pre>
+                  </details>
+                </div>
+              {:else}
+                <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-2.5 py-1.5 text-xs text-rose-300 break-words">{v.error}</div>
+              {/if}
+              {#if storageNode && storageNodeAvailability}
+                <p class="mt-2 text-xs text-amber-300">The storage node <span class="font-mono">{storageNode.hostname || `node ${storageNode.host_id}`}</span> hosting this repository appears {storageNodeAvailability}{#if storageNodeAvailability === 'offline' && storageNode.last_seen}{' '}(last seen <span class="numeric">{timeAgo(storageNode.last_seen)}</span>){/if}.{' '}Reconfigure this host to back up to a new repository; if the node's disk is recoverable, its store directory can be copied to a new destination to keep this history.</p>
+              {/if}
             {/if}
           </section>
         {/each}
@@ -1152,6 +1198,10 @@
           </div>
         {/if}
       </header>
+
+      {#if selectedRepoNodeAvailability}
+        <p class="px-4 pt-3 text-xs text-amber-300 sm:px-5">Snapshot list as of the last successful backup — the destination is unreachable, so restore and browse will fail until the node is back or its store is relocated.</p>
+      {/if}
 
       {#if activeSnapshots.length === 0}
         <div class="p-12 text-center">

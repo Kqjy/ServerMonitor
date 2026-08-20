@@ -12,7 +12,7 @@
     type BackupRepoStatus,
     type Host
   } from '$lib/api';
-  import { bytes, timeAgo, timeUntil } from '$lib/format';
+  import { bytes, statusFor, timeAgo, timeUntil } from '$lib/format';
   import { subscribeHosts, type LivePoint } from '$lib/sse';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
@@ -60,6 +60,7 @@
   let rotated = $state<BackupCredential | null>(null);
   let toRevoke = $state<BackupTarget | null>(null);
   let toDelete = $state<BackupTarget | null>(null);
+  let retiredNodeTargetToDelete = $state<BackupTarget | null>(null);
   let toEditQuota = $state<BackupTarget | null>(null);
   let editQuotaGiB = $state<number | null>(null);
 
@@ -196,6 +197,7 @@
 
   const promotableHosts = $derived(hosts.filter((h) => !nodes.some((n) => n.host_id === h.id)));
   const selectedNode = $derived(newDestination === 'server' ? null : (nodes.find((n) => n.host_id === newDestination) ?? null));
+  const destinationReady = $derived(newDestination === 'server' ? (data?.configured ?? false) : selectedNode?.enrolled === true && nodeAvailability(selectedNode) === null);
 
   async function loadHosts() {
     try {
@@ -211,7 +213,7 @@
     newName = '';
     newHostId = hostId ?? null;
     newQuotaGiB = null;
-    newDestination = data?.configured ? 'server' : (nodes.find((n) => n.enrolled)?.host_id ?? nodes[0]?.host_id ?? 'server');
+    newDestination = data?.configured ? 'server' : (nodes.find((n) => n.enrolled && nodeAvailability(n) === null)?.host_id ?? nodes[0]?.host_id ?? 'server');
     credential = null;
     createError = null;
     firstBlobSeen = false;
@@ -237,6 +239,10 @@
   async function create() {
     if (!nameValid) {
       createError = 'Name must use only letters, digits, dot, dash or underscore.';
+      return;
+    }
+    if (!destinationReady) {
+      createError = 'Choose an available storage destination.';
       return;
     }
     if (newDestination !== 'server' && newHostId == null) {
@@ -321,6 +327,13 @@
     await load();
   }
 
+  async function doDeleteRetiredNodeTarget() {
+    if (!retiredNodeTargetToDelete) return;
+    await api.backupTargetDelete(retiredNodeTargetToDelete.id);
+    retiredNodeTargetToDelete = null;
+    await load();
+  }
+
   function openQuota(t: BackupTarget) {
     editQuotaGiB = t.quota_bytes ? Math.round((t.quota_bytes / 1024 ** 3) * 100) / 100 : null;
     toEditQuota = t;
@@ -352,24 +365,63 @@
     return 'bg-sky-500/70';
   }
 
+  type NodeAvailability = 'removed' | 'archived' | 'offline' | null;
+
+  function nodeAvailability(node: BackupNode | null | undefined): NodeAvailability {
+    if (!node) return null;
+    if (node.host_missing) return 'removed';
+    if (node.archived) return 'archived';
+    if (statusFor(node.last_seen, node.sample_interval_s ?? 10) === 'bad') return 'offline';
+    return null;
+  }
+
+  function availabilityText(availability: NodeAvailability): string {
+    return availability === 'archived' ? 'text-amber-300' : 'text-rose-300';
+  }
+
+  function availabilityDot(availability: NodeAvailability): string {
+    return availability === 'archived' ? 'bg-amber-400' : 'bg-rose-400';
+  }
+
+  function availabilityBadge(availability: NodeAvailability): string {
+    return availability === 'archived'
+      ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+      : 'border-rose-500/30 bg-rose-500/10 text-rose-300';
+  }
+
+  function nodeForTarget(target: BackupTarget): BackupNode | null {
+    if (target.node_host_id == null) return null;
+    return nodes.find((node) => node.host_id === target.node_host_id) ?? null;
+  }
+
   type HostBackup = {
     id: number;
     hostname: string;
     state: string;
     message?: string;
-    repos: string[];
+    repos: BackupTarget[];
+    revokedRepos: BackupTarget[];
+    nodeAvailability: NodeAvailability;
   };
 
   const reposByHost = $derived.by(() => {
-    const m = new Map<number, string[]>();
+    const m = new Map<number, BackupTarget[]>();
     for (const t of data?.targets ?? []) {
-      if (t.host_id == null || t.revoked_at) continue;
+      if (t.host_id == null) continue;
       const arr = m.get(t.host_id) ?? [];
-      arr.push(t.name);
+      arr.push(t);
       m.set(t.host_id, arr);
     }
     return m;
   });
+
+  function hostNodeAvailability(repos: BackupTarget[]): NodeAvailability {
+    const values = repos.map((repo) => nodeAvailability(nodeForTarget(repo)));
+    if (values.includes('removed')) return 'removed';
+    if (values.includes('archived')) return 'archived';
+    if (values.includes('offline')) return 'offline';
+    return null;
+  }
 
   const activeBackupStates = new Set(['ok', 'stale', 'error', 'scheduled', 'stale_agent', 'agent_perms']);
   const hostBackups = $derived.by<HostBackup[]>(() =>
@@ -378,13 +430,19 @@
         const state = h.collector_status?.backup?.state ?? '';
         return activeBackupStates.has(state) && !((state === 'stale_agent' || state === 'agent_perms') && nodes.some((n) => n.host_id === h.id));
       })
-      .map((h) => ({
-        id: h.id,
-        hostname: h.hostname,
-        state: h.collector_status!.backup.state,
-        message: h.collector_status!.backup.message,
-        repos: reposByHost.get(h.id) ?? []
-      }))
+      .map((h) => {
+        const targets = reposByHost.get(h.id) ?? [];
+        const repos = targets.filter((target) => !target.revoked_at);
+        return {
+          id: h.id,
+          hostname: h.hostname,
+          state: h.collector_status!.backup.state,
+          message: h.collector_status!.backup.message,
+          repos,
+          revokedRepos: targets.filter((target) => target.revoked_at),
+          nodeAvailability: hostNodeAvailability(repos)
+        };
+      })
       .sort((a, b) => a.hostname.localeCompare(b.hostname))
   );
 
@@ -677,6 +735,23 @@ restic -r ${publicRepoUrl} backup /etc`;
   </details>
 {/snippet}
 
+{#snippet hostRepositories(h: HostBackup)}
+  {#if h.repos.length > 0}
+    {#each h.repos as repo, index (repo.id)}
+      {@const availability = nodeAvailability(nodeForTarget(repo))}
+      {#if index > 0}<span class="text-zinc-600">, </span>{/if}
+      <span class="font-mono text-emerald-300/90">{repo.name}</span>{#if availability}<span class={availabilityText(availability)}>{' · '}node {availability}</span>{/if}
+    {/each}
+  {:else if h.revokedRepos.length > 0}
+    {#each h.revokedRepos as repo, index (repo.id)}
+      {#if index > 0}<span class="text-zinc-600">, </span>{/if}
+      <span class="font-mono text-zinc-500">{repo.name}</span><span class="text-rose-300">{' · '}revoked</span>
+    {/each}
+  {:else}
+    <span class="text-zinc-600">external / not linked</span>
+  {/if}
+{/snippet}
+
 {#snippet fleetSection()}
   <section>
     <h2 class="text-sm font-medium text-zinc-100">Hosts backing themselves up</h2>
@@ -702,23 +777,20 @@ restic -r ${publicRepoUrl} backup /etc`;
             <tbody class="divide-y divide-zinc-800/70">
               {#each hostBackups as h (h.id)}
                 {@const running = hostIsRunning(h.id)}
+                {@const destinationUnavailable = h.nodeAvailability}
                 <tr class="hover:bg-zinc-900/60">
                   <td class="px-4 py-3">
                     <a href="/hosts/{h.id}?tab=backups" class="font-mono text-zinc-200 hover:text-zinc-100">{h.hostname}</a>
                   </td>
                   <td class="px-4 py-3">
                     <div class="flex items-center gap-2">
-                      <span class="h-1.5 w-1.5 rounded-full {running ? 'bg-emerald-400 animate-pulse' : stateDot(h.state)}"></span>
-                      <span class="text-xs {running ? 'text-emerald-300' : stateText(h.state)}">{running ? 'backing up now' : stateLabel(h.state)}</span>
+                      <span class="h-1.5 w-1.5 rounded-full {running ? 'bg-emerald-400 animate-pulse' : destinationUnavailable ? availabilityDot(destinationUnavailable) : stateDot(h.state)}"></span>
+                      <span class="text-xs {running ? 'text-emerald-300' : destinationUnavailable ? availabilityText(destinationUnavailable) : stateText(h.state)}">{running ? 'backing up now' : destinationUnavailable ? `node ${destinationUnavailable}` : stateLabel(h.state)}</span>
                     </div>
                     {#if h.message}<div class="mt-0.5 text-[11px] text-zinc-600 truncate max-w-xs" title={h.message}>{h.message}</div>{/if}
                   </td>
                   <td class="px-4 py-3 text-xs">
-                    {#if h.repos.length > 0}
-                      <span class="text-emerald-300/90 font-mono">{h.repos.join(', ')}</span>
-                    {:else}
-                      <span class="text-zinc-600">external / not linked</span>
-                    {/if}
+                    {@render hostRepositories(h)}
                   </td>
                   <td class="px-4 py-3 text-right">
                     <a href="/hosts/{h.id}?tab=backups" class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Backups tab</a>
@@ -731,6 +803,7 @@ restic -r ${publicRepoUrl} backup /etc`;
         <div class="md:hidden divide-y divide-zinc-800/70">
           {#each hostBackups as h (h.id)}
             {@const running = hostIsRunning(h.id)}
+            {@const destinationUnavailable = h.nodeAvailability}
             <div class="px-4 py-3 space-y-2">
               <div class="flex items-center justify-between gap-3">
                 <a href="/hosts/{h.id}?tab=backups" class="min-w-0 truncate font-mono text-sm text-zinc-200 hover:text-zinc-100">{h.hostname}</a>
@@ -738,17 +811,13 @@ restic -r ${publicRepoUrl} backup /etc`;
               </div>
               <div>
                 <div class="flex items-center gap-2">
-                  <span class="h-1.5 w-1.5 rounded-full {running ? 'bg-emerald-400 animate-pulse' : stateDot(h.state)}"></span>
-                  <span class="text-xs {running ? 'text-emerald-300' : stateText(h.state)}">{running ? 'backing up now' : stateLabel(h.state)}</span>
+                  <span class="h-1.5 w-1.5 rounded-full {running ? 'bg-emerald-400 animate-pulse' : destinationUnavailable ? availabilityDot(destinationUnavailable) : stateDot(h.state)}"></span>
+                  <span class="text-xs {running ? 'text-emerald-300' : destinationUnavailable ? availabilityText(destinationUnavailable) : stateText(h.state)}">{running ? 'backing up now' : destinationUnavailable ? `node ${destinationUnavailable}` : stateLabel(h.state)}</span>
                 </div>
                 {#if h.message}<div class="mt-0.5 text-[11px] text-zinc-600 truncate" title={h.message}>{h.message}</div>{/if}
               </div>
               <div class="text-xs">
-                {#if h.repos.length > 0}
-                  <span class="text-emerald-300/90 font-mono">{h.repos.join(', ')}</span>
-                {:else}
-                  <span class="text-zinc-600">external / not linked</span>
-                {/if}
+                {@render hostRepositories(h)}
               </div>
             </div>
           {/each}
@@ -803,7 +872,8 @@ restic -r ${publicRepoUrl} backup /etc`;
                 <option value="server">This server</option>
               {/if}
               {#each nodes as n (n.host_id)}
-                <option value={n.host_id} disabled={!n.enrolled}>Node · {n.hostname}{n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
+                {@const availability = nodeAvailability(n)}
+                <option value={n.host_id} disabled={!n.enrolled || availability !== null}>Node · {n.hostname || `node ${n.host_id}`}{availability === 'removed' ? ' (host removed)' : availability === 'archived' ? ' (host archived)' : availability === 'offline' ? ' (offline)' : n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
               {/each}
             </select>
             <p class="mt-1.5 text-[11px] text-zinc-600">Storage nodes receive backups over per-host WireGuard tunnels; nothing is exposed to the internet.</p>
@@ -859,7 +929,7 @@ restic -r ${publicRepoUrl} backup /etc`;
           <button type="button" onclick={backToList} class="text-sm px-3 py-2 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40">Cancel</button>
           <button
             type="button"
-            disabled={creating || !nameValid}
+            disabled={creating || !nameValid || !destinationReady}
             onclick={create}
             class="text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
             {creating ? 'Creating…' : 'Create repository'}
@@ -1141,6 +1211,9 @@ restic -r ${publicRepoUrl} backup /etc`;
                   </thead>
                   <tbody class="divide-y divide-zinc-800/70">
                     {#each data.targets as t (t.id)}
+                      {@const destinationNode = nodeForTarget(t)}
+                      {@const destinationAvailability = nodeAvailability(destinationNode)}
+                      {@const retiredNodeTargetDeletable = t.node_host_id != null && (destinationNode === null || destinationAvailability === 'removed' || destinationAvailability === 'archived')}
                       <tr class="hover:bg-zinc-900/60">
                         <td class="px-4 py-3 align-top">
                           <div class="flex items-center gap-2">
@@ -1153,7 +1226,11 @@ restic -r ${publicRepoUrl} backup /etc`;
                         </td>
                         <td class="px-4 py-3 align-top text-xs">
                           {#if t.node_host_id}
-                            <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{t.node_hostname || `node ${t.node_host_id}`}</span>
+                            {#if destinationNode}
+                              <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{destinationNode.hostname || t.node_hostname || `node ${t.node_host_id}`}</span>{#if destinationAvailability}<span class="ml-1.5 rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
+                            {:else}
+                              <span class="text-zinc-500">{t.node_hostname || `node ${t.node_host_id}`}</span>
+                            {/if}
                           {:else}
                             <span class="text-zinc-400">this server</span>
                           {/if}
@@ -1218,6 +1295,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                                 Revoke
                               </button>
                             {/if}
+                            {#if retiredNodeTargetDeletable}
+                              <button
+                                type="button"
+                                onclick={() => (retiredNodeTargetToDelete = t)}
+                                class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                                Delete
+                              </button>
+                            {/if}
                           </div>
                         </td>
                       </tr>
@@ -1227,6 +1312,9 @@ restic -r ${publicRepoUrl} backup /etc`;
               </div>
               <div class="md:hidden divide-y divide-zinc-800/70">
                 {#each data.targets as t (t.id)}
+                  {@const destinationNode = nodeForTarget(t)}
+                  {@const destinationAvailability = nodeAvailability(destinationNode)}
+                  {@const retiredNodeTargetDeletable = t.node_host_id != null && (destinationNode === null || destinationAvailability === 'removed' || destinationAvailability === 'archived')}
                   <div class="px-4 py-3 space-y-2">
                     <div class="flex min-w-0 items-center gap-2">
                       <span class="h-1.5 w-1.5 shrink-0 rounded-full {t.revoked_at ? 'bg-rose-400' : 'bg-emerald-400'}"></span>
@@ -1237,7 +1325,11 @@ restic -r ${publicRepoUrl} backup /etc`;
                     </div>
                     <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs">
                       {#if t.node_host_id}
-                        <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{t.node_hostname || `node ${t.node_host_id}`}</span>
+                        {#if destinationNode}
+                          <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{destinationNode.hostname || t.node_hostname || `node ${t.node_host_id}`}</span>{#if destinationAvailability}<span class="rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
+                        {:else}
+                          <span class="text-zinc-500">{t.node_hostname || `node ${t.node_host_id}`}</span>
+                        {/if}
                       {:else}
                         <span class="text-zinc-400">this server</span>
                       {/if}
@@ -1297,6 +1389,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                           onclick={() => (toRevoke = t)}
                           class="text-[11px] px-2.5 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
                           Revoke
+                        </button>
+                      {/if}
+                      {#if retiredNodeTargetDeletable}
+                        <button
+                          type="button"
+                          onclick={() => (retiredNodeTargetToDelete = t)}
+                          class="text-[11px] px-2.5 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+                          Delete
                         </button>
                       {/if}
                     </div>
@@ -1601,9 +1701,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                     </thead>
                     <tbody class="divide-y divide-zinc-800/70">
                       {#each nodes as n (n.host_id)}
+                        {@const availability = nodeAvailability(n)}
                         <tr class="hover:bg-zinc-900/60">
                           <td class="px-4 py-3">
-                            <a href="/hosts/{n.host_id}" class="font-mono text-zinc-200 hover:text-zinc-100">{n.hostname}</a>
+                            {#if n.host_missing}
+                              <span class="font-mono text-zinc-500">{n.hostname || `node ${n.host_id}`}</span>
+                            {:else}
+                              <a href="/hosts/{n.host_id}" class="font-mono text-zinc-200 hover:text-zinc-100">{n.hostname || `node ${n.host_id}`}</a>
+                            {/if}
                             {#if n.store_dir && n.store_dir !== '/var/lib/servermonitor/backup-store'}
                               <div class="mt-1 text-[11px] font-mono text-zinc-500">{n.store_dir}</div>
                             {/if}
@@ -1611,8 +1716,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                           <td class="px-4 py-3 text-xs font-mono text-zinc-300">{n.endpoint}<span class="text-zinc-600">:{n.udp_port}/udp</span></td>
                           <td class="px-4 py-3">
                             <div class="flex items-center gap-2 text-xs">
-                              <span class="h-1.5 w-1.5 rounded-full {n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                              {#if n.node_state === 'error'}
+                              <span class="h-1.5 w-1.5 rounded-full {availability ? availabilityDot(availability) : n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                              {#if availability === 'removed'}
+                                <span class="text-rose-300">host removed</span>
+                              {:else if availability === 'archived'}
+                                <span class="text-amber-300">host archived</span>
+                              {:else if availability === 'offline'}
+                                <span class="text-rose-300">offline{#if n.last_seen} — last seen <span class="numeric">{timeAgo(n.last_seen)}</span>{/if}</span>
+                              {:else if n.node_state === 'error'}
                                 <span class="text-rose-300">endpoint failed</span>
                               {:else if n.enrolled}
                                 <span class="text-emerald-300 font-mono">{n.tunnel_ip}</span>
@@ -1620,7 +1731,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                                 <span class="text-amber-300">coming online…</span>
                               {/if}
                             </div>
-                            {#if n.node_state === 'error' && n.node_error}
+                            {#if !availability && n.node_state === 'error' && n.node_error}
                               <div class="mt-1 max-w-[280px] truncate font-mono text-[11px] text-rose-300/80" title={n.node_error}>{n.node_error}</div>
                             {/if}
                           </td>
@@ -1649,9 +1760,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                 </div>
                 <div class="md:hidden divide-y divide-zinc-800/70">
                   {#each nodes as n (n.host_id)}
+                    {@const availability = nodeAvailability(n)}
                     <div class="px-4 py-3 space-y-2">
                       <div class="flex items-center justify-between gap-3">
-                        <a href="/hosts/{n.host_id}" class="min-w-0 truncate font-mono text-sm text-zinc-200 hover:text-zinc-100">{n.hostname}</a>
+                        {#if n.host_missing}
+                          <span class="min-w-0 truncate font-mono text-sm text-zinc-500">{n.hostname || `node ${n.host_id}`}</span>
+                        {:else}
+                          <a href="/hosts/{n.host_id}" class="min-w-0 truncate font-mono text-sm text-zinc-200 hover:text-zinc-100">{n.hostname || `node ${n.host_id}`}</a>
+                        {/if}
                         <div class="flex shrink-0 items-center gap-2">
                           <button
                             type="button"
@@ -1674,8 +1790,14 @@ restic -r ${publicRepoUrl} backup /etc`;
                         {/if}
                       </div>
                       <div class="flex items-center gap-2 text-xs">
-                        <span class="h-1.5 w-1.5 rounded-full {n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                        {#if n.node_state === 'error'}
+                        <span class="h-1.5 w-1.5 rounded-full {availability ? availabilityDot(availability) : n.node_state === 'error' ? 'bg-rose-400' : n.enrolled ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                        {#if availability === 'removed'}
+                          <span class="text-rose-300">host removed</span>
+                        {:else if availability === 'archived'}
+                          <span class="text-amber-300">host archived</span>
+                        {:else if availability === 'offline'}
+                          <span class="text-rose-300">offline{#if n.last_seen} — last seen <span class="numeric">{timeAgo(n.last_seen)}</span>{/if}</span>
+                        {:else if n.node_state === 'error'}
                           <span class="text-rose-300">endpoint failed</span>
                         {:else if n.enrolled}
                           <span class="font-mono text-emerald-300">{n.tunnel_ip}</span>
@@ -1683,7 +1805,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                           <span class="text-amber-300">coming online…</span>
                         {/if}
                       </div>
-                      {#if n.node_state === 'error' && n.node_error}
+                      {#if !availability && n.node_state === 'error' && n.node_error}
                         <div class="truncate font-mono text-[11px] text-rose-300/80" title={n.node_error}>{n.node_error}</div>
                       {/if}
                       <div class="text-[11px] text-zinc-500 numeric">{n.target_count} {n.target_count === 1 ? 'repository' : 'repositories'} · {bytes(n.used_bytes)} stored</div>
@@ -1754,6 +1876,25 @@ restic -r ${publicRepoUrl} backup /etc`;
   <p class="mt-2 text-xs text-zinc-500">
     Only empty repositories can be deleted. If an upload has landed since this list loaded, the delete is refused and you can
     revoke instead.
+  </p>
+{/snippet}
+
+<ConfirmDialog
+  open={retiredNodeTargetToDelete !== null}
+  title="Delete repository record"
+  body={retiredNodeDeleteBody}
+  confirmLabel="Delete"
+  danger
+  onconfirm={doDeleteRetiredNodeTarget}
+  onclose={() => (retiredNodeTargetToDelete = null)} />
+
+{#snippet retiredNodeDeleteBody()}
+  <p class="text-sm text-zinc-300">
+    This deletes only the server-side record and credential for{' '}<span class="font-mono text-zinc-100">{retiredNodeTargetToDelete?.name}</span>.{' '}
+    Snapshots on the node's disk are not touched, and this server holds no copy.
+  </p>
+  <p class="mt-2 text-xs text-amber-300">
+    If the disk is recoverable, keep this repository until the store has been salvaged.
   </p>
 {/snippet}
 

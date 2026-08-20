@@ -79,11 +79,13 @@ func TestAgentBackupNodeUsageStoresHealth(t *testing.T) {
 }
 
 func TestListBackupNodesExposesFreshHealthAndOmitsStaleHealth(t *testing.T) {
+	lastSeen := time.Unix(10, 0).UTC()
 	store := &fakeBackupNodeStore{rows: []storage.BackupNode{
-		{HostID: 1, Hostname: "failed", CreatedAt: time.Unix(1, 0).UTC()},
-		{HostID: 2, Hostname: "running", CreatedAt: time.Unix(2, 0).UTC()},
+		{HostID: 1, Hostname: "failed", CreatedAt: time.Unix(1, 0).UTC(), LastSeen: &lastSeen, SampleIntervalS: 15},
+		{HostID: 2, Hostname: "running", CreatedAt: time.Unix(2, 0).UTC(), Archived: true},
 		{HostID: 3, Hostname: "stale", CreatedAt: time.Unix(3, 0).UTC()},
 		{HostID: 4, Hostname: "absent", CreatedAt: time.Unix(4, 0).UTC()},
+		{HostID: 5, Hostname: "", CreatedAt: time.Unix(5, 0).UTC(), HostMissing: true},
 	}}
 	health := NewNodeHealthCache()
 	health.Store(1, true, "usage measurement failed")
@@ -111,6 +113,16 @@ func TestListBackupNodesExposesFreshHealthAndOmitsStaleHealth(t *testing.T) {
 	}
 	if byName["running"]["node_state"] != "running" || byName["running"]["reported_at"] == nil {
 		t.Fatalf("running node = %+v", byName["running"])
+	}
+	if byName["failed"]["last_seen"] == nil || byName["failed"]["sample_interval_s"] != float64(15) {
+		t.Fatalf("failed node host telemetry = %+v", byName["failed"])
+	}
+	if byName["running"]["archived"] != true {
+		t.Fatalf("archived node = %+v", byName["running"])
+	}
+	removed := response.Nodes[len(response.Nodes)-1]
+	if removed["host_missing"] != true || removed["hostname"] != "" {
+		t.Fatalf("removed node = %+v", removed)
 	}
 	for _, name := range []string{"stale", "absent"} {
 		for _, key := range []string{"node_state", "node_error", "reported_at"} {

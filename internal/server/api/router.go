@@ -156,7 +156,7 @@ func New(d Deps) *Router {
 					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
-					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
 					r.Get("/backup-tunnel", backupTunnelStatusHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo, nodePeerStats))
 					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers, nodePeerStats))
 					r.Get("/backup-nodes", listBackupNodesHandler(d.BackupNodes, nodeHealth))

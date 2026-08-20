@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,66 @@ func TestBackupTargetDeletable(t *testing.T) {
 		if got := backupTargetDeletable(c.storedUsed, c.hasObjects, c.repoChecked, c.nodeHosted); got != c.want {
 			t.Errorf("%s: backupTargetDeletable(%d,%v,%v,%v) = %v, want %v", c.name, c.storedUsed, c.hasObjects, c.repoChecked, c.nodeHosted, got, c.want)
 		}
+	}
+}
+
+type backupTargetDeleteTestStore struct {
+	target  storage.BackupTarget
+	deleted bool
+}
+
+func (s *backupTargetDeleteTestStore) Get(_ context.Context, _ int64) (storage.BackupTarget, error) {
+	return s.target, nil
+}
+
+func (s *backupTargetDeleteTestStore) Delete(_ context.Context, _ int64) error {
+	s.deleted = true
+	return nil
+}
+
+type backupNodeDeleteTestStore struct {
+	node storage.BackupNode
+	err  error
+}
+
+func (s backupNodeDeleteTestStore) Get(_ context.Context, _ int64) (storage.BackupNode, error) {
+	return s.node, s.err
+}
+
+func TestDeleteBackupTargetHandlerNodeRetirement(t *testing.T) {
+	nodeHostID := int64(42)
+	lastSeen := time.Now().Add(-time.Hour)
+	cases := []struct {
+		name       string
+		node       storage.BackupNode
+		nodeErr    error
+		wantStatus int
+		wantDelete bool
+	}{
+		{"live node", storage.BackupNode{HostID: nodeHostID}, nil, http.StatusConflict, false},
+		{"offline node", storage.BackupNode{HostID: nodeHostID, LastSeen: &lastSeen, SampleIntervalS: 10}, nil, http.StatusConflict, false},
+		{"demoted node", storage.BackupNode{}, storage.ErrNotFound, http.StatusNoContent, true},
+		{"archived host", storage.BackupNode{HostID: nodeHostID, Archived: true}, nil, http.StatusNoContent, true},
+		{"missing host", storage.BackupNode{HostID: nodeHostID, HostMissing: true}, nil, http.StatusNoContent, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targets := &backupTargetDeleteTestStore{target: storage.BackupTarget{ID: 7, NodeHostID: &nodeHostID, UsedBytes: 4096}}
+			nodes := backupNodeDeleteTestStore{node: tc.node, err: tc.nodeErr}
+			router := chi.NewRouter()
+			router.Delete("/backup-targets/{id}", deleteBackupTargetHandlerWithStores(targets, nil, nodes))
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/backup-targets/7", nil))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if targets.deleted != tc.wantDelete {
+				t.Fatalf("deleted = %v, want %v", targets.deleted, tc.wantDelete)
+			}
+			if tc.wantStatus == http.StatusConflict && !strings.Contains(rec.Body.String(), "demoted, archived, or removed") {
+				t.Fatalf("conflict body does not explain retirement path: %s", rec.Body.String())
+			}
+		})
 	}
 }
 

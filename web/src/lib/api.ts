@@ -204,6 +204,10 @@ export interface BackupNode {
   store_dir?: string;
   tunnel_ip?: string;
   enrolled: boolean;
+  last_seen?: string;
+  sample_interval_s?: number;
+  archived?: boolean;
+  host_missing?: boolean;
   node_state?: string;
   node_error?: string;
   reported_at?: string;

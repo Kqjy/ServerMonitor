@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -255,7 +256,23 @@ func backupTargetDeletable(storedUsedBytes int64, repoHasObjects, repoChecked, n
 	return true
 }
 
-func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server) http.HandlerFunc {
+type backupTargetDeleteStore interface {
+	Get(context.Context, int64) (storage.BackupTarget, error)
+	Delete(context.Context, int64) error
+}
+
+type backupNodeDeleteStore interface {
+	Get(context.Context, int64) (storage.BackupNode, error)
+}
+
+func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server, nodes *storage.BackupNodes) http.HandlerFunc {
+	if nodes == nil {
+		return deleteBackupTargetHandlerWithStores(targets, server, nil)
+	}
+	return deleteBackupTargetHandlerWithStores(targets, server, nodes)
+}
+
+func deleteBackupTargetHandlerWithStores(targets backupTargetDeleteStore, server *restserver.Server, nodes backupNodeDeleteStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseBackupTargetID(w, r)
 		if !ok {
@@ -267,7 +284,24 @@ func deleteBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 			return
 		}
 		if t.NodeHostID != nil {
-			writeError(w, http.StatusConflict, "node-hosted backup targets cannot be deleted because their storage namespace cannot be verified empty; revoke them instead")
+			if nodes == nil {
+				writeError(w, http.StatusInternalServerError, "backup nodes are not available")
+				return
+			}
+			node, nodeErr := nodes.Get(r.Context(), *t.NodeHostID)
+			if nodeErr != nil && !errors.Is(nodeErr, storage.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, nodeErr.Error())
+				return
+			}
+			if nodeErr == nil && !node.HostMissing && !node.Archived {
+				writeError(w, http.StatusConflict, "node-hosted backup targets cannot be deleted while their storage node is active or offline; revoke them instead, or delete after the node is demoted, archived, or removed")
+				return
+			}
+			if err := targets.Delete(r.Context(), id); err != nil {
+				backupTargetLookupError(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		var repoHasObjects bool

@@ -417,19 +417,23 @@ func agentBackupNodeUsageHandler(nodes backupNodeUsageStore, peerStats *NodePeer
 }
 
 type backupNodeView struct {
-	HostID      int64      `json:"host_id"`
-	Hostname    string     `json:"hostname"`
-	UDPPort     int        `json:"udp_port"`
-	Endpoint    string     `json:"endpoint"`
-	StoreDir    string     `json:"store_dir,omitempty"`
-	TunnelIP    string     `json:"tunnel_ip,omitempty"`
-	Enrolled    bool       `json:"enrolled"`
-	TargetCount int        `json:"target_count"`
-	UsedBytes   int64      `json:"used_bytes"`
-	CreatedAt   time.Time  `json:"created_at"`
-	NodeState   string     `json:"node_state,omitempty"`
-	NodeError   string     `json:"node_error,omitempty"`
-	ReportedAt  *time.Time `json:"reported_at,omitempty"`
+	HostID          int64      `json:"host_id"`
+	Hostname        string     `json:"hostname"`
+	UDPPort         int        `json:"udp_port"`
+	Endpoint        string     `json:"endpoint"`
+	StoreDir        string     `json:"store_dir,omitempty"`
+	TunnelIP        string     `json:"tunnel_ip,omitempty"`
+	Enrolled        bool       `json:"enrolled"`
+	TargetCount     int        `json:"target_count"`
+	UsedBytes       int64      `json:"used_bytes"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastSeen        *time.Time `json:"last_seen,omitempty"`
+	SampleIntervalS int        `json:"sample_interval_s,omitempty"`
+	Archived        bool       `json:"archived,omitempty"`
+	HostMissing     bool       `json:"host_missing,omitempty"`
+	NodeState       string     `json:"node_state,omitempty"`
+	NodeError       string     `json:"node_error,omitempty"`
+	ReportedAt      *time.Time `json:"reported_at,omitempty"`
 }
 
 type backupNodeListStore interface {
@@ -447,15 +451,19 @@ func listBackupNodesHandler(nodes backupNodeListStore, health *NodeHealthCache) 
 		now := time.Now()
 		for _, node := range rows {
 			view := backupNodeView{
-				HostID:      node.HostID,
-				Hostname:    node.Hostname,
-				UDPPort:     node.UDPPort,
-				Endpoint:    node.Endpoint,
-				StoreDir:    node.StoreDir,
-				Enrolled:    node.TunnelIP != nil,
-				TargetCount: node.TargetCount,
-				UsedBytes:   node.UsedBytes,
-				CreatedAt:   node.CreatedAt,
+				HostID:          node.HostID,
+				Hostname:        node.Hostname,
+				UDPPort:         node.UDPPort,
+				Endpoint:        node.Endpoint,
+				StoreDir:        node.StoreDir,
+				Enrolled:        node.TunnelIP != nil,
+				TargetCount:     node.TargetCount,
+				UsedBytes:       node.UsedBytes,
+				CreatedAt:       node.CreatedAt,
+				LastSeen:        node.LastSeen,
+				SampleIntervalS: node.SampleIntervalS,
+				Archived:        node.Archived,
+				HostMissing:     node.HostMissing,
 			}
 			if node.TunnelIP != nil {
 				view.TunnelIP = node.TunnelIP.String()

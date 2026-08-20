@@ -12,18 +12,22 @@ import (
 var ErrNodeHasTargets = errors.New("backup node still has repositories; delete or reassign them first")
 
 type BackupNode struct {
-	HostID       int64
-	Hostname     string
-	UDPPort      int
-	Endpoint     string
-	StoreDir     string
-	MaxBlobBytes int64
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	TunnelIP     *netip.Addr
-	PublicKey    []byte
-	TargetCount  int
-	UsedBytes    int64
+	HostID          int64
+	Hostname        string
+	UDPPort         int
+	Endpoint        string
+	StoreDir        string
+	MaxBlobBytes    int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	TunnelIP        *netip.Addr
+	PublicKey       []byte
+	TargetCount     int
+	UsedBytes       int64
+	LastSeen        *time.Time
+	SampleIntervalS int
+	Archived        bool
+	HostMissing     bool
 }
 
 type NodeTarget struct {
@@ -113,14 +117,17 @@ func (n *BackupNodes) Demote(ctx context.Context, hostID int64) error {
 
 func (n *BackupNodes) List(ctx context.Context) ([]BackupNode, error) {
 	rows, err := n.db.Pool.Query(ctx, `
-		SELECT b.host_id, h.hostname, b.udp_port, b.endpoint, b.store_dir, b.max_blob_bytes,
+		SELECT b.host_id, COALESCE(CASE WHEN h.deleted_at IS NULL THEN h.hostname ELSE '' END, ''),
+		       b.udp_port, b.endpoint, b.store_dir, b.max_blob_bytes,
 		       b.created_at, b.updated_at, p.tunnel_ip, p.public_key,
 		       (SELECT count(*) FROM backup_targets t WHERE t.node_host_id = b.host_id AND t.revoked_at IS NULL),
-		       COALESCE((SELECT sum(t.used_bytes) FROM backup_targets t WHERE t.node_host_id = b.host_id), 0)
+		       COALESCE((SELECT sum(t.used_bytes) FROM backup_targets t WHERE t.node_host_id = b.host_id), 0),
+		       h.last_seen, COALESCE(h.sample_interval_s, 0), h.archived_at IS NOT NULL,
+		       h.id IS NULL OR h.deleted_at IS NOT NULL
 		FROM backup_nodes b
-		JOIN hosts h ON h.id = b.host_id AND h.deleted_at IS NULL
+		LEFT JOIN hosts h ON h.id = b.host_id
 		LEFT JOIN backup_tunnel_peers p ON p.host_id = b.host_id
-		ORDER BY h.hostname
+		ORDER BY COALESCE(h.hostname, ''), b.host_id
 	`)
 	if err != nil {
 		return nil, err
@@ -130,7 +137,8 @@ func (n *BackupNodes) List(ctx context.Context) ([]BackupNode, error) {
 	for rows.Next() {
 		var node BackupNode
 		if err := rows.Scan(&node.HostID, &node.Hostname, &node.UDPPort, &node.Endpoint, &node.StoreDir,
-			&node.MaxBlobBytes, &node.CreatedAt, &node.UpdatedAt, &node.TunnelIP, &node.PublicKey, &node.TargetCount, &node.UsedBytes); err != nil {
+			&node.MaxBlobBytes, &node.CreatedAt, &node.UpdatedAt, &node.TunnelIP, &node.PublicKey, &node.TargetCount,
+			&node.UsedBytes, &node.LastSeen, &node.SampleIntervalS, &node.Archived, &node.HostMissing); err != nil {
 			return nil, err
 		}
 		out = append(out, node)
@@ -141,14 +149,17 @@ func (n *BackupNodes) List(ctx context.Context) ([]BackupNode, error) {
 func (n *BackupNodes) Get(ctx context.Context, hostID int64) (BackupNode, error) {
 	var node BackupNode
 	err := n.db.Pool.QueryRow(ctx, `
-		SELECT b.host_id, COALESCE(h.hostname, ''), b.udp_port, b.endpoint, b.store_dir, b.max_blob_bytes,
-		       b.created_at, b.updated_at, p.tunnel_ip
+		SELECT b.host_id, COALESCE(CASE WHEN h.deleted_at IS NULL THEN h.hostname ELSE '' END, ''),
+		       b.udp_port, b.endpoint, b.store_dir, b.max_blob_bytes,
+		       b.created_at, b.updated_at, p.tunnel_ip, h.last_seen, COALESCE(h.sample_interval_s, 0),
+		       h.archived_at IS NOT NULL, h.id IS NULL OR h.deleted_at IS NOT NULL
 		FROM backup_nodes b
-		LEFT JOIN hosts h ON h.id = b.host_id AND h.deleted_at IS NULL
+		LEFT JOIN hosts h ON h.id = b.host_id
 		LEFT JOIN backup_tunnel_peers p ON p.host_id = b.host_id
 		WHERE b.host_id = $1
 	`, hostID).Scan(&node.HostID, &node.Hostname, &node.UDPPort, &node.Endpoint, &node.StoreDir,
-		&node.MaxBlobBytes, &node.CreatedAt, &node.UpdatedAt, &node.TunnelIP)
+		&node.MaxBlobBytes, &node.CreatedAt, &node.UpdatedAt, &node.TunnelIP, &node.LastSeen,
+		&node.SampleIntervalS, &node.Archived, &node.HostMissing)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return BackupNode{}, ErrNotFound
