@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"servermonitor/internal/agent/spool"
+	"servermonitor/pkg/secretenvelope"
 	"servermonitor/pkg/wire"
 )
 
@@ -37,6 +38,7 @@ type Client struct {
 
 	controlCh chan ControlUpdate
 	browseCh  chan struct{}
+	ipbanCh   chan int64
 
 	healthMu   sync.Mutex
 	healthPath string
@@ -77,6 +79,7 @@ func New(baseURL, token string, timeout time.Duration, insecureSkip bool, logger
 		intervalCh:     make(chan int, 1),
 		controlCh:      make(chan ControlUpdate, 1),
 		browseCh:       make(chan struct{}, 1),
+		ipbanCh:        make(chan int64, 1),
 	}
 }
 
@@ -90,6 +93,10 @@ func (c *Client) ControlUpdates() <-chan ControlUpdate {
 
 func (c *Client) BrowseSignals() <-chan struct{} {
 	return c.browseCh
+}
+
+func (c *Client) IPBanSignals() <-chan int64 {
+	return c.ipbanCh
 }
 
 func (c *Client) SetHealthPath(p string) {
@@ -295,6 +302,7 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 			UpgradeNow          bool   `json:"upgrade_now"`
 			ServerPubkey        string `json:"server_pubkey"`
 			BackupBrowsePending bool   `json:"backup_browse_pending"`
+			IPBanVersion        int64  `json:"ipban_version"`
 		}
 		if len(ackBytes) > 0 {
 			_ = json.Unmarshal(ackBytes, &ack)
@@ -347,6 +355,20 @@ func (c *Client) postBytes(ctx context.Context, body []byte) error {
 			default:
 			}
 		}
+		if ack.IPBanVersion > 0 {
+			select {
+			case c.ipbanCh <- ack.IPBanVersion:
+			default:
+				select {
+				case <-c.ipbanCh:
+				default:
+				}
+				select {
+				case c.ipbanCh <- ack.IPBanVersion:
+				default:
+				}
+			}
+		}
 		c.writeHealth()
 		return nil
 	}
@@ -393,6 +415,81 @@ func (c *Client) FetchBackupBrowseJobs(ctx context.Context) ([]wire.BackupBrowse
 	return body.Jobs, nil
 }
 
+func (c *Client) FetchIPBanConfig(ctx context.Context) (*wire.IPBanConfig, error) {
+	select {
+	case <-c.deregisteredCh:
+		return nil, ErrDeregistered
+	default:
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/agent/ipban", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Agent-Token", c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+	if resp.StatusCode == http.StatusGone {
+		c.markDeregistered()
+		return nil, ErrDeregistered
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &httpError{status: resp.StatusCode, body: string(data)}
+	}
+	var body wire.IPBanConfig
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
+	if err := dec.Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode ipban config: %w", err)
+	}
+	return &body, nil
+}
+
+func (c *Client) FetchManagedBackupConfig(ctx context.Context) (*wire.ManagedBackupConfig, error) {
+	select {
+	case <-c.deregisteredCh:
+		return nil, ErrDeregistered
+	default:
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/agent/backup-config", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Agent-Token", c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusGone {
+		c.markDeregistered()
+		return nil, ErrDeregistered
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &httpError{status: resp.StatusCode, body: string(data)}
+	}
+	var envelope secretenvelope.Envelope
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("decode managed backup envelope: %w", err)
+	}
+	plaintext, err := secretenvelope.Open(c.token, secretenvelope.ManagedBackupConfigPurpose, envelope)
+	if err != nil {
+		return nil, fmt.Errorf("open managed backup envelope: %w", err)
+	}
+	var body wire.ManagedBackupConfig
+	if err := json.Unmarshal(plaintext, &body); err != nil {
+		return nil, fmt.Errorf("decode managed backup config: %w", err)
+	}
+	return &body, nil
+}
+
 func (c *Client) PostBackupBrowseResult(ctx context.Context, jobID string, result wire.BackupBrowseResult) error {
 	select {
 	case <-c.deregisteredCh:
@@ -429,6 +526,14 @@ func (c *Client) PostBackupBrowseResult(ctx context.Context, jobID string, resul
 type httpError struct {
 	status int
 	body   string
+}
+
+func HTTPStatus(err error) (int, bool) {
+	var httpErr *httpError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+	return httpErr.status, true
 }
 
 func (e *httpError) Error() string {

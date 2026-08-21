@@ -9,12 +9,13 @@ import (
 )
 
 type RetentionPolicies struct {
-	Raw           string
-	Aggregate5m   string
-	Processes     string
-	Containers    string
-	Ports         string
-	CompressAfter string
+	Raw                string
+	Aggregate5m        string
+	Processes          string
+	Containers         string
+	Ports              string
+	CompressAfter      string
+	ArchiveAggregate5m bool
 }
 
 type AppliedPolicy struct {
@@ -51,8 +52,12 @@ func ApplyRetentionPolicies(ctx context.Context, pool *pgxpool.Pool, p Retention
 			return applied, fmt.Errorf("remove %s on %s: %w", s.kind, s.target, err)
 		}
 
-		if isForever(s.value) {
-			applied = append(applied, AppliedPolicy{Target: s.target, Kind: s.kind, Value: "forever"})
+		if !shouldInstallPolicy(p, s.target, s.kind, s.value) {
+			if s.target == "metric_points_5m" && s.kind == "retention" && p.ArchiveAggregate5m {
+				applied = append(applied, AppliedPolicy{Target: s.target, Kind: "archive-controlled retention", Value: s.value})
+			} else {
+				applied = append(applied, AppliedPolicy{Target: s.target, Kind: s.kind, Value: "forever"})
+			}
 			continue
 		}
 
@@ -63,6 +68,13 @@ func ApplyRetentionPolicies(ctx context.Context, pool *pgxpool.Pool, p Retention
 		applied = append(applied, AppliedPolicy{Target: s.target, Kind: s.kind, Value: s.value})
 	}
 	return applied, nil
+}
+
+func shouldInstallPolicy(p RetentionPolicies, target, kind, value string) bool {
+	if target == "metric_points_5m" && kind == "retention" && p.ArchiveAggregate5m {
+		return false
+	}
+	return !isForever(value)
 }
 
 func isForever(v string) bool {

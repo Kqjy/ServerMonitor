@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"servermonitor/internal/agent/backupsched"
 	"servermonitor/internal/agent/collectors"
 	"servermonitor/internal/agent/config"
+	"servermonitor/internal/agent/ipban"
 	"servermonitor/internal/agent/runner"
 	"servermonitor/internal/agent/spool"
 	"servermonitor/internal/agent/transport"
@@ -48,6 +50,9 @@ func main() {
 			return
 		case "backup":
 			backupCmd(os.Args[2:])
+			return
+		case "ipban":
+			ipbanCmd(os.Args[2:])
 			return
 		case "healthz":
 			if err := healthzCmd(os.Args[2:]); err != nil {
@@ -143,6 +148,16 @@ func main() {
 
 	client.StartDrainer(ctx)
 	go runBackupBrowseLoop(ctx, client, logger)
+	maybeStartIPBan(ctx, cfg, client, logger)
+	managedBackups := &managedBackupSyncState{}
+	if err := syncManagedBackups(ctx, cfg.BackupStatusPath, client, managedBackups); err != nil {
+		if status, ok := transport.HTTPStatus(err); ok && (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) {
+			logger.Debug("server does not support centrally managed backup destinations")
+		} else {
+			logger.Warn("initial managed backup configuration sync failed", "err", err)
+		}
+	}
+	go runManagedBackupSyncLoop(ctx, cfg.BackupStatusPath, client, managedBackups, logger)
 
 	nodeManager := backupnode.New(cfg.ServerURL, cfg.Token, cfg.InsecureSkip, filepath.Dir(cfg.BackupStatusPath), logger)
 	go nodeManager.Run(ctx)
@@ -472,6 +487,139 @@ func syncPrivilegedCmd(args []string) {
 	}
 	if !updated {
 		logger.Debug("privileged backup agent already current or no signed resident update is staged")
+	}
+}
+
+func maybeStartIPBan(ctx context.Context, cfg *config.Config, client *transport.Client, logger *slog.Logger) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	enabled := false
+	for _, c := range collectors.Filtered(cfg.Enabled, cfg.Disabled) {
+		if c.Name() == "ipban" {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return
+	}
+	manager := ipban.New(ipban.Options{ServerURL: cfg.ServerURL, Logger: logger, Fetch: client.FetchIPBanConfig})
+	collectors.SetIPBanSource(manager)
+	go manager.Run(ctx)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-client.IPBanSignals():
+				if !ok {
+					return
+				}
+				manager.Signal(v)
+			}
+		}
+	}()
+}
+
+type managedBackupSyncState struct {
+	signature   [sha256.Size]byte
+	initialized bool
+}
+
+func syncManagedBackups(ctx context.Context, statusPath string, client *transport.Client, state *managedBackupSyncState) error {
+	remote, err := client.FetchManagedBackupConfig(ctx)
+	if err != nil {
+		return err
+	}
+	signature, err := managedBackupConfigSignature(remote)
+	if err != nil {
+		return err
+	}
+	if state.initialized && state.signature == signature {
+		return nil
+	}
+	if err := agentbackup.ApplyManagedBackupConfig(statusPath, *remote); err != nil {
+		return err
+	}
+	state.signature = signature
+	state.initialized = true
+	return nil
+}
+
+func managedBackupConfigSignature(config *wire.ManagedBackupConfig) ([sha256.Size]byte, error) {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("encode managed backup configuration signature: %w", err)
+	}
+	return sha256.Sum256(data), nil
+}
+
+func runManagedBackupSyncLoop(ctx context.Context, statusPath string, client *transport.Client, state *managedBackupSyncState, logger *slog.Logger) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	unsupported := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := syncManagedBackups(syncCtx, statusPath, client, state)
+		cancel()
+		if err == nil {
+			unsupported = false
+			continue
+		}
+		if status, ok := transport.HTTPStatus(err); ok && (status == http.StatusNotFound || status == http.StatusMethodNotAllowed) {
+			if !unsupported {
+				logger.Debug("server does not support centrally managed backup destinations")
+				unsupported = true
+			}
+			continue
+		}
+		logger.Warn("managed backup configuration sync failed", "err", err)
+	}
+}
+
+func ipbanCmd(args []string) {
+	usage := "usage: sm-agent ipban <status|teardown>"
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "status":
+		snapshots, err := ipban.Snapshot()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ipban status:", err)
+			os.Exit(1)
+		}
+		if snapshots == nil {
+			fmt.Printf("no nftables table inet %s present\n", ipban.TableName)
+			return
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "SET\tADDRESS\tEXPIRES")
+		total := 0
+		for _, snap := range snapshots {
+			for _, entry := range snap.Entries {
+				total++
+				fmt.Fprintf(tw, "%s\t%s\t%s\n", snap.Name, entry.IP, entry.Expires.Round(time.Second))
+			}
+		}
+		_ = tw.Flush()
+		fmt.Printf("%d banned address(es) in inet %s\n", total, ipban.TableName)
+	case "teardown":
+		if err := ipban.Teardown(); err != nil {
+			fmt.Fprintln(os.Stderr, "ipban teardown:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("removed nftables table inet %s\n", ipban.TableName)
+	default:
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
 	}
 }
 

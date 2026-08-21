@@ -775,6 +775,21 @@ func TestPruneModeExternalSkipsForget(t *testing.T) {
 	}
 }
 
+func TestManagedDirectRepositoryNeverInheritsHostPruning(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.PruneMode = "host"
+	cfg.Repos[0].managed = true
+	runner := newFakeResticRunner()
+	if _, err := Run(context.Background(), cfg, Options{Runner: runner}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, call := range runner.calls {
+		if len(call.Args) > 0 && call.Args[0] == "forget" {
+			t.Fatalf("managed direct repository inherited host pruning: %#v", runner.calls)
+		}
+	}
+}
+
 func TestStatusMergePreservesChecksForeignReposAndLastSuccessOnFailure(t *testing.T) {
 	cfg := testConfig(t)
 	checkLast := time.Date(2026, 6, 28, 4, 0, 0, 0, time.UTC)
@@ -865,6 +880,23 @@ func TestMergeStatusPreservesRepositoryFactsForPartialFailure(t *testing.T) {
 	}
 	if &merged.Repos[0].Snapshots[0] == &existing.Repos[0].Snapshots[0] {
 		t.Fatal("snapshots slice was not copied")
+	}
+}
+
+func TestRemoveRepoStatusDropsOnlyNamedRepositories(t *testing.T) {
+	status := StatusFile{Repos: []RepoStatus{{Name: "local"}, {Name: "revoked"}, {Name: "legacy"}}}
+	got := removeRepoStatus(status, map[string]bool{"revoked": true})
+	if len(got.Repos) != 2 || got.Repos[0].Name != "local" || got.Repos[1].Name != "legacy" {
+		t.Fatalf("remaining status = %#v", got.Repos)
+	}
+	if got.Version != statusVersion {
+		t.Fatalf("status version = %d, want %d", got.Version, statusVersion)
+	}
+}
+
+func TestRunResultWithNoActiveRepositoriesIsSuccessful(t *testing.T) {
+	if !(RunResult{}).AnySucceeded() {
+		t.Fatal("an idle managed runtime should not fail after its final assignment is revoked")
 	}
 }
 

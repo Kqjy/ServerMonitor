@@ -59,7 +59,11 @@
 
   let endpoint = $state<BackupTargetsResp | null>(null);
   const endpointConfigured = $derived(endpoint?.configured ?? false);
-  const linkedRepo = $derived(endpoint?.targets.find((t) => t.host_id === hostId && !t.revoked_at)?.name ?? null);
+  const linkedRepositories = $derived(endpoint?.targets.filter((t) => t.host_id === hostId && !t.revoked_at) ?? []);
+  const linkedRepository = $derived(linkedRepositories[0] ?? null);
+  const linkedRepo = $derived(linkedRepository?.name ?? null);
+  const linkedDirectRepo = $derived(linkedRepositories.length > 0 && linkedRepositories.every((repository) => repository.destination_id != null));
+  const hasDirectDestinations = $derived((endpoint?.destinations.length ?? 0) > 0);
 
   async function loadEndpoint() {
     try {
@@ -70,7 +74,7 @@
   let nodes = $state<BackupNode[]>([]);
   const nodeRole = $derived(nodes.find((n) => n.host_id === hostId) ?? null);
   const isStorageNode = $derived(nodeRole !== null);
-  const canCreateRepo = $derived(endpointConfigured || nodes.length > 0);
+  const canCreateRepo = $derived(endpointConfigured || nodes.length > 0 || hasDirectDestinations);
 
   async function loadNodeRole() {
     try {
@@ -95,6 +99,10 @@
     return nodes.find((node) => node.host_id === target.node_host_id) ?? null;
   }
 
+  function managedDataPath(repo: string): string | null {
+    return endpoint?.targets.find((candidate) => candidate.host_id === hostId && candidate.name === repo)?.data_path.label ?? null;
+  }
+
   function condenseRepoError(error: string): string | null {
     const lower = error.toLowerCase();
     const reasons = ['connection reset by peer', 'connection refused', 'i/o timeout', 'no route to host', 'context deadline exceeded'];
@@ -108,11 +116,16 @@
     return `backup failed: destination unreachable (${details.join('; ')})`;
   }
 
-  const enableSnippet = $derived(
-    isWindows
+  const enableSnippet = $derived.by(() => {
+    if (linkedDirectRepo) {
+      return isWindows
+        ? `$env:SM_ENABLE_BACKUP="1"; $env:SM_BACKUP_PRUNE_MODE="external"; iex (iwr -useb ${baseUrl}/install.ps1).Content`
+        : `SM_ENABLE_BACKUP='1' SM_BACKUP_PRUNE_MODE='external' \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_PRUNE_MODE bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
+    }
+    return isWindows
       ? `$env:SM_ENABLE_BACKUP="1"; $env:SM_BACKUP_REPOS="<rest/s3 url>"; iex (iwr -useb ${baseUrl}/install.ps1).Content`
-      : `SM_ENABLE_BACKUP='1' SM_BACKUP_REPOS='<rest/s3 url>' \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_REPOS bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
-  );
+      : `SM_ENABLE_BACKUP='1' SM_BACKUP_REPOS='<rest/s3 url>' \\\n  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_REPOS bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
+  });
 
   type Tone = 'good' | 'warn' | 'bad' | 'none';
 
@@ -870,8 +883,8 @@
           <h3 class="text-base font-medium text-zinc-100">This host isn't backing up yet</h3>
           <p class="mt-1 text-sm text-zinc-500 max-w-xl">
             This agent is externally managed (a container image or read-only filesystem). Managed backups <span class="text-zinc-300">are</span>
-            supported — a Dockerized agent backs up its host directly. Enable it by setting
-            <span class="font-mono text-zinc-300">SM_ENABLE_BACKUP=1</span> plus a repository, then redeploy the container.
+            supported — a Dockerized agent backs up its host directly. Enable the backup runtime with
+            <span class="font-mono text-zinc-300">SM_ENABLE_BACKUP=1</span>, choose a centrally managed destination or local repository, then redeploy the container.
           </p>
           <p class="mt-3 text-sm text-zinc-500 max-w-xl">
             Create a repository under <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Backups</a>
@@ -891,37 +904,46 @@
           {#if canCreateRepo && linkedRepo}
             <div class="mt-4 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100/90">
               A repository <span class="font-mono text-emerald-200">{linkedRepo}</span> for this host already exists.
-              Point the agent at it, then it will report here. <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
+              {linkedDirectRepo
+                ? 'Its direct S3 assignment syncs automatically; allow up to one minute, then enable the backup runtime once if this host has never used backups.'
+                : 'Point the agent at it, then it will report here.'}
+              <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Open repositories</a>.
             </div>
           {:else if canCreateRepo}
             <div class="mt-4">
               <a
                 href="/backups?new=1&host={hostId}"
                 class="inline-flex items-center gap-2 text-sm px-4 py-2 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 font-medium">
-                {endpointConfigured ? 'Back up this host to this server →' : 'Back up this host to a storage node →'}
+                Choose a backup destination →
               </a>
-              <p class="mt-2 text-[11px] text-zinc-600">Creates the repository and shows the exact install command to run on this host.</p>
+              <p class="mt-2 text-[11px] text-zinc-600">Creates a repository namespace. Direct S3 assignments sync automatically; gateway destinations show the exact install command.</p>
             </div>
           {/if}
 
           <div class="mt-5">
             <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">
-              {canCreateRepo ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
+              {linkedDirectRepo ? 'Enable the managed backup runtime' : canCreateRepo ? 'Or back up to an external endpoint' : 'Enable backups on this host'}
             </div>
             <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200 select-text">{enableSnippet}</pre>
             <p class="mt-2 text-[11px] text-zinc-500">
               Run this on the host — the installer detects the existing agent and enables backups in place. Full setup — rest-server, S3/B2, TLS, recovery — is in <span class="font-mono text-zinc-600">deploy/BACKUPS.md</span>.
             </p>
-            <p class="mt-1.5 text-[11px] text-zinc-500">
-              An authenticated <span class="font-mono text-zinc-300">rest:</span> endpoint additionally needs
-              <span class="font-mono text-zinc-300">SM_BACKUP_REST_USERNAME</span> and <span class="font-mono text-zinc-300">SM_BACKUP_REST_PASSWORD</span>
-              (plus <span class="font-mono text-zinc-300">SM_BACKUP_PRUNE_MODE=external</span> for append-only endpoints) exported the same way and added to <span class="font-mono text-zinc-300">--preserve-env</span>.
-            </p>
+            {#if linkedDirectRepo}
+              <p class="mt-1.5 text-[11px] text-zinc-500">
+                Run this after the assignment has had up to one minute to sync. No <span class="font-mono text-zinc-300">SM_BACKUP_REPOS</span> or S3 secret is needed: the endpoint, per-host prefix, and encrypted provider credential are centrally delivered. External pruning avoids giving the host delete authority.
+              </p>
+            {:else}
+              <p class="mt-1.5 text-[11px] text-zinc-500">
+                An authenticated <span class="font-mono text-zinc-300">rest:</span> endpoint additionally needs
+                <span class="font-mono text-zinc-300">SM_BACKUP_REST_USERNAME</span> and <span class="font-mono text-zinc-300">SM_BACKUP_REST_PASSWORD</span>
+                (plus <span class="font-mono text-zinc-300">SM_BACKUP_PRUNE_MODE=external</span> for append-only endpoints) exported the same way and added to <span class="font-mono text-zinc-300">--preserve-env</span>.
+              </p>
+            {/if}
             {#if !canCreateRepo}
               <p class="mt-1.5 text-[11px] text-zinc-500">
-                This server can also hold backups itself — set <span class="font-mono text-zinc-300">BACKUP_DIR</span> or
-                <span class="font-mono text-zinc-300">BACKUP_S3_BUCKET</span> on the server, or promote a monitored host into a storage node with
-                <span class="font-mono text-zinc-300">BACKUP_WG_PORT</span>, and repositories can be minted from
+                Add a direct S3/R2 destination, set <span class="font-mono text-zinc-300">BACKUP_DIR</span> or
+                <span class="font-mono text-zinc-300">BACKUP_S3_BUCKET</span> for the server gateway, or promote a monitored host into a storage node with
+                <span class="font-mono text-zinc-300">BACKUP_WG_PORT</span>; repository namespaces can then be created from
                 <a href="/backups" class="text-sky-300 hover:text-sky-200 underline underline-offset-2">Backups</a>.
               </p>
             {/if}
@@ -950,6 +972,7 @@
                     {#if v.engine}<span class="hidden sm:inline shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</span>{/if}
                     {#if v.tunnel}<span class="shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}
                   </div>
+                  {#if managedDataPath(v.repo)}<div class="mt-1 pl-3.5 text-[10px] text-zinc-500">{managedDataPath(v.repo)}</div>{/if}
                 </td>
                 <td class="px-2 sm:px-3 py-2.5">
                   {#if isRunning(v.repo)}
@@ -984,6 +1007,7 @@
             <header class="flex items-center justify-between gap-3">
               <div class="min-w-0">
                 <h3 class="min-w-0 truncate font-mono text-sm text-zinc-100">{v.repo}</h3>
+                {#if managedDataPath(v.repo)}<div class="mt-0.5 text-[10px] text-zinc-500">{managedDataPath(v.repo)}</div>{/if}
                 {#if v.engine}<div class="mt-0.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}{#if v.tunnel}<span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}</div>{:else if v.tunnel}<div class="mt-0.5 text-[10px] uppercase tracking-wider"><span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300">tunnel</span></div>{/if}
               </div>
               {#if isRunning(v.repo)}

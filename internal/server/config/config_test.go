@@ -82,15 +82,93 @@ func TestLoadTLSGate(t *testing.T) {
 }
 
 var allEnvKeys = map[string]struct{}{
-	"DATABASE_URL":        {},
-	"ADMIN_TOKEN":         {},
-	"TLS_CERT_FILE":       {},
-	"TLS_KEY_FILE":        {},
-	"TRUST_PROXY_TLS":     {},
-	"INSECURE_ALLOW_HTTP": {},
-	"TRUSTED_PROXIES":     {},
-	"HTTP_ADDR":           {},
-	"BACKUP_ACME_DOMAIN":  {},
+	"DATABASE_URL":                 {},
+	"ADMIN_TOKEN":                  {},
+	"TLS_CERT_FILE":                {},
+	"TLS_KEY_FILE":                 {},
+	"TRUST_PROXY_TLS":              {},
+	"INSECURE_ALLOW_HTTP":          {},
+	"TRUSTED_PROXIES":              {},
+	"HTTP_ADDR":                    {},
+	"BACKUP_ACME_DOMAIN":           {},
+	"BACKUP_S3_ACCESS_KEY_ID":      {},
+	"BACKUP_S3_SECRET_ACCESS_KEY":  {},
+	"BACKUP_S3_SESSION_TOKEN":      {},
+	"BACKUP_SECRETS_KEY":           {},
+	"ARCHIVE_S3_BUCKET":            {},
+	"ARCHIVE_S3_REGION":            {},
+	"ARCHIVE_S3_PREFIX":            {},
+	"ARCHIVE_S3_ENDPOINT":          {},
+	"ARCHIVE_S3_USE_PATH_STYLE":    {},
+	"ARCHIVE_S3_ACCESS_KEY_ID":     {},
+	"ARCHIVE_S3_SECRET_ACCESS_KEY": {},
+	"ARCHIVE_S3_SESSION_TOKEN":     {},
+	"S3_BUCKET":                    {},
+	"S3_REGION":                    {},
+	"S3_PREFIX":                    {},
+	"S3_ENDPOINT":                  {},
+	"S3_USE_PATH_STYLE":            {},
+}
+
+func TestLoadArchiveS3CanonicalNamesOverrideLegacyAliases(t *testing.T) {
+	for k := range allEnvKeys {
+		t.Setenv(k, "")
+	}
+	t.Setenv("DATABASE_URL", "postgres://servermonitor:real-password@db:5432/servermonitor")
+	t.Setenv("ADMIN_TOKEN", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+	t.Setenv("INSECURE_ALLOW_HTTP", "1")
+	t.Setenv("S3_BUCKET", "legacy-bucket")
+	t.Setenv("S3_REGION", "legacy-region")
+	t.Setenv("ARCHIVE_S3_BUCKET", "archive-bucket")
+	t.Setenv("ARCHIVE_S3_REGION", "archive-region")
+	t.Setenv("ARCHIVE_S3_ACCESS_KEY_ID", "archive-key")
+	t.Setenv("ARCHIVE_S3_SECRET_ACCESS_KEY", "archive-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ArchiveS3Bucket != "archive-bucket" || cfg.ArchiveS3Region != "archive-region" {
+		t.Fatalf("canonical archive settings did not win: bucket=%q region=%q", cfg.ArchiveS3Bucket, cfg.ArchiveS3Region)
+	}
+	if cfg.ArchiveS3AccessKeyID != "archive-key" || cfg.ArchiveS3SecretKey != "archive-secret" {
+		t.Fatal("archive-specific credentials were not loaded")
+	}
+
+	t.Setenv("ARCHIVE_S3_BUCKET", "")
+	t.Setenv("ARCHIVE_S3_REGION", "")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load legacy aliases: %v", err)
+	}
+	if cfg.ArchiveS3Bucket != "legacy-bucket" || cfg.ArchiveS3Region != "legacy-region" {
+		t.Fatalf("legacy aliases were not preserved: bucket=%q region=%q", cfg.ArchiveS3Bucket, cfg.ArchiveS3Region)
+	}
+}
+
+func TestLoadBackupS3Credentials(t *testing.T) {
+	for k := range allEnvKeys {
+		t.Setenv(k, "")
+	}
+	t.Setenv("DATABASE_URL", "postgres://servermonitor:real-password@db:5432/servermonitor")
+	t.Setenv("ADMIN_TOKEN", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+	t.Setenv("INSECURE_ALLOW_HTTP", "1")
+	t.Setenv("BACKUP_S3_ACCESS_KEY_ID", "backup-key")
+	t.Setenv("BACKUP_S3_SECRET_ACCESS_KEY", "backup-secret")
+	t.Setenv("BACKUP_S3_SESSION_TOKEN", "backup-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BackupS3AccessKeyID != "backup-key" || cfg.BackupS3SecretKey != "backup-secret" || cfg.BackupS3SessionToken != "backup-token" {
+		t.Fatalf("backup S3 credentials were not loaded")
+	}
+
+	t.Setenv("BACKUP_S3_SECRET_ACCESS_KEY", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be set together") {
+		t.Fatalf("expected incomplete backup S3 credentials to be rejected, got %v", err)
+	}
 }
 
 func TestLoadRejectsPlaceholderSecrets(t *testing.T) {

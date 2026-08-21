@@ -13,6 +13,7 @@ ENABLE_DOCKER="${SM_ENABLE_DOCKER:-0}"
 ENABLE_GPU="${SM_ENABLE_GPU:-0}"
 ENABLE_NETWORK="${SM_ENABLE_NETWORK:-0}"
 ENABLE_PORT_OWNERS="${SM_ENABLE_PORT_OWNERS:-0}"
+ENABLE_IPBAN="${SM_ENABLE_IPBAN:-0}"
 ENABLE_ALL="${SM_ENABLE_ALL:-0}"
 ENABLE_BACKUP=0
 DISABLE_BACKUP=0
@@ -44,7 +45,7 @@ DEFAULT_BACKUP_EXCLUDES_TOML='excludes = ["**/.cache", "/var/lib/servermonitor",
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-all] [--enable-backup] [--disable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-excludes CSV] [--backup-one-file-system 0|1] [--backup-time HH:MM] [--reinstall]
+Usage: $0 --server URL --binary /path/to/sm-agent [--admin-token-file PATH] [--hostname NAME] [--interval SECONDS] [--enable-port-owners] [--enable-smart] [--enable-smart-nvme] [--enable-docker] [--enable-gpu] [--enable-network] [--enable-ipban] [--enable-all] [--enable-backup] [--disable-backup] [--backup-repos URLS] [--backup-repo-names NAMES] [--backup-paths PATHS] [--backup-excludes CSV] [--backup-one-file-system 0|1] [--backup-time HH:MM] [--reinstall]
 
 Installs the ServerMonitor agent as a systemd service. Registers the host
 with the server and writes /etc/servermonitor/agent.toml.
@@ -70,11 +71,12 @@ extra collector's grant:
   --enable-docker       adds 'docker' group membership (containers collector)
   --enable-gpu          adds 'video' group membership (some nvidia-smi setups)
   --enable-network      adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
-  --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme and --enable-backup; CAP_SYS_ADMIN and whole-host backup read access must be opted into explicitly
-  --enable-backup       provisions scheduled encrypted restic backups: installs a pinned restic to /usr/local/bin/sm-restic, writes /etc/servermonitor-backup/backup.toml, generates a repo key, runs 'sm-agent backup init', and adds an sm-backup systemd timer whose oneshot unit runs with CAP_DAC_READ_SEARCH so it can read every file on the host to back it up. That grant is confined to the backup unit, not the resident agent. NOT included in --enable-all. Requires --backup-repos (or SM_BACKUP_REPOS) on a fresh setup
+  --enable-ipban        reactive IP banning: adds 'systemd-journal' + 'adm' group membership so the agent can follow sshd login failures, and CAP_NET_ADMIN so it can drop repeat offenders through its own nftables table (inet sm_agent). Thresholds, allowlist and fleet sharing are managed from the server's Security page; the agent needs no local config. Firewall-write authority for the resident agent, so NOT included in --enable-all
+  --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme, --enable-ipban and --enable-backup; CAP_SYS_ADMIN, firewall writes and whole-host backup read access must be opted into explicitly
+  --enable-backup       provisions scheduled encrypted restic backups: installs a pinned restic to /usr/local/bin/sm-restic, writes /etc/servermonitor-backup/backup.toml, generates a repo key, runs 'sm-agent backup init', and adds an sm-backup systemd timer whose oneshot unit runs with CAP_DAC_READ_SEARCH so it can read every file on the host to back it up. That grant is confined to the backup unit, not the resident agent. NOT included in --enable-all. Requires local --backup-repos or a centrally assigned direct repository already synchronized by the agent
 
 Backup inputs (used with --enable-backup; each also settable via the matching SM_BACKUP_* env var):
-  --backup-repos URLS         comma-separated restic repository URLs (e.g. rest:https://user:pass@host/repo). Required on a fresh backup setup
+  --backup-repos URLS         comma-separated restic repository URLs (e.g. rest:https://user:pass@host/repo). Optional when a centrally assigned direct repository has already synchronized
                                tunnel:NAME backs up over the built-in WireGuard tunnel to the ServerMonitor server (requires the server to run with BACKUP_WG_PORT)
   --backup-repo-names NAMES   comma-separated logical names matching --backup-repos (default repo1..repoN)
   --backup-paths PATHS        comma-separated paths to back up (default /etc,/home,/root,/var/lib)
@@ -253,6 +255,7 @@ while [[ $# -gt 0 ]]; do
     --enable-docker)     ENABLE_DOCKER=1; shift ;;
     --enable-gpu)        ENABLE_GPU=1; shift ;;
     --enable-network)    ENABLE_NETWORK=1; shift ;;
+    --enable-ipban)      ENABLE_IPBAN=1; shift ;;
     --enable-all)        ENABLE_ALL=1; shift ;;
     --enable-backup)     ENABLE_BACKUP=1; DISABLE_BACKUP=0; shift ;;
     --disable-backup)    DISABLE_BACKUP=1; ENABLE_BACKUP=0; shift ;;
@@ -375,6 +378,22 @@ WARNING: --enable-backup grants the sm-backup unit CAP_DAC_READ_SEARCH, letting
          the oneshot sm-backup.service and its timer, NOT the resident sm-agent
          daemon, and it is excluded from --enable-all. Enable it only where
          whole-host read access for backups is worth that exposure.
+
+WARN
+}
+
+warn_ipban_capability() {
+  cat >&2 <<'WARN'
+
+WARNING: --enable-ipban grants the resident sm-agent daemon CAP_NET_ADMIN so it
+         can write bans into nftables, and joins it to the systemd-journal and
+         adm groups so it can read every service's logs (login failures live
+         next to whatever else your services log). A compromised agent could
+         then rewrite the host firewall. It is excluded from --enable-all;
+         enable it only where reactive IP banning is worth that exposure.
+         Bans persist in the kernel table 'inet sm_agent' until they expire;
+         'sm-agent ipban status' lists them and 'sm-agent ipban teardown'
+         removes the table.
 
 WARN
 }
@@ -932,11 +951,30 @@ backup_init_as_agent() {
   fi
 }
 
+backup_have_managed_repos() {
+  [ -r /var/lib/servermonitor/managed-backups/repositories.json ] &&
+    grep -Eq '"repositories"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{' /var/lib/servermonitor/managed-backups/repositories.json
+}
+
+backup_write_effective_recovery_kit() {
+  local tmp
+  tmp="$(mktemp /etc/servermonitor-backup/recovery-kit.txt.XXXXXX)"
+  if ! /usr/local/bin/sm-agent backup recovery-kit --config /etc/servermonitor-backup/backup.toml > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0400 "$tmp"
+  chown root:root "$tmp"
+  mv -f "$tmp" /etc/servermonitor-backup/recovery-kit.txt
+}
+
 provision_backup() {
   backup_validate_tunnel_repos
   backup_migrate_legacy
-  if [ ! -f /etc/servermonitor-backup/backup.toml ] && [ -z "$BACKUP_REPOS" ]; then
-    echo "--enable-backup requires --backup-repos (or SM_BACKUP_REPOS) on a fresh setup" >&2
+  local managed_repos=0
+  if backup_have_managed_repos; then managed_repos=1; fi
+  if [ ! -f /etc/servermonitor-backup/backup.toml ] && [ -z "$BACKUP_REPOS" ] && [ "$managed_repos" != "1" ]; then
+    echo "--enable-backup requires --backup-repos (or SM_BACKUP_REPOS), or a centrally assigned direct repository that the resident agent has already synchronized" >&2
     exit 1
   fi
   case "$BACKUP_PRUNE_MODE" in
@@ -972,6 +1010,10 @@ provision_backup() {
     echo "note: --backup-repos not provided; keeping existing /etc/servermonitor-backup/backup.toml"
     chmod 0640 /etc/servermonitor-backup/backup.toml
     chown root:sm-agent /etc/servermonitor-backup/backup.toml
+  elif [ "$managed_repos" = "1" ]; then
+    backup_write_toml
+    repos_written=1
+    echo "note: wrote backup.toml for the centrally assigned direct repository"
   fi
   if [ "$BACKUP_HAS_TUNNEL" = "1" ]; then
     backup_enroll_tunnel
@@ -980,8 +1022,18 @@ provision_backup() {
     echo "sm-agent backup init failed; backup not scheduled" >&2
     exit 1
   fi
+  if [ "$managed_repos" = "1" ]; then
+    if ! backup_write_effective_recovery_kit; then
+      echo "could not write a recovery kit containing the effective managed repository; backup not scheduled" >&2
+      exit 1
+    fi
+  fi
   backup_write_units
-  if [ "$key_fresh" = "1" ]; then
+  if [ "$managed_repos" = "1" ] && [ "$key_fresh" = "1" ]; then
+    backup_print_recovery_kit
+  elif [ "$managed_repos" = "1" ]; then
+    echo "note: recovery kit updated from the effective managed configuration at /etc/servermonitor-backup/recovery-kit.txt (password unchanged, not reprinted)"
+  elif [ "$key_fresh" = "1" ]; then
     backup_write_recovery_kit
     backup_print_recovery_kit
   elif [ "$repos_written" = "1" ]; then
@@ -1031,11 +1083,13 @@ id -u sm-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr
 
 [ "$ENABLE_SMART" = "1" ] && install_smartmontools
 [ "$ENABLE_SMART" = "1" ] && warn_nvme_smart
+[ "$ENABLE_IPBAN" = "1" ] && warn_ipban_capability
 
 WANTED_GROUPS=()
 [ "$ENABLE_SMART" = "1" ]  && WANTED_GROUPS+=(disk)
 [ "$ENABLE_DOCKER" = "1" ] && WANTED_GROUPS+=(docker)
 [ "$ENABLE_GPU" = "1" ]    && WANTED_GROUPS+=(video)
+[ "$ENABLE_IPBAN" = "1" ]  && WANTED_GROUPS+=(systemd-journal adm)
 PRESENT_GROUPS=()
 for grp in "${WANTED_GROUPS[@]}"; do
   if getent group "$grp" >/dev/null 2>&1; then
@@ -1074,6 +1128,10 @@ install -o sm-agent -g sm-agent -m 0700 -d /var/lib/servermonitor
 install -o sm-agent -g sm-agent -m 0755 -d /opt/servermonitor
 refresh_agent_binaries
 
+if [ "$ENABLE_IPBAN" != "1" ] && [ -x /usr/local/bin/sm-agent ]; then
+  /usr/local/bin/sm-agent ipban teardown >/dev/null 2>&1 || true
+fi
+
 if [ "$RECONFIGURE" != "1" ]; then
 ARGS=(--server "$SERVER_URL" --interval "$INTERVAL")
 [[ -n "$HOSTNAME_OVERRIDE" ]] && ARGS+=(--hostname "$HOSTNAME_OVERRIDE")
@@ -1093,6 +1151,12 @@ CAPS=""
 [ "$ENABLE_SMART" = "1" ]       && CAPS="${CAPS:+$CAPS }CAP_SYS_RAWIO"
 [ "$ENABLE_SMART_NVME" = "1" ]  && CAPS="${CAPS:+$CAPS }CAP_SYS_ADMIN"
 [ "$ENABLE_NETWORK" = "1" ]     && CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN CAP_NET_RAW"
+if [ "$ENABLE_IPBAN" = "1" ]; then
+  case " $CAPS " in
+    *" CAP_NET_ADMIN "*) ;;
+    *) CAPS="${CAPS:+$CAPS }CAP_NET_ADMIN" ;;
+  esac
+fi
 
 DOCKER_ORDER=""
 if [ "$ENABLE_DOCKER" = "1" ]; then

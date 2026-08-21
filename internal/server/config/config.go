@@ -13,46 +13,54 @@ import (
 )
 
 type Config struct {
-	HTTPAddr             string
-	DatabaseURL          string
-	AdminToken           string
-	S3Bucket             string
-	S3Region             string
-	S3Prefix             string
-	S3Endpoint           string
-	S3UsePathStyle       bool
-	BackupDir            string
-	BackupS3Bucket       string
-	BackupS3Region       string
-	BackupS3Prefix       string
-	BackupS3Endpoint     string
-	BackupS3UsePathStyle bool
-	BackupMaxBlobBytes   int64
-	BackupWGPort         int
-	BackupWGEndpoint     string
-	BackupWGSubnet       string
-	BackupWGMTU          int
-	BackupPublicHTTP     bool
-	BackupACMEDomain     string
-	ACMEEmail            string
-	ACMECacheDir         string
-	IngestRateLimit      int
-	IngestBurst          int
-	BatcherMaxRows       int
-	BatcherMaxAge        time.Duration
-	LogLevel             string
-	RetentionRaw         string
-	RetentionAggregate5m string
-	RetentionProcesses   string
-	RetentionContainers  string
-	RetentionPorts       string
-	CompressionAfter     string
-	TrustedProxies       []*net.IPNet
-	TLSCertFile          string
-	TLSKeyFile           string
-	TrustProxyTLS        bool
-	InsecureAllowHTTP    bool
-	AgentSigningKeyFile  string
+	HTTPAddr              string
+	DatabaseURL           string
+	AdminToken            string
+	ArchiveS3Bucket       string
+	ArchiveS3Region       string
+	ArchiveS3Prefix       string
+	ArchiveS3Endpoint     string
+	ArchiveS3UsePathStyle bool
+	ArchiveS3AccessKeyID  string
+	ArchiveS3SecretKey    string
+	ArchiveS3SessionToken string
+	BackupDir             string
+	BackupS3Bucket        string
+	BackupS3Region        string
+	BackupS3Prefix        string
+	BackupS3Endpoint      string
+	BackupS3UsePathStyle  bool
+	BackupS3AccessKeyID   string
+	BackupS3SecretKey     string
+	BackupS3SessionToken  string
+	BackupSecretsKey      string
+	BackupMaxBlobBytes    int64
+	BackupWGPort          int
+	BackupWGEndpoint      string
+	BackupWGSubnet        string
+	BackupWGMTU           int
+	BackupPublicHTTP      bool
+	BackupACMEDomain      string
+	ACMEEmail             string
+	ACMECacheDir          string
+	IngestRateLimit       int
+	IngestBurst           int
+	BatcherMaxRows        int
+	BatcherMaxAge         time.Duration
+	LogLevel              string
+	RetentionRaw          string
+	RetentionAggregate5m  string
+	RetentionProcesses    string
+	RetentionContainers   string
+	RetentionPorts        string
+	RetentionIPBanEvents  string
+	CompressionAfter      string
+	TrustedProxies        []*net.IPNet
+	TLSCertFile           string
+	TLSKeyFile            string
+	TrustProxyTLS         bool
+	InsecureAllowHTTP     bool
+	AgentSigningKeyFile   string
 }
 
 func (c *Config) ServesTLS() bool      { return c.TLSCertFile != "" && c.TLSKeyFile != "" }
@@ -90,45 +98,53 @@ func (c *Config) BackupTLSSecure() bool { return c.BackupTLSMode() != "insecure"
 
 func Load() (*Config, error) {
 	c := &Config{
-		HTTPAddr:             getenv("HTTP_ADDR", ":8080"),
-		DatabaseURL:          getenv("DATABASE_URL", ""),
-		AdminToken:           getenv("ADMIN_TOKEN", ""),
-		S3Bucket:             getenv("S3_BUCKET", ""),
-		S3Region:             getenv("S3_REGION", ""),
-		S3Prefix:             getenv("S3_PREFIX", "metrics"),
-		S3Endpoint:           getenv("S3_ENDPOINT", ""),
-		S3UsePathStyle:       getenvBool("S3_USE_PATH_STYLE", false),
-		BackupDir:            getenv("BACKUP_DIR", ""),
-		BackupS3Bucket:       getenv("BACKUP_S3_BUCKET", ""),
-		BackupS3Region:       getenv("BACKUP_S3_REGION", ""),
-		BackupS3Prefix:       getenv("BACKUP_S3_PREFIX", "backups"),
-		BackupS3Endpoint:     getenv("BACKUP_S3_ENDPOINT", ""),
-		BackupS3UsePathStyle: getenvBool("BACKUP_S3_USE_PATH_STYLE", false),
-		BackupMaxBlobBytes:   getenvInt64("BACKUP_MAX_BLOB_BYTES", 1<<30),
-		BackupWGPort:         getenvInt("BACKUP_WG_PORT", 0),
-		BackupWGEndpoint:     getenv("BACKUP_WG_ENDPOINT", ""),
-		BackupWGSubnet:       getenv("BACKUP_WG_SUBNET", "10.83.0.0/16"),
-		BackupWGMTU:          getenvInt("BACKUP_WG_MTU", 1280),
-		BackupPublicHTTP:     getenvBool("BACKUP_PUBLIC_HTTP", false),
-		BackupACMEDomain:     getenv("BACKUP_ACME_DOMAIN", ""),
-		ACMEEmail:            getenv("ACME_EMAIL", ""),
-		ACMECacheDir:         getenv("ACME_CACHE_DIR", ""),
-		IngestRateLimit:      getenvInt("INGEST_RATE_LIMIT", 10),
-		IngestBurst:          getenvInt("INGEST_BURST", 30),
-		BatcherMaxRows:       getenvInt("BATCHER_MAX_ROWS", 50000),
-		BatcherMaxAge:        getenvDuration("BATCHER_MAX_AGE", 2*time.Second),
-		LogLevel:             getenv("LOG_LEVEL", "info"),
-		RetentionRaw:         getenv("RETENTION_RAW", "30 days"),
-		RetentionAggregate5m: getenv("RETENTION_AGGREGATE_5M", "6 months"),
-		RetentionProcesses:   getenv("RETENTION_PROCESSES", "7 days"),
-		RetentionContainers:  getenv("RETENTION_CONTAINERS", "30 days"),
-		RetentionPorts:       getenv("RETENTION_PORTS", "30 days"),
-		CompressionAfter:     getenv("COMPRESSION_AFTER", "7 days"),
-		TLSCertFile:          getenv("TLS_CERT_FILE", ""),
-		TLSKeyFile:           getenv("TLS_KEY_FILE", ""),
-		TrustProxyTLS:        getenvBool("TRUST_PROXY_TLS", false),
-		InsecureAllowHTTP:    getenvBool("INSECURE_ALLOW_HTTP", false),
-		AgentSigningKeyFile:  getenv("AGENT_SIGNING_KEY_FILE", ""),
+		HTTPAddr:              getenv("HTTP_ADDR", ":8080"),
+		DatabaseURL:           getenv("DATABASE_URL", ""),
+		AdminToken:            getenv("ADMIN_TOKEN", ""),
+		ArchiveS3Bucket:       getenvFirst("", "ARCHIVE_S3_BUCKET", "S3_BUCKET"),
+		ArchiveS3Region:       getenvFirst("", "ARCHIVE_S3_REGION", "S3_REGION"),
+		ArchiveS3Prefix:       getenvFirst("metrics", "ARCHIVE_S3_PREFIX", "S3_PREFIX"),
+		ArchiveS3Endpoint:     getenvFirst("", "ARCHIVE_S3_ENDPOINT", "S3_ENDPOINT"),
+		ArchiveS3UsePathStyle: getenvBoolFirst(false, "ARCHIVE_S3_USE_PATH_STYLE", "S3_USE_PATH_STYLE"),
+		ArchiveS3AccessKeyID:  getenvFirst("", "ARCHIVE_S3_ACCESS_KEY_ID"),
+		ArchiveS3SecretKey:    getenvFirst("", "ARCHIVE_S3_SECRET_ACCESS_KEY"),
+		ArchiveS3SessionToken: getenvFirst("", "ARCHIVE_S3_SESSION_TOKEN"),
+		BackupDir:             getenv("BACKUP_DIR", ""),
+		BackupS3Bucket:        getenv("BACKUP_S3_BUCKET", ""),
+		BackupS3Region:        getenv("BACKUP_S3_REGION", ""),
+		BackupS3Prefix:        getenv("BACKUP_S3_PREFIX", "backups"),
+		BackupS3Endpoint:      getenv("BACKUP_S3_ENDPOINT", ""),
+		BackupS3UsePathStyle:  getenvBool("BACKUP_S3_USE_PATH_STYLE", false),
+		BackupS3AccessKeyID:   getenv("BACKUP_S3_ACCESS_KEY_ID", ""),
+		BackupS3SecretKey:     getenv("BACKUP_S3_SECRET_ACCESS_KEY", ""),
+		BackupS3SessionToken:  getenv("BACKUP_S3_SESSION_TOKEN", ""),
+		BackupSecretsKey:      getenv("BACKUP_SECRETS_KEY", ""),
+		BackupMaxBlobBytes:    getenvInt64("BACKUP_MAX_BLOB_BYTES", 1<<30),
+		BackupWGPort:          getenvInt("BACKUP_WG_PORT", 0),
+		BackupWGEndpoint:      getenv("BACKUP_WG_ENDPOINT", ""),
+		BackupWGSubnet:        getenv("BACKUP_WG_SUBNET", "10.83.0.0/16"),
+		BackupWGMTU:           getenvInt("BACKUP_WG_MTU", 1280),
+		BackupPublicHTTP:      getenvBool("BACKUP_PUBLIC_HTTP", false),
+		BackupACMEDomain:      getenv("BACKUP_ACME_DOMAIN", ""),
+		ACMEEmail:             getenv("ACME_EMAIL", ""),
+		ACMECacheDir:          getenv("ACME_CACHE_DIR", ""),
+		IngestRateLimit:       getenvInt("INGEST_RATE_LIMIT", 10),
+		IngestBurst:           getenvInt("INGEST_BURST", 30),
+		BatcherMaxRows:        getenvInt("BATCHER_MAX_ROWS", 50000),
+		BatcherMaxAge:         getenvDuration("BATCHER_MAX_AGE", 2*time.Second),
+		LogLevel:              getenv("LOG_LEVEL", "info"),
+		RetentionRaw:          getenv("RETENTION_RAW", "30 days"),
+		RetentionAggregate5m:  getenv("RETENTION_AGGREGATE_5M", "6 months"),
+		RetentionProcesses:    getenv("RETENTION_PROCESSES", "7 days"),
+		RetentionContainers:   getenv("RETENTION_CONTAINERS", "30 days"),
+		RetentionPorts:        getenv("RETENTION_PORTS", "30 days"),
+		RetentionIPBanEvents:  getenv("RETENTION_IPBAN_EVENTS", "90 days"),
+		CompressionAfter:      getenv("COMPRESSION_AFTER", "7 days"),
+		TLSCertFile:           getenv("TLS_CERT_FILE", ""),
+		TLSKeyFile:            getenv("TLS_KEY_FILE", ""),
+		TrustProxyTLS:         getenvBool("TRUST_PROXY_TLS", false),
+		InsecureAllowHTTP:     getenvBool("INSECURE_ALLOW_HTTP", false),
+		AgentSigningKeyFile:   getenv("AGENT_SIGNING_KEY_FILE", ""),
 	}
 
 	if c.DatabaseURL == "" {
@@ -151,6 +167,12 @@ func Load() (*Config, error) {
 	}
 	if c.BackupDir != "" && c.BackupS3Bucket != "" {
 		return nil, fmt.Errorf("set BACKUP_DIR or BACKUP_S3_BUCKET, not both")
+	}
+	if (c.BackupS3AccessKeyID == "") != (c.BackupS3SecretKey == "") || (c.BackupS3SessionToken != "" && c.BackupS3AccessKeyID == "") {
+		return nil, fmt.Errorf("BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY must be set together")
+	}
+	if (c.ArchiveS3AccessKeyID == "") != (c.ArchiveS3SecretKey == "") || (c.ArchiveS3SessionToken != "" && c.ArchiveS3AccessKeyID == "") {
+		return nil, fmt.Errorf("ARCHIVE_S3_ACCESS_KEY_ID and ARCHIVE_S3_SECRET_ACCESS_KEY must be set together")
 	}
 	if c.BackupWGPort != 0 {
 		if c.BackupWGPort < 1 || c.BackupWGPort > 65535 {
@@ -187,6 +209,7 @@ func Load() (*Config, error) {
 		{"RETENTION_PROCESSES", c.RetentionProcesses},
 		{"RETENTION_CONTAINERS", c.RetentionContainers},
 		{"RETENTION_PORTS", c.RetentionPorts},
+		{"RETENTION_IPBAN_EVENTS", c.RetentionIPBanEvents},
 		{"COMPRESSION_AFTER", c.CompressionAfter},
 	} {
 		if err := ValidateInterval(p.value); err != nil {
@@ -199,6 +222,27 @@ func Load() (*Config, error) {
 	}
 	c.TrustedProxies = nets
 	return c, nil
+}
+
+func getenvFirst(fallback string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+func getenvBoolFirst(fallback bool, keys ...string) bool {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			parsed, err := strconv.ParseBool(value)
+			if err == nil {
+				return parsed
+			}
+		}
+	}
+	return fallback
 }
 
 func parseTrustedProxies(raw string) ([]*net.IPNet, error) {

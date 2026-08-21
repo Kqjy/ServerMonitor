@@ -86,6 +86,7 @@ type Repo struct {
 	S3PathStyle  bool               `toml:"s3_path_style"`
 	Retention    *RetentionOverride `toml:"retention"`
 
+	managed   bool
 	tunnelErr error
 }
 
@@ -253,6 +254,15 @@ func loadConfig(path string, allowUnenrolledTunnel bool) (Config, error) {
 	if cfg.PruneMode == "" {
 		cfg.PruneMode = "host"
 	}
+	passwordFile := filepath.Join(filepath.Dir(path), "backup.key")
+	if len(cfg.Repos) > 0 && strings.TrimSpace(cfg.Repos[0].PasswordFile) != "" {
+		passwordFile = strings.TrimSpace(cfg.Repos[0].PasswordFile)
+	}
+	managedRepos, err := loadManagedRepos(cfg.StatusPath, passwordFile)
+	if err != nil {
+		return Config{}, fmt.Errorf("load centrally managed repositories: %w", err)
+	}
+	cfg.Repos = append(cfg.Repos, managedRepos...)
 	if err := cfg.validate(allowUnenrolledTunnel); err != nil {
 		return Config{}, fmt.Errorf("validate backup config %s: %w", path, err)
 	}
@@ -301,7 +311,9 @@ func (c Config) validate(allowUnenrolledTunnel bool) error {
 		return err
 	}
 	if len(c.Repos) == 0 {
-		return fmt.Errorf("at least one repo is required")
+		if !ManagedBackupConfigExists(c.StatusPath) {
+			return fmt.Errorf("at least one repo is required")
+		}
 	}
 	seen := map[string]bool{}
 	for i, repo := range c.Repos {
@@ -455,6 +467,7 @@ func trimmedRepos(repos []Repo) []Repo {
 			S3Region:     strings.TrimSpace(repo.S3Region),
 			S3PathStyle:  repo.S3PathStyle,
 			Retention:    repo.Retention,
+			managed:      repo.managed,
 		})
 	}
 	return out

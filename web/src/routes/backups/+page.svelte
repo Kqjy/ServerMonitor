@@ -9,6 +9,8 @@
     type BackupTunnelResp,
     type BackupTunnelPeer,
     type BackupNode,
+    type BackupDestination,
+    type BackupS3CredentialsInput,
     type BackupRepoStatus,
     type Host
   } from '$lib/api';
@@ -42,7 +44,8 @@
   let editError = $state<string | null>(null);
   let editBusy = $state(false);
 
-  let newDestination = $state<'server' | number>('server');
+  type DestinationSelection = 'server' | `node:${number}` | `direct:${number}`;
+  let newDestination = $state<DestinationSelection>('server');
   let baseUrl = $state('');
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -53,6 +56,10 @@
   let newQuotaGiB = $state<number | null>(null);
   let creating = $state(false);
   let createError = $state<string | null>(null);
+  let useScopedCredentials = $state(true);
+  let scopedAccessKeyId = $state('');
+  let scopedSecretAccessKey = $state('');
+  let scopedSessionToken = $state('');
   let credential = $state<BackupCredential | null>(null);
   let snippetTab = $state<SnippetTab>('linux');
   let copied = $state<string | null>(null);
@@ -63,6 +70,26 @@
   let retiredNodeTargetToDelete = $state<BackupTarget | null>(null);
   let toEditQuota = $state<BackupTarget | null>(null);
   let editQuotaGiB = $state<number | null>(null);
+
+  let addingDestination = $state(false);
+  let destinationName = $state('');
+  let destinationEndpoint = $state('');
+  let destinationBucket = $state('');
+  let destinationRegion = $state('');
+  let destinationPrefix = $state('backups/hosts/{host_id}-{hostname}/{repository}');
+  let destinationPathStyle = $state(false);
+  let destinationAccessKeyId = $state('');
+  let destinationSecretAccessKey = $state('');
+  let destinationSessionToken = $state('');
+  let destinationBusy = $state(false);
+  let destinationError = $state<string | null>(null);
+  let destinationToDelete = $state<BackupDestination | null>(null);
+  let destinationCredentialsFor = $state<BackupDestination | null>(null);
+  let repositoryCredentialsFor = $state<BackupTarget | null>(null);
+  let repositoryAccessKeyId = $state('');
+  let repositorySecretAccessKey = $state('');
+  let repositorySessionToken = $state('');
+  let repositoryCredentialError = $state<string | null>(null);
 
   let firstBlobSeen = $state(false);
   let linkedRepoStatus = $state<BackupRepoStatus | null>(null);
@@ -196,8 +223,18 @@
   }
 
   const promotableHosts = $derived(hosts.filter((h) => !nodes.some((n) => n.host_id === h.id)));
-  const selectedNode = $derived(newDestination === 'server' ? null : (nodes.find((n) => n.host_id === newDestination) ?? null));
-  const destinationReady = $derived(newDestination === 'server' ? (data?.configured ?? false) : selectedNode?.enrolled === true && nodeAvailability(selectedNode) === null);
+  const selectedNodeId = $derived(newDestination.startsWith('node:') ? Number(newDestination.slice(5)) : null);
+  const selectedDirectId = $derived(newDestination.startsWith('direct:') ? Number(newDestination.slice(7)) : null);
+  const selectedNode = $derived(selectedNodeId == null ? null : (nodes.find((n) => n.host_id === selectedNodeId) ?? null));
+  const selectedDirectDestination = $derived(selectedDirectId == null ? null : (data?.destinations.find((d) => d.id === selectedDirectId) ?? null));
+  const scopedCredentialsValid = $derived(scopedAccessKeyId.trim() !== '' && scopedSecretAccessKey.trim() !== '');
+  const destinationReady = $derived(
+    newDestination === 'server'
+      ? (data?.configured ?? false)
+      : selectedNode
+        ? selectedNode.enrolled === true && nodeAvailability(selectedNode) === null
+        : selectedDirectDestination != null && (useScopedCredentials ? scopedCredentialsValid : selectedDirectDestination.credentials_configured)
+  );
 
   async function loadHosts() {
     try {
@@ -213,7 +250,18 @@
     newName = '';
     newHostId = hostId ?? null;
     newQuotaGiB = null;
-    newDestination = data?.configured ? 'server' : (nodes.find((n) => n.enrolled && nodeAvailability(n) === null)?.host_id ?? nodes[0]?.host_id ?? 'server');
+    const availableNode = nodes.find((n) => n.enrolled && nodeAvailability(n) === null);
+    newDestination = data?.configured
+      ? 'server'
+      : availableNode
+        ? `node:${availableNode.host_id}`
+        : data?.destinations[0]
+          ? `direct:${data.destinations[0].id}`
+          : 'server';
+    useScopedCredentials = true;
+    scopedAccessKeyId = '';
+    scopedSecretAccessKey = '';
+    scopedSessionToken = '';
     credential = null;
     createError = null;
     firstBlobSeen = false;
@@ -246,22 +294,157 @@
       return;
     }
     if (newDestination !== 'server' && newHostId == null) {
-      createError = 'Node-hosted repositories need a linked host — the node only admits tunnel peers that own a repository on it.';
+      createError = 'Storage-node and direct S3 repositories require a linked host.';
       return;
     }
     creating = true;
     createError = null;
     try {
-      const body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number } = { name: newName.trim() };
+      const body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number; destination_id?: number; s3_credentials?: BackupS3CredentialsInput } = { name: newName.trim() };
       if (newHostId != null) body.host_id = newHostId;
       if (newQuotaGiB != null && newQuotaGiB > 0) body.quota_bytes = Math.round(newQuotaGiB * 1024 ** 3);
-      if (newDestination !== 'server') body.node_host_id = newDestination;
+      if (selectedNodeId != null) body.node_host_id = selectedNodeId;
+      if (selectedDirectId != null) {
+        body.destination_id = selectedDirectId;
+        if (useScopedCredentials) {
+          body.s3_credentials = {
+            access_key_id: scopedAccessKeyId.trim(),
+            secret_access_key: scopedSecretAccessKey.trim(),
+            ...(scopedSessionToken.trim() ? { session_token: scopedSessionToken.trim() } : {})
+          };
+        }
+      }
       credential = await api.backupTargetCreate(body);
+      scopedAccessKeyId = '';
+      scopedSecretAccessKey = '';
+      scopedSessionToken = '';
       startPoll();
     } catch (e) {
       createError = (e as Error).message;
     } finally {
       creating = false;
+    }
+  }
+
+  function resetDestinationForm() {
+    destinationName = '';
+    destinationEndpoint = '';
+    destinationBucket = '';
+    destinationRegion = '';
+    destinationPrefix = 'backups/hosts/{host_id}-{hostname}/{repository}';
+    destinationPathStyle = false;
+    destinationAccessKeyId = '';
+    destinationSecretAccessKey = '';
+    destinationSessionToken = '';
+    destinationError = null;
+  }
+
+  async function createDestination() {
+    if (!destinationName.trim() || !destinationBucket.trim()) {
+      destinationError = 'Name and bucket are required.';
+      return;
+    }
+    if ((destinationAccessKeyId.trim() === '') !== (destinationSecretAccessKey.trim() === '')) {
+      destinationError = 'Access key ID and secret access key must be supplied together.';
+      return;
+    }
+    if (destinationSessionToken.trim() && !destinationAccessKeyId.trim()) {
+      destinationError = 'A session token requires an access key ID and secret access key.';
+      return;
+    }
+    destinationBusy = true;
+    destinationError = null;
+    try {
+      await api.backupDestinationCreate({
+        name: destinationName.trim(),
+        kind: 'direct_s3',
+        ...(destinationEndpoint.trim() ? { endpoint: destinationEndpoint.trim() } : {}),
+        bucket: destinationBucket.trim(),
+        ...(destinationRegion.trim() ? { region: destinationRegion.trim() } : {}),
+        prefix_template: destinationPrefix.trim(),
+        use_path_style: destinationPathStyle,
+        ...(destinationAccessKeyId.trim() ? {
+          credentials: {
+            access_key_id: destinationAccessKeyId.trim(),
+            secret_access_key: destinationSecretAccessKey.trim(),
+            ...(destinationSessionToken.trim() ? { session_token: destinationSessionToken.trim() } : {})
+          }
+        } : {})
+      });
+      addingDestination = false;
+      resetDestinationForm();
+      await load();
+    } catch (e) {
+      destinationError = (e as Error).message;
+    } finally {
+      destinationBusy = false;
+    }
+  }
+
+  function openDestinationCredentials(destination: BackupDestination) {
+    destinationCredentialsFor = destination;
+    destinationAccessKeyId = '';
+    destinationSecretAccessKey = '';
+    destinationSessionToken = '';
+    destinationError = null;
+  }
+
+  async function replaceDestinationCredentials() {
+    if (!destinationCredentialsFor || !destinationAccessKeyId.trim() || !destinationSecretAccessKey.trim()) {
+      destinationError = 'Access key ID and secret access key are required.';
+      return;
+    }
+    destinationBusy = true;
+    destinationError = null;
+    try {
+      await api.backupDestinationSetCredentials(destinationCredentialsFor.id, {
+        access_key_id: destinationAccessKeyId.trim(),
+        secret_access_key: destinationSecretAccessKey.trim(),
+        ...(destinationSessionToken.trim() ? { session_token: destinationSessionToken.trim() } : {})
+      });
+      destinationCredentialsFor = null;
+      resetDestinationForm();
+      await load();
+    } catch (e) {
+      destinationError = (e as Error).message;
+    } finally {
+      destinationBusy = false;
+    }
+  }
+
+  async function deleteDestination() {
+    if (!destinationToDelete) return;
+    await api.backupDestinationDelete(destinationToDelete.id);
+    destinationToDelete = null;
+    await load();
+  }
+
+  function openRepositoryCredentials(repository: BackupTarget) {
+    repositoryCredentialsFor = repository;
+    repositoryAccessKeyId = '';
+    repositorySecretAccessKey = '';
+    repositorySessionToken = '';
+    repositoryCredentialError = null;
+  }
+
+  async function replaceRepositoryCredentials() {
+    if (!repositoryCredentialsFor || !repositoryAccessKeyId.trim() || !repositorySecretAccessKey.trim()) {
+      throw new Error('Access key ID and secret access key are required.');
+    }
+    try {
+      await api.backupTargetSetCredentials(repositoryCredentialsFor.id, {
+        access_key_id: repositoryAccessKeyId.trim(),
+        secret_access_key: repositorySecretAccessKey.trim(),
+        ...(repositorySessionToken.trim() ? { session_token: repositorySessionToken.trim() } : {})
+      });
+      repositoryAccessKeyId = '';
+      repositorySecretAccessKey = '';
+      repositorySessionToken = '';
+      repositoryCredentialsFor = null;
+      await load();
+    } catch (e) {
+      repositoryCredentialError = (e as Error).message;
+      throw e;
     }
   }
 
@@ -532,7 +715,7 @@
       `SM_BACKUP_REPOS='${repoSpec}'`,
       `SM_BACKUP_REPO_NAMES='${credential.name}'`,
       `SM_BACKUP_REST_USERNAME='${credential.name}'`,
-      `SM_BACKUP_REST_PASSWORD='${credential.password}'`,
+      `SM_BACKUP_REST_PASSWORD='${credential.password ?? ''}'`,
       "SM_BACKUP_PRUNE_MODE='external'"
     ];
     const preserve = vars.map((v) => v.split('=')[0]).join(',');
@@ -547,7 +730,7 @@
       `$env:SM_BACKUP_REPOS="${repoSpec}"`,
       `$env:SM_BACKUP_REPO_NAMES="${credential.name}"`,
       `$env:SM_BACKUP_REST_USERNAME="${credential.name}"`,
-      `$env:SM_BACKUP_REST_PASSWORD="${credential.password}"`,
+      `$env:SM_BACKUP_REST_PASSWORD="${credential.password ?? ''}"`,
       '$env:SM_BACKUP_PRUNE_MODE="external"',
       `iex (iwr -useb ${baseUrl}/install.ps1).Content`
     ].join('\n');
@@ -560,7 +743,7 @@
       `SM_BACKUP_REPOS="${repoSpec}"`,
       `SM_BACKUP_REPO_NAMES="${credential.name}"`,
       `SM_BACKUP_REST_USERNAME="${credential.name}"`,
-      `SM_BACKUP_REST_PASSWORD="${credential.password}"`,
+      `SM_BACKUP_REST_PASSWORD="${credential.password ?? ''}"`,
       'SM_BACKUP_PRUNE_MODE=external',
       'SM_BACKUP_TIME=02:30',
       'TZ=UTC'
@@ -588,19 +771,19 @@ env_file = "/etc/servermonitor-backup/repo-credentials.env"`;
   const existingEnv = $derived.by(() => {
     if (!credential) return '';
     return `RESTIC_REST_USERNAME=${credential.name}
-RESTIC_REST_PASSWORD=${credential.password}`;
+RESTIC_REST_PASSWORD=${credential.password ?? ''}`;
   });
 
   const resticSnippet = $derived.by(() => {
     if (!credential) return '';
     if (selectedNode || (tunnelActive && !tunnel?.public_http)) {
       return `export RESTIC_REST_USERNAME='${credential.name}'
-export RESTIC_REST_PASSWORD='${credential.password}'
+export RESTIC_REST_PASSWORD='${credential.password ?? ''}'
 sm-agent backup proxy --config /etc/servermonitor-backup/backup.toml
 restic -r <printed RESTIC_REPOSITORY> snapshots`;
     }
     return `export RESTIC_REST_USERNAME='${credential.name}'
-export RESTIC_REST_PASSWORD='${credential.password}'
+export RESTIC_REST_PASSWORD='${credential.password ?? ''}'
 restic -r ${publicRepoUrl} init
 restic -r ${publicRepoUrl} backup /etc`;
   });
@@ -669,7 +852,7 @@ restic -r ${publicRepoUrl} backup /etc`;
     liveUnsub = subscribeHosts(['backup_running'], receiveLive);
     liveTimer = setInterval(() => (liveNow = Date.now()), 5_000);
     const sp = $page.url.searchParams;
-    if (sp.get('new') === '1' && (data?.configured || nodes.length > 0)) {
+    if (sp.get('new') === '1' && (data?.configured || nodes.length > 0 || (data?.destinations.length ?? 0) > 0)) {
       const h = sp.get('host');
       const hid = h != null ? Number(h) : NaN;
       openNew(Number.isInteger(hid) && hid > 0 ? hid : undefined);
@@ -685,9 +868,8 @@ restic -r ${publicRepoUrl} backup /etc`;
 
 {#snippet howBackupsContent()}
   <p class="mt-1.5 text-xs text-zinc-400 leading-relaxed">
-    Monitored hosts back up their own files with restic — encrypted on the host, so the destination only ever sees
-    ciphertext. A destination can be <span class="text-zinc-200">this server</span> or an
-    <span class="text-zinc-200">external</span> rest-server / S3 endpoint. Enable a host's backups at install with
+    Monitored hosts back up their own files with restic — encrypted on the host, so every backend sees ciphertext only.
+    Storage backend, repository namespace, and network/data path are independent choices. Enable a host's backup runtime at install with
     <code class="font-mono text-zinc-300">--enable-backup</code>, then watch each host under its
     <span class="text-zinc-200">Backups</span> tab.
   </p>
@@ -705,10 +887,12 @@ restic -r ${publicRepoUrl} backup /etc`;
       </div>
     </div>
     <div class="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 flex-1 min-w-[220px]">
-      <div class="text-zinc-200 font-medium">Destination</div>
+      <div class="text-zinc-200 font-medium">Effective data paths</div>
       <div class="mt-1 space-y-0.5 text-[11px] text-zinc-400">
-        <div class="flex items-center gap-1.5"><span class="h-1 w-1 rounded-full bg-emerald-400"></span> This server (append-only endpoint{#if tunnelActive}, over WireGuard{/if})</div>
-        <div class="flex items-center gap-1.5"><span class="h-1 w-1 rounded-full bg-zinc-500"></span> External rest-server VPS or S3 / B2</div>
+        <div>Agent → Server disk</div>
+        <div>Agent → ServerMonitor → S3</div>
+        <div>Agent → storage node</div>
+        <div class="text-emerald-300">Agent → S3 directly</div>
       </div>
     </div>
   </div>
@@ -740,7 +924,7 @@ restic -r ${publicRepoUrl} backup /etc`;
     {#each h.repos as repo, index (repo.id)}
       {@const availability = nodeAvailability(nodeForTarget(repo))}
       {#if index > 0}<span class="text-zinc-600">, </span>{/if}
-      <span class="font-mono text-emerald-300/90">{repo.name}</span>{#if availability}<span class={availabilityText(availability)}>{' · '}node {availability}</span>{/if}
+      <span class="font-mono text-emerald-300/90">{repo.name}</span><span class="text-zinc-600">{' · '}{repo.data_path.label}</span>{#if availability}<span class={availabilityText(availability)}>{' · '}node {availability}</span>{/if}
     {/each}
   {:else if h.revokedRepos.length > 0}
     {#each h.revokedRepos as repo, index (repo.id)}
@@ -779,7 +963,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                 {@const running = hostIsRunning(h.id)}
                 {@const destinationUnavailable = h.nodeAvailability}
                 <tr class="hover:bg-zinc-900/60">
-                  <td class="px-4 py-3">
+                  <td class="px-4 py-3 whitespace-nowrap">
                     <a href="/hosts/{h.id}?tab=backups" class="font-mono text-zinc-200 hover:text-zinc-100">{h.hostname}</a>
                   </td>
                   <td class="px-4 py-3">
@@ -792,7 +976,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                   <td class="px-4 py-3 text-xs">
                     {@render hostRepositories(h)}
                   </td>
-                  <td class="px-4 py-3 text-right">
+                  <td class="px-4 py-3 text-right whitespace-nowrap">
                     <a href="/hosts/{h.id}?tab=backups" class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Backups tab</a>
                   </td>
                 </tr>
@@ -827,15 +1011,105 @@ restic -r ${publicRepoUrl} backup /etc`;
   </section>
 {/snippet}
 
+{#snippet directDestinationsSection()}
+  <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+    <header class="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-800 px-4 sm:px-5 py-4">
+      <div>
+        <h2 class="text-sm font-medium text-zinc-100">Direct external S3 destinations</h2>
+        <p class="mt-0.5 text-xs text-zinc-500">Reusable backend definitions. Repository namespaces and host assignments are created separately below.</p>
+      </div>
+      <button type="button" onclick={() => { resetDestinationForm(); destinationCredentialsFor = null; addingDestination = true; }} class="text-xs px-3 py-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20">Add S3 destination</button>
+    </header>
+
+    {#if addingDestination || destinationCredentialsFor}
+      <div class="border-b border-zinc-800 bg-zinc-950/30 p-4 sm:p-5">
+        <h3 class="text-sm font-medium text-zinc-200">{destinationCredentialsFor ? `Replace credentials · ${destinationCredentialsFor.name}` : 'New direct S3 destination'}</h3>
+        {#if !destinationCredentialsFor}
+          <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label for="dest-name" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Destination name</label>
+              <input id="dest-name" bind:value={destinationName} placeholder="Cloudflare R2" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label for="dest-bucket" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Bucket</label>
+              <input id="dest-bucket" bind:value={destinationBucket} placeholder="servermonitor-backups" autocomplete="off" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+            </div>
+            <div class="sm:col-span-2">
+              <label for="dest-endpoint" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">S3 endpoint <span class="normal-case text-zinc-600">(blank for AWS)</span></label>
+              <input id="dest-endpoint" bind:value={destinationEndpoint} placeholder="https://ACCOUNT_ID.r2.cloudflarestorage.com" autocomplete="off" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+              <p class="mt-1 text-[10px] text-zinc-600">Custom endpoints must be an HTTPS origin without credentials or a path.</p>
+            </div>
+            <div>
+              <label for="dest-region" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Region</label>
+              <input id="dest-region" bind:value={destinationRegion} placeholder="auto (R2) or us-east-1" autocomplete="off" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+            </div>
+            <label class="flex items-center gap-2 self-end rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-300">
+              <input type="checkbox" bind:checked={destinationPathStyle} class="accent-emerald-500" /> Path-style addressing
+            </label>
+            <div class="sm:col-span-2">
+              <label for="dest-prefix" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Per-host prefix template</label>
+              <input id="dest-prefix" bind:value={destinationPrefix} autocomplete="off" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+              <p class="mt-1 text-[11px] text-zinc-600">Must contain <span class="font-mono">{'{host_id}'}</span> and <span class="font-mono">{'{repository}'}</span>; <span class="font-mono">{'{hostname}'}</span> is optional.</p>
+            </div>
+          </div>
+        {/if}
+
+        <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label for="dest-key" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Access key ID</label>
+            <input id="dest-key" type="password" bind:value={destinationAccessKeyId} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+          </div>
+          <div>
+            <label for="dest-secret" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Secret access key</label>
+            <input id="dest-secret" type="password" bind:value={destinationSecretAccessKey} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+          </div>
+          <div class="sm:col-span-2">
+            <label for="dest-token" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Session token <span class="normal-case text-zinc-600">(optional)</span></label>
+            <input id="dest-token" type="password" bind:value={destinationSessionToken} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+          </div>
+        </div>
+        <p class="mt-2 text-[11px] text-zinc-500">Shared credentials are optional. Secrets are write-only in the admin API/UI and encrypted in PostgreSQL with <span class="font-mono">BACKUP_SECRETS_KEY</span>. Leave them blank when every repository will use its own prefix-scoped credential.</p>
+        {#if destinationError}<div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{destinationError}</div>{/if}
+        <div class="mt-4 flex justify-end gap-2">
+          <button type="button" onclick={() => { addingDestination = false; destinationCredentialsFor = null; resetDestinationForm(); }} class="text-sm px-3 py-1.5 text-zinc-400 hover:text-zinc-200">Cancel</button>
+          <button type="button" disabled={destinationBusy} onclick={destinationCredentialsFor ? replaceDestinationCredentials : createDestination} class="text-sm px-4 py-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 disabled:opacity-50">{destinationBusy ? 'Saving…' : destinationCredentialsFor ? 'Replace credentials' : 'Create destination'}</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if (data?.destinations.length ?? 0) === 0}
+      <div class="px-4 py-7 text-center text-sm text-zinc-500">No centrally managed direct destinations yet.</div>
+    {:else}
+      <div class="divide-y divide-zinc-800/70">
+        {#each data?.destinations ?? [] as destination (destination.id)}
+          <div class="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-5 py-3">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span><span class="font-medium text-zinc-200">{destination.name}</span><span class="rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">Agent → S3 directly</span></div>
+              <div class="mt-1 truncate font-mono text-[11px] text-zinc-500" title={`${destination.endpoint || 'AWS S3'}/${destination.bucket}`}>{destination.endpoint || 'AWS S3'} / {destination.bucket}</div>
+              <div class="mt-0.5 text-[11px] text-zinc-600">{destination.repository_count} {destination.repository_count === 1 ? 'namespace' : 'namespaces'} · credentials {destination.credentials_configured ? 'stored' : 'required per repository'}</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" onclick={() => openDestinationCredentials(destination)} class="text-[11px] px-2.5 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Replace credentials</button>
+              {#if destination.repository_count === 0}
+                <button type="button" onclick={() => (destinationToDelete = destination)} class="text-[11px] px-2.5 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Delete</button>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
+{/snippet}
+
 <div class="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
   <div class="flex items-start justify-between gap-3 flex-wrap">
     <div>
       <h1 class="text-xl sm:text-2xl font-semibold tracking-tight">Backups</h1>
       <p class="text-xs sm:text-sm text-zinc-500 mt-1">
-        Where your fleet backs up, and this server's role as an append-only backup destination.
+        Storage backends, repository namespaces, and the exact data path for every fleet backup.
       </p>
     </div>
-    {#if view === 'list' && (data?.configured || nodes.length > 0)}
+    {#if view === 'list' && (data?.configured || nodes.length > 0 || (data?.destinations.length ?? 0) > 0)}
       <button
         type="button"
         onclick={() => openNew()}
@@ -859,29 +1133,45 @@ restic -r ${publicRepoUrl} backup /etc`;
     {#if !credential}
       <section class="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5 max-w-2xl">
         <h2 class="text-sm font-medium text-zinc-100">New repository</h2>
-        <p class="text-xs text-zinc-500 mt-1">A private, append-only namespace one host uploads to, plus the credential it authenticates with.</p>
+        <p class="text-xs text-zinc-500 mt-1">Choose the storage backend, define a repository namespace, then verify the exact network/data path separately.</p>
 
-        {#if nodes.length > 0}
           <div class="mt-4">
-            <label for="bt-dest" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Where is it stored?</label>
+            <label for="bt-dest" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Storage destination</label>
             <select
               id="bt-dest"
               bind:value={newDestination}
               class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm">
               {#if data?.configured}
-                <option value="server">This server</option>
+                <option value="server">ServerMonitor backend · {data.storage?.kind === 's3' ? 'S3 gateway' : 'server disk'}</option>
               {/if}
               {#each nodes as n (n.host_id)}
                 {@const availability = nodeAvailability(n)}
-                <option value={n.host_id} disabled={!n.enrolled || availability !== null}>Node · {n.hostname || `node ${n.host_id}`}{availability === 'removed' ? ' (host removed)' : availability === 'archived' ? ' (host archived)' : availability === 'offline' ? ' (offline)' : n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
+                <option value={`node:${n.host_id}`} disabled={!n.enrolled || availability !== null}>Storage node · {n.hostname || `node ${n.host_id}`}{availability === 'removed' ? ' (host removed)' : availability === 'archived' ? ' (host archived)' : availability === 'offline' ? ' (offline)' : n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
+              {/each}
+              {#each data?.destinations ?? [] as destination (destination.id)}
+                <option value={`direct:${destination.id}`}>Direct external S3 · {destination.name}</option>
               {/each}
             </select>
-            <p class="mt-1.5 text-[11px] text-zinc-600">Storage nodes receive backups over per-host WireGuard tunnels; nothing is exposed to the internet.</p>
+            <div class="mt-2 rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2 text-xs">
+              <div class="text-[10px] uppercase tracking-wider text-zinc-600">Effective data path</div>
+              {#if selectedDirectDestination}
+                <div class="mt-1 font-medium text-emerald-300">Agent → S3 directly</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">S3 API to {selectedDirectDestination.endpoint || 'AWS S3'} · ServerMonitor delivers configuration only</div>
+              {:else if selectedNode}
+                <div class="mt-1 font-medium text-sky-300">Agent → storage node</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">Public transport: WireGuard UDP to {selectedNode.endpoint}:{selectedNode.udp_port}</div>
+              {:else if data?.storage?.kind === 's3'}
+                <div class="mt-1 font-medium text-amber-300">Agent → ServerMonitor → S3</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">ServerMonitor terminates restic, temporarily spools each object, then relays it to S3</div>
+              {:else}
+                <div class="mt-1 font-medium text-zinc-300">Agent → Server disk</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">The server's append-only restic endpoint writes to its local backup directory</div>
+              {/if}
+            </div>
           </div>
-        {/if}
 
         <div class="mt-4">
-          <label for="bt-host" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Which host will back up here? <span class="text-zinc-600 normal-case">{newDestination === 'server' ? '(optional)' : '(required for node repositories)'}</span></label>
+          <label for="bt-host" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Which host owns this namespace? <span class="text-zinc-600 normal-case">{newDestination === 'server' ? '(optional for legacy gateway repositories)' : '(required)'}</span></label>
           <select
             id="bt-host"
             bind:value={newHostId}
@@ -892,7 +1182,7 @@ restic -r ${publicRepoUrl} backup /etc`;
               <option value={h.id}>{h.hostname}</option>
             {/each}
           </select>
-          <p class="mt-1.5 text-[11px] text-zinc-600">Links this repository to a monitored host for display. The host still needs the install snippet below to actually back up.</p>
+          <p class="mt-1.5 text-[11px] text-zinc-600">Direct destinations are delivered only to this authenticated agent and expand to a unique per-host object prefix.</p>
         </div>
 
         <div class="mt-4">
@@ -905,9 +1195,37 @@ restic -r ${publicRepoUrl} backup /etc`;
             spellcheck="false"
             placeholder="web-01-offsite"
             class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm font-mono" />
-          <p class="mt-1.5 text-[11px] text-zinc-600">Letters, digits, dot, dash, underscore. Becomes the repo path and the upload login name.</p>
+          <p class="mt-1.5 text-[11px] text-zinc-600">Letters, digits, dot, dash, underscore. This is the logical namespace; the storage prefix is shown separately.</p>
         </div>
 
+        {#if selectedDirectDestination}
+          <div class="mt-4 rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
+            <label class="flex items-start gap-2 text-xs text-zinc-300">
+              <input type="checkbox" bind:checked={useScopedCredentials} class="mt-0.5 accent-emerald-500" />
+              <span><span class="font-medium">Use repository-scoped credentials</span> <span class="text-emerald-400/80">recommended</span><span class="mt-0.5 block text-[11px] text-zinc-600">Use IAM/R2 credentials restricted to this expanded prefix. Uncheck to reuse the destination credential.</span></span>
+            </label>
+            {#if useScopedCredentials}
+              <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label for="scoped-key" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Access key ID</label>
+                  <input id="scoped-key" type="password" bind:value={scopedAccessKeyId} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+                </div>
+                <div>
+                  <label for="scoped-secret" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Secret access key</label>
+                  <input id="scoped-secret" type="password" bind:value={scopedSecretAccessKey} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+                </div>
+                <div class="sm:col-span-2">
+                  <label for="scoped-session" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Session token <span class="normal-case text-zinc-600">(optional)</span></label>
+                  <input id="scoped-session" type="password" bind:value={scopedSessionToken} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+                </div>
+              </div>
+            {:else if !selectedDirectDestination.credentials_configured}
+              <p class="mt-3 text-xs text-rose-300">This destination has no shared credential. Supply scoped credentials to continue.</p>
+            {/if}
+          </div>
+        {/if}
+
+        {#if !selectedDirectDestination}
         <div class="mt-4">
           <label for="bt-quota" class="block text-xs uppercase tracking-wider text-zinc-500 mb-1.5">Quota <span class="text-zinc-600 normal-case">(GiB, optional)</span></label>
           <input
@@ -920,6 +1238,7 @@ restic -r ${publicRepoUrl} backup /etc`;
             class="w-full rounded-md bg-zinc-950 border border-zinc-800 focus:border-zinc-600 focus:outline-none px-3 py-2 text-sm numeric" />
           <p class="mt-1.5 text-[11px] text-zinc-600">Uploads are refused once the repo exceeds this. Leave blank for no limit.</p>
         </div>
+        {/if}
 
         {#if createError}
           <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">{createError}</div>
@@ -938,6 +1257,48 @@ restic -r ${publicRepoUrl} backup /etc`;
       </section>
     {:else}
       <section class="mt-6 space-y-5">
+        {#if credential.managed}
+          <div class="rounded-xl border border-emerald-900/40 bg-emerald-950/20 p-4 sm:p-5">
+            <div class="text-xs uppercase tracking-wider text-emerald-400/80">Centrally managed direct repository</div>
+            <h2 class="mt-1 text-base font-medium text-emerald-100">{credential.name} is assigned to {linkedHostname || 'the selected host'}</h2>
+            <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              <div class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+                <div class="text-[10px] uppercase tracking-wider text-zinc-500">Storage backend</div>
+                <div class="mt-1 text-zinc-200">{selectedDirectDestination?.name ?? 'External S3'}</div>
+                <div class="mt-0.5 font-mono text-[11px] text-zinc-500">{selectedDirectDestination?.bucket}</div>
+              </div>
+              <div class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+                <div class="text-[10px] uppercase tracking-wider text-zinc-500">Repository namespace</div>
+                <div class="mt-1 font-mono text-zinc-200">{credential.name}</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">expanded to a unique per-host prefix</div>
+              </div>
+              <div class="rounded-lg border border-emerald-900/40 bg-emerald-950/20 p-3">
+                <div class="text-[10px] uppercase tracking-wider text-emerald-500/80">Effective data path</div>
+                <div class="mt-1 font-medium text-emerald-200">Agent → S3 directly</div>
+                <div class="mt-0.5 text-[11px] text-zinc-500">ServerMonitor is control plane only</div>
+              </div>
+            </div>
+            <p class="mt-4 text-xs leading-relaxed text-zinc-400">
+              No secret is shown here. ServerMonitor stores the S3 credential encrypted, and the linked agent receives only its assignment in an agent-token-bound AES-GCM envelope over HTTPS. Backup objects never spool on or pass through this server.
+            </p>
+          </div>
+
+          <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
+            <h2 class="text-sm font-medium text-zinc-100">What happens next</h2>
+            <ol class="mt-3 list-decimal space-y-2 pl-5 text-xs text-zinc-400">
+              <li>The resident agent receives this repository within one minute and writes credentials to its private managed-backup directory.</li>
+              <li>If backups are already enabled on the host, the next scheduled run includes this repository automatically—no installer rerun or per-agent S3 env change.</li>
+              <li>If this host has never had backups enabled, wait for the assignment to sync, then enable the backup runtime once with <code class="font-mono text-zinc-300">SM_ENABLE_BACKUP=1</code> and <code class="font-mono text-zinc-300">SM_BACKUP_PRUNE_MODE=external</code>. Do not set <code class="font-mono text-zinc-300">SM_BACKUP_REPOS</code> or S3 secrets.</li>
+              <li>After the assignment arrives, run <code class="font-mono text-zinc-300">sm-agent backup recovery-kit</code> and save the refreshed break-glass kit offline.</li>
+            </ol>
+            <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+              {#if newHostId != null}
+                <a href="/hosts/{newHostId}?tab=backups" class="text-xs text-sky-300 hover:text-sky-200">Open {linkedHostname || 'host'} backups →</a>
+              {/if}
+              <button type="button" onclick={backToList} class="text-sm px-3 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Done</button>
+            </div>
+          </div>
+        {:else}
         <div class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
           <div class="flex items-baseline justify-between gap-3 flex-wrap">
             <div class="min-w-0">
@@ -946,7 +1307,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                 Shown once and stored only as a hash. It authenticates uploads only — it cannot decrypt backups (the repo password never leaves the host).
               </p>
             </div>
-            <button type="button" onclick={() => credential && copy(credential.password, 'pw')} class="text-xs px-2.5 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 shrink-0">
+            <button type="button" onclick={() => credential && copy(credential.password ?? '', 'pw')} class="text-xs px-2.5 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 shrink-0">
               {copied === 'pw' ? 'copied' : 'Copy password'}
             </button>
           </div>
@@ -1096,12 +1457,15 @@ restic -r ${publicRepoUrl} backup /etc`;
             <button type="button" onclick={backToList} class="text-sm px-3 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60 shrink-0">Done</button>
           </div>
         </div>
+        {/if}
       </section>
     {/if}
   {:else if data}
     <div class="mt-6 space-y-4">
-      {#if !data.configured && !tunnelActive && data.targets.length === 0 && nodes.length === 0}
+      {#if !data.configured && !tunnelActive && data.targets.length === 0 && nodes.length === 0 && data.destinations.length === 0}
         {@render howBackupsWork()}
+
+        {@render directDestinationsSection()}
 
         <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
           <h2 class="text-sm font-medium text-zinc-100">This server isn't a backup destination yet</h2>
@@ -1120,11 +1484,9 @@ restic -r ${publicRepoUrl} backup /etc`;
             </div>
             <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
               <div class="text-sm font-medium text-zinc-200">B · Use an external destination</div>
-              <p class="mt-1 text-xs text-zinc-500">Keep destinations off this server — hosts back up straight to a rest-server VPS or S3 / B2. Nothing to enable here.</p>
+              <p class="mt-1 text-xs text-zinc-500">Keep the data plane off this server. Add a direct S3/R2 destination above; ServerMonitor distributes encrypted-at-rest credentials while agents upload straight to object storage.</p>
               <div class="mt-3 text-xs text-zinc-400 space-y-2">
-                <p>Install a host with backups pointed at your endpoint:</p>
-                <pre class="text-[11px] font-mono bg-zinc-950 border border-zinc-800 rounded-md p-2.5 overflow-x-auto whitespace-pre text-zinc-300 select-text">--enable-backup --backup-repos &lt;rest/s3 url&gt;</pre>
-                <p>Then monitor it from its <span class="text-zinc-300">Backups</span> tab.</p>
+                <p>Repository namespaces use per-host prefixes and can use prefix-scoped IAM/R2 keys. No backup object passes through ServerMonitor.</p>
               </div>
             </div>
           </div>
@@ -1137,12 +1499,12 @@ restic -r ${publicRepoUrl} backup /etc`;
       {:else}
         {#if tunnelActive && !tunnel?.public_http}
           <div class="rounded-md border border-emerald-900/40 bg-emerald-950/20 px-3 py-2.5 text-xs text-emerald-300/90">
-            WireGuard tunnel only — backup destinations are reachable solely through enrolled peers (server UDP port
-            <span class="font-mono numeric">{tunnel?.listen_port}</span>). Nothing backup-related is exposed on the web listener, and the tunnels encrypt all backup traffic.
+            WireGuard tunnel only — the public transport is <span class="font-mono">{tunnel?.endpoint}</span> over UDP (<span class="font-mono">BACKUP_WG_PORT={tunnel?.listen_port}</span>).
+            The restic service stays inside the tunnel at <span class="font-mono">{tunnel?.server_tunnel_ip}:{tunnel?.rest_port}</span>; TCP {tunnel?.rest_port} is not a public listener.
           </div>
         {:else if !data.configured}
           <div class="rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2.5 text-xs text-zinc-400">
-            This server has no storage backend of its own (<span class="font-mono">BACKUP_DIR</span> / <span class="font-mono">BACKUP_S3_BUCKET</span>) — repositories live on promoted storage nodes below.
+            This server has no gateway storage backend (<span class="font-mono">BACKUP_DIR</span> / <span class="font-mono">BACKUP_S3_BUCKET</span>). Storage-node and direct S3 repositories still work; the latter bypass ServerMonitor entirely.
           </div>
         {:else if data.tls.mode === 'insecure'}
           <div class="rounded-md border border-rose-900/50 bg-rose-950/30 px-3 py-2.5 text-xs text-rose-300">
@@ -1160,27 +1522,29 @@ restic -r ${publicRepoUrl} backup /etc`;
           </div>
         {/if}
 
+        {@render directDestinationsSection()}
+
         {@render fleetSection()}
 
         <section>
           <div class="flex items-baseline justify-between gap-3 flex-wrap">
             <div>
               <h2 class="text-sm font-medium text-zinc-100">Repositories</h2>
-              <p class="mt-0.5 text-xs text-zinc-500">Each repository is a private, append-only namespace one host uploads to — stored on this server or on a storage node. Create one per host.</p>
+              <p class="mt-0.5 text-xs text-zinc-500">A repository is a logical namespace. Its storage backend and effective data path are shown independently; create one per host.</p>
             </div>
           </div>
 
           <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
             <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
               <div class="px-4 sm:px-5 py-3 sm:py-4 min-w-0">
-                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Server backend</div>
-                <div class="text-lg font-semibold text-zinc-100 mt-1">{data.storage ? (data.storage.kind === 's3' ? 'Object storage' : 'Local disk') : 'None (nodes only)'}</div>
+                <div class="text-[11px] uppercase tracking-wider text-zinc-500">Server storage backend</div>
+                <div class="text-lg font-semibold text-zinc-100 mt-1">{data.storage ? (data.storage.kind === 's3' ? 'S3 gateway backend' : 'Server disk') : 'None'}</div>
                 <div class="text-[11px] text-zinc-500 mt-0.5 font-mono truncate" title={data.storage?.location ?? ''}>{data.storage?.location ?? ''}</div>
               </div>
               <div class="px-4 sm:px-5 py-3 sm:py-4">
                 <div class="text-[11px] uppercase tracking-wider text-zinc-500">Stored</div>
                 <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{bytes(data.targets.reduce((s, t) => s + t.used_bytes, 0))}</div>
-                <div class="text-[11px] text-zinc-500 mt-0.5">across all repositories</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">gateway/node tracked; direct S3 is provider-measured</div>
               </div>
               <div class="px-4 sm:px-5 py-3 sm:py-4">
                 <div class="text-[11px] uppercase tracking-wider text-zinc-500">Repositories</div>
@@ -1215,7 +1579,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                       {@const destinationAvailability = nodeAvailability(destinationNode)}
                       {@const retiredNodeTargetDeletable = t.node_host_id != null && (destinationNode === null || destinationAvailability === 'removed' || destinationAvailability === 'archived')}
                       <tr class="hover:bg-zinc-900/60">
-                        <td class="px-4 py-3 align-top">
+                        <td class="px-4 py-3 align-top whitespace-nowrap">
                           <div class="flex items-center gap-2">
                             <span class="h-1.5 w-1.5 rounded-full {t.revoked_at ? 'bg-rose-400' : 'bg-emerald-400'}"></span>
                             <span class="font-mono text-zinc-200">{t.name}</span>
@@ -1225,17 +1589,19 @@ restic -r ${publicRepoUrl} backup /etc`;
                           {/if}
                         </td>
                         <td class="px-4 py-3 align-top text-xs">
+                          <div class="text-zinc-300">{t.storage_backend.label}</div>
+                          <div class="mt-0.5 font-medium {t.data_path.kind === 'agent_to_s3_direct' ? 'text-emerald-300' : t.data_path.kind === 'agent_via_server_to_s3' ? 'text-amber-300' : 'text-sky-300'}">{t.data_path.label}</div>
                           {#if t.node_host_id}
                             {#if destinationNode}
-                              <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{destinationNode.hostname || t.node_hostname || `node ${t.node_host_id}`}</span>{#if destinationAvailability}<span class="ml-1.5 rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
+                              {#if destinationAvailability}<span class="mt-1 inline-block rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
                             {:else}
-                              <span class="text-zinc-500">{t.node_hostname || `node ${t.node_host_id}`}</span>
+                              <span class="mt-1 text-zinc-500">{t.node_hostname || `node ${t.node_host_id}`}</span>
                             {/if}
-                          {:else}
-                            <span class="text-zinc-400">this server</span>
                           {/if}
+                          {#if t.namespace_prefix}<div class="mt-1 max-w-xs truncate font-mono text-[10px] text-zinc-600" title={t.namespace_prefix}>{t.namespace_prefix}</div>{/if}
+                          {#if t.destination_id}<div class="mt-0.5 text-[10px] text-zinc-600">{t.credential_scope === 'repository' ? 'repository-scoped credential' : 'shared destination credential'}</div>{/if}
                         </td>
-                        <td class="px-4 py-3 align-top text-xs">
+                        <td class="px-4 py-3 align-top text-xs whitespace-nowrap">
                           {#if t.host_id}
                             <a href="/hosts/{t.host_id}?tab=backups" class="text-sky-300 hover:text-sky-200">{t.hostname || `host ${t.host_id}`}</a>
                           {:else}
@@ -1243,6 +1609,10 @@ restic -r ${publicRepoUrl} backup /etc`;
                           {/if}
                         </td>
                         <td class="px-4 py-3 align-top">
+                          {#if t.destination_id}
+                            <div class="text-xs text-zinc-400">provider-managed</div>
+                            <div class="text-[10px] text-zinc-600 mt-0.5">traffic bypasses server</div>
+                          {:else}
                           <div class="numeric text-zinc-200 text-xs">{bytes(t.used_bytes)}{#if t.quota_bytes}<span class="text-zinc-500"> / {bytes(t.quota_bytes)}</span>{/if}</div>
                           {#if t.quota_bytes}
                             <div class="mt-1.5 h-1.5 w-28 rounded-full bg-zinc-800 overflow-hidden">
@@ -1251,12 +1621,13 @@ restic -r ${publicRepoUrl} backup /etc`;
                           {:else}
                             <div class="text-[10px] text-zinc-600 mt-0.5">no quota</div>
                           {/if}
+                          {/if}
                         </td>
-                        <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'}</td>
+                        <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{t.destination_id ? 'at provider' : t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'}</td>
                         <td class="px-4 py-3 align-top text-zinc-400 text-xs numeric whitespace-nowrap">{timeAgo(t.created_at)}</td>
-                        <td class="px-4 py-3 align-top">
+                        <td class="px-4 py-3 align-top whitespace-nowrap">
                           <div class="flex items-center justify-end gap-1.5">
-                            {#if !t.revoked_at}
+                            {#if !t.revoked_at && !t.destination_id}
                               <button
                                 type="button"
                                 onclick={() => openQuota(t)}
@@ -1264,7 +1635,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                                 Quota
                               </button>
                             {/if}
-                            {#if !t.node_host_id}
+                            {#if !t.node_host_id && !t.destination_id}
                               <button
                                 type="button"
                                 onclick={() => measure(t.id)}
@@ -1273,13 +1644,20 @@ restic -r ${publicRepoUrl} backup /etc`;
                                 {measuring === t.id ? 'Measuring…' : 'Measure'}
                               </button>
                             {/if}
-                            <button
+                            {#if !t.destination_id}<button
                               type="button"
                               onclick={() => rotate(t.id)}
                               class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
                               Rotate
-                            </button>
-                            {#if t.used_bytes === 0 && !t.node_host_id}
+                            </button>{/if}
+                            {#if t.destination_id}
+                              {#if !t.revoked_at}<button type="button" onclick={() => openRepositoryCredentials(t)} class="text-[11px] px-2 py-1 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Replace key</button>{/if}
+                              {#if t.revoked_at}
+                                <button type="button" onclick={() => (toDelete = t)} title="Deletes only the control-plane record; S3 objects remain" class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Delete record</button>
+                              {:else}
+                                <button type="button" onclick={() => (toRevoke = t)} class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Revoke</button>
+                              {/if}
+                            {:else if t.used_bytes === 0 && !t.node_host_id}
                               <button
                                 type="button"
                                 onclick={() => (toDelete = t)}
@@ -1324,15 +1702,10 @@ restic -r ${publicRepoUrl} backup /etc`;
                       {/if}
                     </div>
                     <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs">
-                      {#if t.node_host_id}
-                        {#if destinationNode}
-                          <span class="inline-flex items-center gap-1.5 text-sky-300"><span class="h-1 w-1 rounded-full bg-sky-400"></span>{destinationNode.hostname || t.node_hostname || `node ${t.node_host_id}`}</span>{#if destinationAvailability}<span class="rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
-                        {:else}
-                          <span class="text-zinc-500">{t.node_hostname || `node ${t.node_host_id}`}</span>
-                        {/if}
-                      {:else}
-                        <span class="text-zinc-400">this server</span>
-                      {/if}
+                      <span class="text-zinc-300">{t.storage_backend.label}</span>
+                      <span class="text-zinc-700">·</span>
+                      <span class={t.data_path.kind === 'agent_to_s3_direct' ? 'text-emerald-300' : t.data_path.kind === 'agent_via_server_to_s3' ? 'text-amber-300' : 'text-sky-300'}>{t.data_path.label}</span>
+                      {#if destinationAvailability}<span class="rounded border px-1 py-px text-[10px] uppercase tracking-wider {availabilityBadge(destinationAvailability)}">{destinationAvailability}</span>{/if}
                       <span class="text-zinc-700">·</span>
                       {#if t.host_id}
                         <a href="/hosts/{t.host_id}?tab=backups" class="text-sky-300 hover:text-sky-200">{t.hostname || `host ${t.host_id}`}</a>
@@ -1340,19 +1713,24 @@ restic -r ${publicRepoUrl} backup /etc`;
                         <span class="text-zinc-600">not linked</span>
                       {/if}
                     </div>
+                    {#if t.namespace_prefix}<div class="truncate font-mono text-[10px] text-zinc-600">{t.namespace_prefix}</div>{/if}
                     <div>
+                      {#if t.destination_id}
+                        <div class="text-xs text-zinc-400">Usage measured at object-storage provider · traffic bypasses server</div>
+                      {:else}
                       <div class="numeric text-xs text-zinc-200">{bytes(t.used_bytes)}{#if t.quota_bytes}<span class="text-zinc-500"> / {bytes(t.quota_bytes)}</span>{/if}</div>
                       {#if t.quota_bytes}
                         <div class="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
                           <div class="h-full rounded-full {barTone(t.used_bytes, t.quota_bytes)}" style="width: {sharePct(t.used_bytes, t.quota_bytes)}%"></div>
                         </div>
                       {/if}
+                      {/if}
                     </div>
                     <div class="text-[11px] text-zinc-500 numeric">
-                      measured {t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'} · created {timeAgo(t.created_at)}
+                      measured {t.destination_id ? 'at provider' : t.usage_measured_at ? timeAgo(t.usage_measured_at) : 'never'} · created {timeAgo(t.created_at)}
                     </div>
                     <div class="flex justify-end gap-2">
-                      {#if !t.revoked_at}
+                      {#if !t.revoked_at && !t.destination_id}
                         <button
                           type="button"
                           onclick={() => openQuota(t)}
@@ -1360,7 +1738,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                           Quota
                         </button>
                       {/if}
-                      {#if !t.node_host_id}
+                      {#if !t.node_host_id && !t.destination_id}
                         <button
                           type="button"
                           onclick={() => measure(t.id)}
@@ -1369,13 +1747,20 @@ restic -r ${publicRepoUrl} backup /etc`;
                           {measuring === t.id ? 'Measuring…' : 'Measure'}
                         </button>
                       {/if}
-                      <button
+                      {#if !t.destination_id}<button
                         type="button"
                         onclick={() => rotate(t.id)}
                         class="text-[11px] px-2.5 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">
                         Rotate
-                      </button>
-                      {#if t.used_bytes === 0 && !t.node_host_id}
+                      </button>{/if}
+                      {#if t.destination_id}
+                        {#if !t.revoked_at}<button type="button" onclick={() => openRepositoryCredentials(t)} class="text-[11px] px-2.5 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800/60">Replace key</button>{/if}
+                        {#if t.revoked_at}
+                          <button type="button" onclick={() => (toDelete = t)} class="text-[11px] px-2.5 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Delete record</button>
+                        {:else}
+                          <button type="button" onclick={() => (toRevoke = t)} class="text-[11px] px-2.5 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Revoke</button>
+                        {/if}
+                      {:else if t.used_bytes === 0 && !t.node_host_id}
                         <button
                           type="button"
                           onclick={() => (toDelete = t)}
@@ -1407,8 +1792,8 @@ restic -r ${publicRepoUrl} backup /etc`;
           </div>
 
           <p class="mt-3 text-[11px] text-zinc-600">
-            Revoking a credential stops new uploads but never deletes stored backups — this endpoint is append-only, including for admins.
-            Remove blobs directly on the storage backend if you need to reclaim space. Empty repositories that never received an upload can be deleted outright.
+            ServerMonitor and storage-node gateways enforce append-only writes. Direct S3 immutability depends on the provider IAM/Object Lock policy.
+            Revocation never asks any backend to delete data; remove blobs with a separately trusted backend credential when you need to reclaim space.
           </p>
         </section>
 
@@ -1430,14 +1815,14 @@ restic -r ${publicRepoUrl} backup /etc`;
             <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
               <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
                 <div class="px-4 sm:px-5 py-3 sm:py-4 min-w-0">
-                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Endpoint</div>
+                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Public transport</div>
                   <div class="text-lg font-semibold text-zinc-100 mt-1 font-mono truncate" title={tunnel?.endpoint}>{tunnel?.endpoint}</div>
-                  <div class="text-[11px] text-zinc-500 mt-0.5">UDP · silent to anything but enrolled peers</div>
+                  <div class="text-[11px] text-zinc-500 mt-0.5">BACKUP_WG_PORT · UDP · silent to strangers</div>
                 </div>
                 <div class="px-4 sm:px-5 py-3 sm:py-4">
-                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Tunnel network</div>
-                  <div class="text-lg font-semibold text-zinc-100 mt-1 font-mono">{tunnel?.subnet}</div>
-                  <div class="text-[11px] text-zinc-500 mt-0.5">server at <span class="font-mono">{tunnel?.server_tunnel_ip}</span></div>
+                  <div class="text-[11px] uppercase tracking-wider text-zinc-500">Internal backup service</div>
+                  <div class="text-lg font-semibold text-zinc-100 mt-1 font-mono">{tunnel?.server_tunnel_ip}:{tunnel?.rest_port}</div>
+                  <div class="text-[11px] text-zinc-500 mt-0.5">inside {tunnel?.subnet} · not the public dial address</div>
                 </div>
                 <div class="px-4 sm:px-5 py-3 sm:py-4">
                   <div class="flex items-center justify-between gap-2">
@@ -1473,7 +1858,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                     <tbody class="divide-y divide-zinc-800/70">
                       {#each tunnel?.peers ?? [] as p (p.host_id)}
                         <tr class="hover:bg-zinc-900/60">
-                          <td class="px-4 py-3">
+                          <td class="px-4 py-3 whitespace-nowrap">
                             <a href="/hosts/{p.host_id}?tab=backups" class="font-mono text-zinc-200 hover:text-zinc-100">{p.hostname}</a>
                           </td>
                           <td class="px-4 py-3 text-xs font-mono text-zinc-300">{p.tunnel_ip}</td>
@@ -1490,7 +1875,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                           </td>
                           <td class="px-4 py-3 text-xs text-zinc-400 numeric whitespace-nowrap">↓{bytes(p.rx_bytes)} · ↑{bytes(p.tx_bytes)}</td>
                           <td class="px-4 py-3 text-xs text-zinc-400 numeric whitespace-nowrap">{timeAgo(p.enrolled_at)}</td>
-                          <td class="px-4 py-3 text-right">
+                          <td class="px-4 py-3 text-right whitespace-nowrap">
                             <button
                               type="button"
                               onclick={() => (peerToRevoke = p)}
@@ -1703,7 +2088,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                       {#each nodes as n (n.host_id)}
                         {@const availability = nodeAvailability(n)}
                         <tr class="hover:bg-zinc-900/60">
-                          <td class="px-4 py-3">
+                          <td class="px-4 py-3 whitespace-nowrap">
                             {#if n.host_missing}
                               <span class="font-mono text-zinc-500">{n.hostname || `node ${n.host_id}`}</span>
                             {:else}
@@ -1737,7 +2122,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                           </td>
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{n.target_count}</td>
                           <td class="px-4 py-3 text-xs text-zinc-300 numeric">{bytes(n.used_bytes)}</td>
-                          <td class="px-4 py-3 text-right">
+                          <td class="px-4 py-3 text-right whitespace-nowrap">
                             <div class="flex items-center justify-end gap-1.5">
                               <button
                                 type="button"
@@ -1838,7 +2223,7 @@ restic -r ${publicRepoUrl} backup /etc`;
         The old credential for <span class="font-mono">{rotated?.name}</span> no longer works. Update the host with this new password — shown once.
       </p>
       <code class="block text-xs font-mono text-zinc-100 break-all bg-zinc-950/60 rounded px-3 py-2 border border-zinc-800">{rotated?.password}</code>
-      <button type="button" onclick={() => rotated && copy(rotated.password, 'rot')} class="text-[11px] px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200">{copied === 'rot' ? 'copied' : 'Copy password'}</button>
+      <button type="button" onclick={() => rotated && copy(rotated.password ?? '', 'rot')} class="text-[11px] px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200">{copied === 'rot' ? 'copied' : 'Copy password'}</button>
     </div>
   {/snippet}
 </ConfirmDialog>
@@ -1853,10 +2238,15 @@ restic -r ${publicRepoUrl} backup /etc`;
   onclose={() => (toRevoke = null)} />
 
 {#snippet revokeBody()}
-  <p class="text-sm text-zinc-300">
-    Revoke the credential for <span class="font-mono text-zinc-100">{toRevoke?.name}</span>? Its host can no longer upload.
-    Stored backups are kept (append-only) and can still be restored from another credentialed machine.
-  </p>
+  {#if toRevoke?.destination_id}
+    <p class="text-sm text-zinc-300">Stop centrally delivering <span class="font-mono text-zinc-100">{toRevoke.name}</span> to its host?</p>
+    <p class="mt-2 text-xs text-zinc-500">The agent removes its local managed credential on the next poll. ServerMonitor never contacts S3 and does not delete any object under <span class="font-mono">{toRevoke.namespace_prefix}</span>.</p>
+  {:else}
+    <p class="text-sm text-zinc-300">
+      Revoke the credential for <span class="font-mono text-zinc-100">{toRevoke?.name}</span>? Its host can no longer upload.
+      ServerMonitor does not delete stored backups; they can still be restored from another credentialed machine.
+    </p>
+  {/if}
 {/snippet}
 
 <ConfirmDialog
@@ -1869,6 +2259,10 @@ restic -r ${publicRepoUrl} backup /etc`;
   onclose={() => (toDelete = null)} />
 
 {#snippet deleteBody()}
+  {#if toDelete?.destination_id}
+    <p class="text-sm text-zinc-300">Delete the revoked control-plane namespace <span class="font-mono text-zinc-100">{toDelete.name}</span>?</p>
+    <p class="mt-2 text-xs text-zinc-500">This removes only ServerMonitor's encrypted credential and assignment record. S3/R2 objects remain under <span class="font-mono">{toDelete.namespace_prefix}</span> and must be retained, restored, or deleted at the provider.</p>
+  {:else}
   <p class="text-sm text-zinc-300">
     Permanently delete <span class="font-mono text-zinc-100">{toDelete?.name}</span>? It holds no backups, so nothing is
     lost — this just removes the credential and its entry.
@@ -1877,6 +2271,23 @@ restic -r ${publicRepoUrl} backup /etc`;
     Only empty repositories can be deleted. If an upload has landed since this list loaded, the delete is refused and you can
     revoke instead.
   </p>
+  {/if}
+{/snippet}
+
+<ConfirmDialog
+  open={destinationToDelete !== null}
+  title="Delete direct S3 destination"
+  body={destinationDeleteBody}
+  confirmLabel="Delete destination"
+  danger
+  onconfirm={deleteDestination}
+  onclose={() => (destinationToDelete = null)} />
+
+{#snippet destinationDeleteBody()}
+  <p class="text-sm text-zinc-300">
+    Delete <span class="font-mono text-zinc-100">{destinationToDelete?.name}</span> and its encrypted control-plane credential?
+  </p>
+  <p class="mt-2 text-xs text-zinc-500">This is allowed only when no repository namespaces reference it. It never contacts S3 and never deletes bucket objects.</p>
 {/snippet}
 
 <ConfirmDialog
@@ -1896,6 +2307,33 @@ restic -r ${publicRepoUrl} backup /etc`;
   <p class="mt-2 text-xs text-amber-300">
     If the disk is recoverable, keep this repository until the store has been salvaged.
   </p>
+{/snippet}
+
+<ConfirmDialog
+  open={repositoryCredentialsFor !== null}
+  title="Replace repository-scoped S3 credential"
+  body={repositoryCredentialsBody}
+  confirmLabel="Replace credential"
+  onconfirm={replaceRepositoryCredentials}
+  onclose={() => (repositoryCredentialsFor = null)} />
+
+{#snippet repositoryCredentialsBody()}
+  <p class="text-xs text-zinc-500">The old key for <span class="font-mono text-zinc-300">{repositoryCredentialsFor?.name}</span> is replaced atomically in the encrypted control plane. It is never returned by the admin API.</p>
+  <div class="mt-3 space-y-3">
+    <div>
+      <label for="repo-key" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Access key ID</label>
+      <input id="repo-key" type="password" bind:value={repositoryAccessKeyId} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+    </div>
+    <div>
+      <label for="repo-secret" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Secret access key</label>
+      <input id="repo-secret" type="password" bind:value={repositorySecretAccessKey} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+    </div>
+    <div>
+      <label for="repo-session" class="block text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Session token <span class="normal-case text-zinc-600">(optional)</span></label>
+      <input id="repo-session" type="password" bind:value={repositorySessionToken} autocomplete="new-password" class="w-full rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono" />
+    </div>
+  </div>
+  {#if repositoryCredentialError}<div class="mt-3 text-xs text-rose-300">{repositoryCredentialError}</div>{/if}
 {/snippet}
 
 <ConfirmDialog

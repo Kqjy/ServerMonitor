@@ -14,6 +14,7 @@ import (
 	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/auth"
 	"servermonitor/internal/server/ingest"
+	"servermonitor/internal/server/ipban"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/agentsig"
@@ -25,32 +26,34 @@ type Router struct {
 }
 
 type Deps struct {
-	Hosts          *storage.Hosts
-	DB             *storage.DB
-	Batcher        *ingest.Batcher
-	Hub            *sse.Hub
-	Auth           *auth.Service
-	Archive        *archive.Archiver
-	Logger         *slog.Logger
-	AdminToken     string
-	IngestRate     int
-	IngestBurst    int
-	Version        string
-	WebHandler     http.Handler
-	Retention      RetentionConfig
-	TrustedProxies []*net.IPNet
-	SecureCookies  bool
-	TrustProxyTLS  bool
-	AgentSigner    *agentsig.Signer
-	BackupServer   *restserver.Server
-	BackupTargets  *storage.BackupTargets
-	BackupTLS      BackupTLSInfo
-	BackupTunnel   *restserver.Tunnel
-	TunnelPeers    *storage.BackupTunnelStore
-	TunnelInfo     BackupTunnelInfo
-	BackupPublic   bool
-	BackupNodes    *storage.BackupNodes
-	BackupBrowse   *browseStore
+	Hosts               *storage.Hosts
+	DB                  *storage.DB
+	Batcher             *ingest.Batcher
+	Hub                 *sse.Hub
+	Auth                *auth.Service
+	Archive             *archive.Archiver
+	Logger              *slog.Logger
+	AdminToken          string
+	IngestRate          int
+	IngestBurst         int
+	Version             string
+	WebHandler          http.Handler
+	Retention           RetentionConfig
+	TrustedProxies      []*net.IPNet
+	SecureCookies       bool
+	TrustProxyTLS       bool
+	AgentSigner         *agentsig.Signer
+	BackupServer        *restserver.Server
+	BackupTargets       *storage.BackupTargets
+	BackupTLS           BackupTLSInfo
+	BackupTunnel        *restserver.Tunnel
+	TunnelPeers         *storage.BackupTunnelStore
+	TunnelInfo          BackupTunnelInfo
+	BackupPublic        bool
+	BackupSecretsSecure bool
+	BackupNodes         *storage.BackupNodes
+	BackupBrowse        *browseStore
+	IPBan               *ipban.Service
 }
 
 func New(d Deps) *Router {
@@ -91,13 +94,19 @@ func New(d Deps) *Router {
 			r.Use(timeout)
 			r.Use(ingestLimiter(d.IngestRate, d.IngestBurst))
 			r.Use(requireAgentToken(d.Hosts))
-			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger, browse))
+			r.Post("/ingest", ingestHandler(d.Batcher, d.Hub, d.Hosts, d.AgentSigner, d.Logger, browse, d.IPBan))
+			if d.IPBan != nil {
+				r.Get("/agent/ipban", agentIPBanConfigHandler(d.IPBan))
+			}
 			r.Post("/agent/tunnel", tunnelEnrollHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo))
 			r.Get("/agent/backup-browse", agentBackupBrowseJobsHandler(browse))
 			r.Post("/agent/backup-browse/{jobID}", agentBackupBrowseResultHandler(browse))
 			r.Get("/agent/tunnel/nodes", agentTunnelNodesHandler(d.BackupNodes))
 			r.Get("/agent/backup-node", agentBackupNodeConfigHandler(d.BackupNodes))
 			r.Post("/agent/backup-node/usage", agentBackupNodeUsageHandler(d.BackupNodes, nodePeerStats, nodeHealth))
+			if d.BackupTargets != nil {
+				r.Get("/agent/backup-config", managedBackupConfigHandler(d.BackupTargets, d.BackupSecretsSecure))
+			}
 		})
 
 		r.Group(func(r chi.Router) {
@@ -135,7 +144,7 @@ func New(d Deps) *Router {
 				r.Get("/metrics", listMetricsHandler())
 				r.Get("/stats", statsHandler(d.Batcher))
 				r.Get("/retention", retentionHandler(d.Retention))
-				r.Get("/storage", storageUsageHandler(d.DB, d.Archive != nil))
+				r.Get("/storage", storageUsageHandler(d.DB, d.Archive))
 				r.Get("/agent/platforms", listPlatformsHandler())
 				r.Get("/server/info", serverInfoHandler(d.Version, d.TrustedProxies, d.TrustProxyTLS))
 
@@ -151,14 +160,40 @@ func New(d Deps) *Router {
 				r.Put("/channels/{id}", updateChannelHandler(d.DB.Pool))
 				r.Delete("/channels/{id}", deleteChannelHandler(d.DB.Pool))
 
+				if d.IPBan != nil {
+					r.Get("/ipban/settings", ipbanSettingsHandler(d.IPBan, d.TrustedProxies))
+					r.Put("/ipban/settings", ipbanUpdateSettingsHandler(d.IPBan, d.TrustedProxies))
+					r.Get("/ipban/summary", ipbanSummaryHandler(d.IPBan))
+					r.Get("/ipban/hosts", ipbanHostsHandler(d.IPBan))
+					r.Put("/ipban/hosts/{id}", ipbanUpdateHostHandler(d.IPBan))
+					r.Get("/ipban/active", ipbanActiveHandler(d.IPBan))
+					r.Get("/ipban/fleet", ipbanFleetHandler(d.IPBan))
+					r.Post("/ipban/fleet", ipbanManualBanHandler(d.IPBan))
+					r.Delete("/ipban/fleet/{ip}", ipbanFleetUnbanHandler(d.IPBan))
+					r.Post("/ipban/unban", ipbanHostUnbanHandler(d.IPBan))
+					r.Get("/ipban/events", ipbanEventsHandler(d.IPBan))
+				}
+
 				if d.BackupTargets != nil {
 					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
-					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
-					r.Patch("/backup-targets/{id}", updateBackupTargetHandler(d.BackupTargets))
+					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes, d.Hosts, d.BackupSecretsSecure))
+					r.Patch("/backup-targets/{id}", updateBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
 					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
+					r.Get("/backup-repositories", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
+					r.Post("/backup-repositories", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes, d.Hosts, d.BackupSecretsSecure))
+					r.Patch("/backup-repositories/{id}", updateBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Post("/backup-repositories/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
+					r.Post("/backup-repositories/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
+					r.Post("/backup-repositories/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
+					r.Put("/backup-repositories/{id}/credentials", updateDirectRepositoryCredentialsHandler(d.BackupTargets))
+					r.Delete("/backup-repositories/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
+					r.Get("/backup-destinations", listBackupDestinationsHandler(d.BackupTargets))
+					r.Post("/backup-destinations", createBackupDestinationHandler(d.BackupTargets))
+					r.Put("/backup-destinations/{id}/credentials", updateBackupDestinationCredentialsHandler(d.BackupTargets))
+					r.Delete("/backup-destinations/{id}", deleteBackupDestinationHandler(d.BackupTargets))
 					r.Get("/backup-tunnel", backupTunnelStatusHandler(d.BackupTunnel, d.TunnelPeers, d.TunnelInfo, nodePeerStats))
 					r.Delete("/backup-tunnel/peers/{hostID}", revokeTunnelPeerHandler(d.BackupTunnel, d.TunnelPeers, nodePeerStats))
 					r.Get("/backup-nodes", listBackupNodesHandler(d.BackupNodes, nodeHealth))

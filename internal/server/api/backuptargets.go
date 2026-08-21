@@ -12,8 +12,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"servermonitor/internal/server/secretbox"
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/restserver"
+	"servermonitor/pkg/secretenvelope"
+	"servermonitor/pkg/wire"
 )
 
 type BackupTLSInfo struct {
@@ -23,24 +26,53 @@ type BackupTLSInfo struct {
 }
 
 type backupTargetView struct {
-	ID              int64      `json:"id"`
-	Name            string     `json:"name"`
-	HostID          *int64     `json:"host_id,omitempty"`
-	Hostname        string     `json:"hostname,omitempty"`
-	NodeHostID      *int64     `json:"node_host_id,omitempty"`
-	NodeHostname    string     `json:"node_hostname,omitempty"`
-	QuotaBytes      *int64     `json:"quota_bytes,omitempty"`
-	UsedBytes       int64      `json:"used_bytes"`
-	UsageMeasuredAt *time.Time `json:"usage_measured_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	ID                  int64                         `json:"id"`
+	Name                string                        `json:"name"`
+	HostID              *int64                        `json:"host_id,omitempty"`
+	Hostname            string                        `json:"hostname,omitempty"`
+	NodeHostID          *int64                        `json:"node_host_id,omitempty"`
+	NodeHostname        string                        `json:"node_hostname,omitempty"`
+	DestinationID       *int64                        `json:"destination_id,omitempty"`
+	DestinationName     string                        `json:"destination_name,omitempty"`
+	DestinationKind     string                        `json:"destination_kind,omitempty"`
+	NamespacePrefix     string                        `json:"namespace_prefix,omitempty"`
+	Managed             bool                          `json:"managed"`
+	CredentialScope     string                        `json:"credential_scope,omitempty"`
+	StorageBackend      backupStorageBackendView      `json:"storage_backend"`
+	RepositoryNamespace backupRepositoryNamespaceView `json:"repository_namespace"`
+	DataPath            backupDataPathView            `json:"data_path"`
+	QuotaBytes          *int64                        `json:"quota_bytes,omitempty"`
+	UsedBytes           int64                         `json:"used_bytes"`
+	UsageMeasuredAt     *time.Time                    `json:"usage_measured_at,omitempty"`
+	CreatedAt           time.Time                     `json:"created_at"`
+	RevokedAt           *time.Time                    `json:"revoked_at,omitempty"`
+}
+
+type backupStorageBackendView struct {
+	Kind     string `json:"kind"`
+	Label    string `json:"label"`
+	Location string `json:"location,omitempty"`
+}
+
+type backupRepositoryNamespaceView struct {
+	Name   string `json:"name"`
+	Prefix string `json:"prefix,omitempty"`
+}
+
+type backupDataPathView struct {
+	Kind      string   `json:"kind"`
+	Label     string   `json:"label"`
+	Hops      []string `json:"hops"`
+	Transport string   `json:"transport,omitempty"`
 }
 
 type backupTargetsResponse struct {
-	Configured bool                    `json:"configured"`
-	Storage    *restserver.BackendInfo `json:"storage,omitempty"`
-	TLS        BackupTLSInfo           `json:"tls"`
-	Targets    []backupTargetView      `json:"targets"`
+	Configured   bool                    `json:"configured"`
+	Storage      *restserver.BackendInfo `json:"storage,omitempty"`
+	TLS          BackupTLSInfo           `json:"tls"`
+	Targets      []backupTargetView      `json:"targets"`
+	Repositories []backupTargetView      `json:"repositories"`
+	Destinations []backupDestinationView `json:"destinations"`
 }
 
 var backupTargetNameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
@@ -49,25 +81,55 @@ func validBackupTargetName(name string) bool {
 	return name != "" && name != "." && name != ".." && backupTargetNameRE.MatchString(name)
 }
 
-func toBackupTargetView(t storage.BackupTarget) backupTargetView {
-	return backupTargetView{
-		ID:              t.ID,
-		Name:            t.Name,
-		HostID:          t.HostID,
-		Hostname:        t.Hostname,
-		NodeHostID:      t.NodeHostID,
-		NodeHostname:    t.NodeHostname,
-		QuotaBytes:      t.QuotaBytes,
-		UsedBytes:       t.UsedBytes,
-		UsageMeasuredAt: t.UsageMeasuredAt,
-		CreatedAt:       t.CreatedAt,
-		RevokedAt:       t.RevokedAt,
+func toBackupTargetView(t storage.BackupTarget, server *restserver.Server) backupTargetView {
+	view := backupTargetView{
+		ID:                  t.ID,
+		Name:                t.Name,
+		HostID:              t.HostID,
+		Hostname:            t.Hostname,
+		NodeHostID:          t.NodeHostID,
+		NodeHostname:        t.NodeHostname,
+		DestinationID:       t.DestinationID,
+		DestinationName:     t.DestinationName,
+		DestinationKind:     t.DestinationKind,
+		NamespacePrefix:     t.NamespacePrefix,
+		Managed:             t.DestinationID != nil,
+		RepositoryNamespace: backupRepositoryNamespaceView{Name: t.Name, Prefix: t.NamespacePrefix},
+		QuotaBytes:          t.QuotaBytes,
+		UsedBytes:           t.UsedBytes,
+		UsageMeasuredAt:     t.UsageMeasuredAt,
+		CreatedAt:           t.CreatedAt,
+		RevokedAt:           t.RevokedAt,
 	}
+	switch {
+	case t.DestinationID != nil:
+		view.CredentialScope = "destination"
+		if t.DirectCredentialsScoped {
+			view.CredentialScope = "repository"
+		}
+		view.StorageBackend = backupStorageBackendView{Kind: "external_s3", Label: "External S3-compatible object storage", Location: t.DestinationName}
+		view.DataPath = backupDataPathView{Kind: "agent_to_s3_direct", Label: "Agent → S3 directly", Hops: []string{"Agent", "S3"}, Transport: "s3_api"}
+	case t.NodeHostID != nil:
+		view.StorageBackend = backupStorageBackendView{Kind: "storage_node_disk", Label: "Storage node disk", Location: t.NodeHostname}
+		view.DataPath = backupDataPathView{Kind: "agent_to_storage_node", Label: "Agent → storage node", Hops: []string{"Agent", "storage node"}, Transport: "wireguard_udp"}
+	case server != nil && server.Backend().Kind == "s3":
+		backend := server.Backend()
+		view.StorageBackend = backupStorageBackendView{Kind: "server_gateway_s3", Label: "S3-compatible object storage behind ServerMonitor", Location: backend.Location}
+		view.DataPath = backupDataPathView{Kind: "agent_via_server_to_s3", Label: "Agent → ServerMonitor → S3", Hops: []string{"Agent", "ServerMonitor", "S3"}}
+	case server != nil:
+		backend := server.Backend()
+		view.StorageBackend = backupStorageBackendView{Kind: "server_disk", Label: "Server disk", Location: backend.Location}
+		view.DataPath = backupDataPathView{Kind: "agent_to_server_disk", Label: "Agent → Server disk", Hops: []string{"Agent", "Server disk"}}
+	default:
+		view.StorageBackend = backupStorageBackendView{Kind: "unavailable", Label: "Legacy server destination (backend unavailable)"}
+		view.DataPath = backupDataPathView{Kind: "agent_to_server_unavailable", Label: "Agent → ServerMonitor (backend unavailable)", Hops: []string{"Agent", "ServerMonitor"}}
+	}
+	return view
 }
 
 func listBackupTargetsHandler(targets *storage.BackupTargets, server *restserver.Server, tlsInfo BackupTLSInfo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		resp := backupTargetsResponse{Configured: server != nil, TLS: tlsInfo, Targets: []backupTargetView{}}
+		resp := backupTargetsResponse{Configured: server != nil, TLS: tlsInfo, Targets: []backupTargetView{}, Repositories: []backupTargetView{}, Destinations: []backupDestinationView{}}
 		if server != nil {
 			backend := server.Backend()
 			resp.Storage = &backend
@@ -78,29 +140,43 @@ func listBackupTargetsHandler(targets *storage.BackupTargets, server *restserver
 			return
 		}
 		for _, t := range rows {
-			resp.Targets = append(resp.Targets, toBackupTargetView(t))
+			view := toBackupTargetView(t, server)
+			resp.Targets = append(resp.Targets, view)
+			resp.Repositories = append(resp.Repositories, view)
+		}
+		destinations, err := targets.ListDestinations(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, destination := range destinations {
+			resp.Destinations = append(resp.Destinations, toBackupDestinationView(destination))
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
 type createBackupTargetRequest struct {
-	Name       string `json:"name"`
-	HostID     *int64 `json:"host_id,omitempty"`
-	QuotaBytes *int64 `json:"quota_bytes,omitempty"`
-	NodeHostID *int64 `json:"node_host_id,omitempty"`
+	Name          string                      `json:"name"`
+	HostID        *int64                      `json:"host_id,omitempty"`
+	QuotaBytes    *int64                      `json:"quota_bytes,omitempty"`
+	NodeHostID    *int64                      `json:"node_host_id,omitempty"`
+	DestinationID *int64                      `json:"destination_id,omitempty"`
+	S3Credentials *backupS3CredentialsRequest `json:"s3_credentials,omitempty"`
 }
 
 type backupCredentialResponse struct {
 	ID       int64  `json:"id"`
 	Name     string `json:"name"`
-	Password string `json:"password"`
+	Password string `json:"password,omitempty"`
+	Managed  bool   `json:"managed,omitempty"`
+	DataPath string `json:"data_path,omitempty"`
 }
 
-func createBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server, nodes *storage.BackupNodes) http.HandlerFunc {
+func createBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server, nodes *storage.BackupNodes, hosts *storage.Hosts, secureSecretDelivery bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createBackupTargetRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
@@ -111,6 +187,55 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 		}
 		if req.QuotaBytes != nil && *req.QuotaBytes < 0 {
 			writeError(w, http.StatusBadRequest, "quota_bytes must be >= 0")
+			return
+		}
+		if req.NodeHostID != nil && req.DestinationID != nil {
+			writeError(w, http.StatusBadRequest, "choose exactly one destination")
+			return
+		}
+		if req.DestinationID != nil {
+			if !secureSecretDelivery {
+				writeError(w, http.StatusServiceUnavailable, "direct S3 credential delivery requires HTTPS (native TLS, ACME, or TRUST_PROXY_TLS=1)")
+				return
+			}
+			if req.HostID == nil {
+				writeError(w, http.StatusBadRequest, "direct S3 repositories require host_id")
+				return
+			}
+			if req.QuotaBytes != nil && *req.QuotaBytes > 0 {
+				writeError(w, http.StatusBadRequest, "direct S3 quotas must be configured at the object-storage provider")
+				return
+			}
+			destination, err := targets.GetDestination(r.Context(), *req.DestinationID)
+			if err != nil {
+				backupTargetLookupError(w, err)
+				return
+			}
+			host, err := hosts.Get(r.Context(), *req.HostID)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "host_id does not refer to an active host")
+				return
+			}
+			prefix, err := storage.ExpandDirectPrefix(destination.PrefixTemplate, host.ID, host.Hostname, name)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			secret, err := generateToken(32)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			credentials := storage.BackupS3Credentials{}
+			if req.S3Credentials != nil {
+				credentials = req.S3Credentials.storage()
+			}
+			id, err := targets.CreateDirectRepository(r.Context(), name, host.ID, req.QuotaBytes, secret, prefix, destination.ID, credentials)
+			if err != nil {
+				backupDestinationMutationError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, backupCredentialResponse{ID: id, Name: name, Managed: true, DataPath: "Agent → S3 directly"})
 			return
 		}
 		if req.NodeHostID != nil {
@@ -149,7 +274,7 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 		id, err := targets.Create(r.Context(), name, req.HostID, req.QuotaBytes, secret, req.NodeHostID)
 		if err != nil {
 			if errors.Is(err, storage.ErrBackupTargetNameTaken) {
-				writeError(w, http.StatusConflict, "a backup target with that name already exists")
+				writeError(w, http.StatusConflict, "a backup repository with that name already exists")
 				return
 			}
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -163,7 +288,7 @@ type updateBackupTargetRequest struct {
 	QuotaBytes *int64 `json:"quota_bytes"`
 }
 
-func updateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc {
+func updateBackupTargetHandler(targets *storage.BackupTargets, server *restserver.Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseBackupTargetID(w, r)
 		if !ok {
@@ -179,6 +304,15 @@ func updateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc 
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		existing, err := targets.Get(r.Context(), id)
+		if err != nil {
+			backupTargetLookupError(w, err)
+			return
+		}
+		if existing.DestinationID != nil {
+			writeError(w, http.StatusBadRequest, "direct S3 quotas are enforced by the object-storage provider, not ServerMonitor")
+			return
+		}
 		if err := targets.SetQuota(r.Context(), id, quota); err != nil {
 			backupTargetLookupError(w, err)
 			return
@@ -188,7 +322,7 @@ func updateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc 
 			backupTargetLookupError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, toBackupTargetView(updated))
+		writeJSON(w, http.StatusOK, toBackupTargetView(updated, server))
 	}
 }
 
@@ -214,6 +348,10 @@ func rotateBackupTargetHandler(targets *storage.BackupTargets) http.HandlerFunc 
 		existing, err := targets.Get(r.Context(), id)
 		if err != nil {
 			backupTargetLookupError(w, err)
+			return
+		}
+		if existing.DestinationID != nil {
+			writeError(w, http.StatusBadRequest, "direct S3 repositories use managed S3 credentials; update those credentials instead of rotating a gateway password")
 			return
 		}
 		secret, err := generateToken(32)
@@ -283,6 +421,18 @@ func deleteBackupTargetHandlerWithStores(targets backupTargetDeleteStore, server
 			backupTargetLookupError(w, err)
 			return
 		}
+		if t.DestinationID != nil {
+			if t.RevokedAt == nil {
+				writeError(w, http.StatusConflict, "revoke the direct repository before deleting its control-plane record; S3 objects are never deleted by this action")
+				return
+			}
+			if err := targets.Delete(r.Context(), id); err != nil {
+				backupTargetLookupError(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if t.NodeHostID != nil {
 			if nodes == nil {
 				writeError(w, http.StatusInternalServerError, "backup nodes are not available")
@@ -294,7 +444,7 @@ func deleteBackupTargetHandlerWithStores(targets backupTargetDeleteStore, server
 				return
 			}
 			if nodeErr == nil && !node.HostMissing && !node.Archived {
-				writeError(w, http.StatusConflict, "node-hosted backup targets cannot be deleted while their storage node is active or offline; revoke them instead, or delete after the node is demoted, archived, or removed")
+				writeError(w, http.StatusConflict, "node-hosted backup repositories cannot be deleted while their storage node is active or offline; revoke them instead, or delete after the node is demoted, archived, or removed")
 				return
 			}
 			if err := targets.Delete(r.Context(), id); err != nil {
@@ -314,7 +464,7 @@ func deleteBackupTargetHandlerWithStores(targets backupTargetDeleteStore, server
 			}
 		}
 		if !backupTargetDeletable(t.UsedBytes, repoHasObjects, repoChecked, false) {
-			writeError(w, http.StatusConflict, "backup target still holds data; revoke it instead, then reclaim space on the storage backend")
+			writeError(w, http.StatusConflict, "backup repository still holds data; revoke it instead, then reclaim space on the storage backend")
 			return
 		}
 		if err := targets.Delete(r.Context(), id); err != nil {
@@ -334,6 +484,10 @@ func measureBackupTargetHandler(targets *storage.BackupTargets, server *restserv
 		t, err := targets.Get(r.Context(), id)
 		if err != nil {
 			backupTargetLookupError(w, err)
+			return
+		}
+		if t.DestinationID != nil {
+			writeError(w, http.StatusBadRequest, "direct S3 usage is measured by the object-storage provider; backup traffic does not pass through ServerMonitor")
 			return
 		}
 		if t.NodeHostID != nil {
@@ -358,7 +512,58 @@ func measureBackupTargetHandler(targets *storage.BackupTargets, server *restserv
 			backupTargetLookupError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, toBackupTargetView(updated))
+		writeJSON(w, http.StatusOK, toBackupTargetView(updated, server))
+	}
+}
+
+func managedBackupConfigHandler(targets *storage.BackupTargets, secureSecretDelivery bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hostID, ok := hostIDFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "no host")
+			return
+		}
+		repositories, err := targets.ManagedRepositoriesForHost(r.Context(), hostID)
+		if err != nil {
+			if errors.Is(err, secretbox.ErrNotConfigured) {
+				writeError(w, http.StatusServiceUnavailable, "managed backup secrets are unavailable; configure BACKUP_SECRETS_KEY")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "managed backup configuration is unavailable")
+			return
+		}
+		if len(repositories) > 0 && !secureSecretDelivery {
+			writeError(w, http.StatusServiceUnavailable, "managed backup credentials are not delivered over plaintext HTTP")
+			return
+		}
+		resp := wire.ManagedBackupConfig{Repositories: []wire.ManagedBackupRepository{}}
+		for _, repository := range repositories {
+			if repository.Version > resp.Version {
+				resp.Version = repository.Version
+			}
+			resp.Repositories = append(resp.Repositories, wire.ManagedBackupRepository{
+				ID:              repository.ID,
+				Name:            repository.Name,
+				URL:             repository.URL,
+				S3Region:        repository.S3Region,
+				S3PathStyle:     repository.S3PathStyle,
+				AccessKeyID:     repository.Credentials.AccessKeyID,
+				SecretAccessKey: repository.Credentials.SecretAccessKey,
+				SessionToken:    repository.Credentials.SessionToken,
+			})
+		}
+		plaintext, err := json.Marshal(resp)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "managed backup configuration is unavailable")
+			return
+		}
+		envelope, err := secretenvelope.Seal(r.Header.Get("X-Agent-Token"), secretenvelope.ManagedBackupConfigPurpose, plaintext)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "managed backup configuration is unavailable")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, envelope)
 	}
 }
 
@@ -373,7 +578,7 @@ func parseBackupTargetID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 
 func backupTargetLookupError(w http.ResponseWriter, err error) {
 	if errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "backup target not found")
+		writeError(w, http.StatusNotFound, "backup repository not found")
 		return
 	}
 	writeError(w, http.StatusInternalServerError, err.Error())

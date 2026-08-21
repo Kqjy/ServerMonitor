@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"servermonitor/pkg/wire"
 )
 
 func TestPubkeyHolderSetIfEmpty(t *testing.T) {
@@ -117,5 +119,25 @@ func TestPersistConfigFieldPreservesInterval(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	if !strings.Contains(string(got), "interval_s = 42") {
 		t.Fatalf("expected interval=42, got:\n%s", got)
+	}
+}
+
+func TestManagedBackupConfigSignatureIncludesCredentialChanges(t *testing.T) {
+	base := &wire.ManagedBackupConfig{Version: 5, Repositories: []wire.ManagedBackupRepository{{
+		ID: 1, Name: "direct", URL: "s3:s3.amazonaws.com/bucket/host-1", AccessKeyID: "key", SecretAccessKey: "secret-1",
+	}}}
+	first, err := managedBackupConfigSignature(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := *base
+	changed.Repositories = append([]wire.ManagedBackupRepository(nil), base.Repositories...)
+	changed.Repositories[0].SecretAccessKey = "secret-2"
+	second, err := managedBackupConfigSignature(&changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("credential-only change did not change the managed backup signature")
 	}
 }

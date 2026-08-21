@@ -204,6 +204,9 @@ func (r RunResult) AnySucceeded() bool {
 	if r.LockSkipped {
 		return true
 	}
+	if len(r.Repos) == 0 {
+		return true
+	}
 	for _, repo := range r.Repos {
 		if repo.Success {
 			return true
@@ -235,7 +238,7 @@ func runRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, opts O
 	status.AddedBytes = summary.AddedBytes
 	status.TotalBytes = summary.TotalBytes
 
-	if cfg.PruneMode == "host" {
+	if cfg.PruneMode == "host" && !repo.managed {
 		if err := runForgetCommand(ctx, cfg, repo, cacheDir, opts); err != nil {
 			return finishRepoStatus(status, opts, err, logger)
 		}

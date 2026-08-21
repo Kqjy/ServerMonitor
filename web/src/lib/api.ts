@@ -206,11 +206,48 @@ export interface BackupTarget {
   hostname?: string;
   node_host_id?: number;
   node_hostname?: string;
+  destination_id?: number;
+  destination_name?: string;
+  destination_kind?: string;
+  namespace_prefix?: string;
+  managed: boolean;
+  credential_scope?: 'destination' | 'repository';
+  storage_backend: {
+    kind: string;
+    label: string;
+    location?: string;
+  };
+  repository_namespace: {
+    name: string;
+    prefix?: string;
+  };
+  data_path: {
+    kind: string;
+    label: string;
+    hops: string[];
+    transport?: string;
+  };
   quota_bytes?: number;
   used_bytes: number;
   usage_measured_at?: string;
   created_at: string;
   revoked_at?: string;
+}
+
+export interface BackupDestination {
+  id: number;
+  name: string;
+  kind: 'direct_s3';
+  endpoint?: string;
+  bucket: string;
+  region?: string;
+  prefix_template: string;
+  use_path_style: boolean;
+  credentials_configured: boolean;
+  repository_count: number;
+  data_path: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface BackupNode {
@@ -238,12 +275,33 @@ export interface BackupTargetsResp {
   storage?: BackupTargetStorage;
   tls: BackupTargetTLS;
   targets: BackupTarget[];
+  repositories: BackupTarget[];
+  destinations: BackupDestination[];
 }
 
 export interface BackupCredential {
   id: number;
   name: string;
-  password: string;
+  password?: string;
+  managed?: boolean;
+  data_path?: string;
+}
+
+export interface BackupS3CredentialsInput {
+  access_key_id: string;
+  secret_access_key: string;
+  session_token?: string;
+}
+
+export interface BackupDestinationInput {
+  name: string;
+  kind: 'direct_s3';
+  endpoint?: string;
+  bucket: string;
+  region?: string;
+  prefix_template?: string;
+  use_path_style?: boolean;
+  credentials?: BackupS3CredentialsInput;
 }
 
 export interface BackupTunnelPeer {
@@ -391,6 +449,7 @@ export interface RetentionPolicy {
   configured: string;
   default: string;
   description: string;
+  owner: string;
 }
 
 export interface RetentionResp {
@@ -421,6 +480,9 @@ export interface StorageArchive {
   row_count: number;
   oldest: string | null;
   newest: string | null;
+  last_attempt_at?: string;
+  last_success_at?: string;
+  last_run_ok?: boolean;
 }
 
 export interface StorageResp {
@@ -431,6 +493,128 @@ export interface StorageResp {
   tables: StorageTable[];
   archive: StorageArchive;
   warnings?: string[];
+}
+
+export interface IPBanSourceStatus {
+  name: string;
+  state: string;
+  message?: string;
+}
+
+export interface IPBanSettings {
+  enabled: boolean;
+  enforce: boolean;
+  contribute: boolean;
+  apply_fleet: boolean;
+  mode: string;
+  max_retry: number;
+  find_time_s: number;
+  ban_time_s: number;
+  ban_time_max_s: number;
+  ban_private: boolean;
+  fleet_min_hosts: number;
+  fleet_min_bans: number;
+  fleet_ttl_s: number;
+  allowlist: string[];
+  version: number;
+  updated_at: string;
+  client_ip: string;
+}
+
+export type IPBanSettingsInput = Partial<Omit<IPBanSettings, 'version' | 'updated_at' | 'client_ip'>>;
+
+export interface IPBanHostPolicy {
+  detect: boolean | null;
+  enforce: boolean | null;
+  contribute: boolean | null;
+  apply_fleet: boolean | null;
+}
+
+export interface IPBanEffectivePolicy {
+  detect: boolean;
+  enforce: boolean;
+  contribute: boolean;
+  apply_fleet: boolean;
+}
+
+export interface IPBanHost {
+  host_id: number;
+  hostname: string;
+  os: string;
+  agent_version: string;
+  last_seen: string | null;
+  sample_interval_s: number;
+  archived: boolean;
+  override: IPBanHostPolicy;
+  effective: IPBanEffectivePolicy;
+  supported: boolean;
+  detect_state: string;
+  detect_message?: string;
+  enforce_state: string;
+  enforce_message?: string;
+  sources: IPBanSourceStatus[];
+  active_local: number;
+  fleet_applied: number;
+  applied_version: number;
+  reported_at: string | null;
+  config_stale: boolean;
+}
+
+export interface IPBanActive {
+  host_id: number;
+  hostname: string;
+  ip: string;
+  source: string;
+  failures: number;
+  user?: string;
+  banned_at: string;
+  expires_at: string;
+  enforced: boolean;
+  repeat_count: number;
+  fleet: boolean;
+}
+
+export interface IPBanFleet {
+  ip: string;
+  first_seen: string;
+  last_seen: string;
+  host_count: number;
+  ban_count: number;
+  expires_at: string;
+  source: string;
+  note?: string;
+  created_by?: string;
+  active_hosts: number;
+}
+
+export interface IPBanEvent {
+  id: number;
+  time: string;
+  host_id: number | null;
+  hostname?: string;
+  ip: string;
+  action: string;
+  source?: string;
+  failures?: number;
+  user?: string;
+  expires_at: string | null;
+  enforced: boolean;
+  repeat_count?: number;
+  actor?: string;
+  note?: string;
+}
+
+export interface IPBanSummary {
+  hosts_total: number;
+  hosts_detecting: number;
+  hosts_enforcing: number;
+  hosts_observing: number;
+  hosts_blocked: number;
+  hosts_not_capable: number;
+  active_local: number;
+  fleet_size: number;
+  bans_24h: number;
+  fleet_bans_24h: number;
 }
 
 export class ApiError extends Error {
@@ -723,25 +907,45 @@ export const api = {
   serverInfo: () => request<ServerInfo>('/api/v1/server/info'),
   retention: () => request<RetentionResp>('/api/v1/retention'),
   storage: () => request<StorageResp>('/api/v1/storage'),
-  backupTargets: () => request<BackupTargetsResp>('/api/v1/backup-targets'),
-  backupTargetCreate: (body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number }) =>
-    request<BackupCredential>('/api/v1/backup-targets', {
+  backupTargets: () => request<BackupTargetsResp>('/api/v1/backup-repositories'),
+  backupTargetCreate: (body: { name: string; host_id?: number; quota_bytes?: number; node_host_id?: number; destination_id?: number; s3_credentials?: BackupS3CredentialsInput }) =>
+    request<BackupCredential>('/api/v1/backup-repositories', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }),
   backupTargetRotate: (id: number) =>
-    request<BackupCredential>(`/api/v1/backup-targets/${id}/rotate`, { method: 'POST' }),
+    request<BackupCredential>(`/api/v1/backup-repositories/${id}/rotate`, { method: 'POST' }),
   backupTargetMeasure: (id: number) =>
-    request<BackupTarget>(`/api/v1/backup-targets/${id}/measure`, { method: 'POST' }),
+    request<BackupTarget>(`/api/v1/backup-repositories/${id}/measure`, { method: 'POST' }),
   backupTargetSetQuota: (id: number, quota_bytes: number | null) =>
-    request<BackupTarget>(`/api/v1/backup-targets/${id}`, {
+    request<BackupTarget>(`/api/v1/backup-repositories/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ quota_bytes })
     }),
-  backupTargetRevoke: (id: number) => request<void>(`/api/v1/backup-targets/${id}/revoke`, { method: 'POST' }),
-  backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-targets/${id}`, { method: 'DELETE' }),
+  backupTargetRevoke: (id: number) => request<void>(`/api/v1/backup-repositories/${id}/revoke`, { method: 'POST' }),
+  backupTargetDelete: (id: number) => request<void>(`/api/v1/backup-repositories/${id}`, { method: 'DELETE' }),
+  backupTargetSetCredentials: (id: number, credentials: BackupS3CredentialsInput) =>
+    request<void>(`/api/v1/backup-repositories/${id}/credentials`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(credentials)
+    }),
+  backupDestinations: () => request<{ destinations: BackupDestination[] }>('/api/v1/backup-destinations'),
+  backupDestinationCreate: (body: BackupDestinationInput) =>
+    request<BackupDestination>('/api/v1/backup-destinations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }),
+  backupDestinationSetCredentials: (id: number, credentials: BackupS3CredentialsInput) =>
+    request<BackupDestination>(`/api/v1/backup-destinations/${id}/credentials`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(credentials)
+    }),
+  backupDestinationDelete: (id: number) => request<void>(`/api/v1/backup-destinations/${id}`, { method: 'DELETE' }),
   backupTunnel: () => request<BackupTunnelResp>('/api/v1/backup-tunnel'),
   backupTunnelPeerRevoke: (hostId: number) =>
     request<void>(`/api/v1/backup-tunnel/peers/${hostId}`, { method: 'DELETE' }),
@@ -764,5 +968,55 @@ export const api = {
       body: JSON.stringify(body)
     }),
   backupNodeDemote: (hostId: number) =>
-    request<void>(`/api/v1/backup-nodes/${hostId}`, { method: 'DELETE' })
+    request<void>(`/api/v1/backup-nodes/${hostId}`, { method: 'DELETE' }),
+
+  ipbanSettings: (opts: { signal?: AbortSignal } = {}) =>
+    request<IPBanSettings>('/api/v1/ipban/settings', { signal: opts.signal }),
+  ipbanUpdateSettings: (input: IPBanSettingsInput) =>
+    request<IPBanSettings>('/api/v1/ipban/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input)
+    }),
+  ipbanSummary: (opts: { signal?: AbortSignal } = {}) =>
+    request<IPBanSummary>('/api/v1/ipban/summary', { signal: opts.signal }),
+  ipbanHosts: (opts: { signal?: AbortSignal } = {}) =>
+    request<IPBanHost[]>('/api/v1/ipban/hosts', { signal: opts.signal }),
+  ipbanUpdateHost: (hostId: number, policy: IPBanHostPolicy) =>
+    request<IPBanHostPolicy>(`/api/v1/ipban/hosts/${hostId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(policy)
+    }),
+  ipbanActive: (opts: { host?: number; limit?: number; signal?: AbortSignal } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.host) q.set('host', String(opts.host));
+    if (opts.limit) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return request<IPBanActive[]>(`/api/v1/ipban/active${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+  },
+  ipbanFleet: (opts: { signal?: AbortSignal } = {}) =>
+    request<IPBanFleet[]>('/api/v1/ipban/fleet', { signal: opts.signal }),
+  ipbanManualBan: (body: { ip: string; ttl_s: number; note?: string }) =>
+    request<IPBanFleet>('/api/v1/ipban/fleet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }),
+  ipbanFleetUnban: (ip: string) => request<void>(`/api/v1/ipban/fleet/${ip}`, { method: 'DELETE' }),
+  ipbanHostUnban: (hostId: number, ip: string) =>
+    request<void>('/api/v1/ipban/unban', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host_id: hostId, ip })
+    }),
+  ipbanEvents: (opts: { host?: number; ip?: string; limit?: number; before?: string; signal?: AbortSignal } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.host) q.set('host', String(opts.host));
+    if (opts.ip) q.set('ip', opts.ip);
+    if (opts.limit) q.set('limit', String(opts.limit));
+    if (opts.before) q.set('before', opts.before);
+    const qs = q.toString();
+    return request<IPBanEvent[]>(`/api/v1/ipban/events${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+  }
 };

@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.4.9 .
-docker push registry.example.com/servermonitor-agent:0.4.9
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.5.0 .
+docker push registry.example.com/servermonitor-agent:0.5.0
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.4.9
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.5.0
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -71,7 +71,7 @@ docker compose -f deploy/docker-compose.agent.yml --env-file .env.agent up -d --
 | Setting | Effect |
 |---|---|
 | `pid: host` + `network_mode: host` | The agent sees host processes and interfaces, not the container's namespace. |
-| `cap_drop: ALL`, then `cap_add: DAC_READ_SEARCH, SYS_PTRACE` | Exactly the caps the host unit grants under `--enable-port-owners`, nothing more — plus `no-new-privileges`. |
+| `cap_drop: ALL`, then `cap_add: DAC_READ_SEARCH, SYS_PTRACE` | Exactly the caps the host unit grants under `--enable-port-owners`, nothing more — plus `no-new-privileges`. `docker-compose.agent.ipban.yml` optionally appends `NET_ADMIN` for IP-ban enforcement (see below). |
 | `read_only` rootfs | All state (spool, health file, deregistration sentinel) lives in the `sm-agent-state` volume. |
 | `/var/run/docker.sock` → `:ro` | The `containers` collector can list the host's containers. **See the security note below.** |
 | `/` → `/host` (`:ro`) + `SM_HOST_FS_ROOT=/host` | The `fs` collector reports the host's filesystem usage instead of the container overlay. |
@@ -123,6 +123,19 @@ Not covered by this recipe — they need extra device access and host capabiliti
 
 On the host install, note that `--enable-smart` (`CAP_SYS_RAWIO` + `disk` group) covers **SATA/SAS** SMART only. **NVMe** SMART reads use `NVME_IOCTL_ADMIN_CMD`, which the kernel gates behind `CAP_SYS_ADMIN` — so NVMe-only hosts (e.g. most modern bare-metal/Proxmox) need `--enable-smart-nvme` (`SM_ENABLE_SMART_NVME=1`). That cap is near-root, kept as a separate opt-in, and is **not** part of `--enable-all`.
 
+### IP banning
+
+Partially covered. The agent's `ipban` collector runs in the container, but two things differ from the host install:
+
+- **Detection reads files, not the journal.** The image has no `journalctl`, so the agent falls back to tailing `/host/var/log/auth.log` (then `secure`, `messages`) through the `/host` bind mount. That works on hosts that still run rsyslog (Ubuntu server, RHEL); journald-only hosts such as current Debian report `no auth log found` on the Security page, and the host install is the way to cover them.
+- **Enforcement needs `NET_ADMIN` in the host network namespace.** Add the override file, which appends exactly that capability:
+
+```bash
+docker compose -f deploy/docker-compose.agent.yml -f deploy/docker-compose.agent.ipban.yml --env-file .env.agent up -d --pull always --no-build
+```
+
+Because the container shares the host network namespace, `NET_ADMIN` here is genuine authority over the host firewall — the same grant `--enable-ipban` makes on a host install, and worth the same scrutiny as the Docker socket note above. Without the override the agent still detects and reports, and the Security page shows it as needing `CAP_NET_ADMIN`. Bans live in the kernel table `inet sm_agent` and survive container restarts; `docker compose … exec sm-agent /usr/local/bin/sm-agent ipban teardown` removes them.
+
 ### Managed backups
 
 The containerized agent can back up its host itself — no second host-installed agent. It provisions its own restic setup into the `sm-agent-state` volume and runs a scheduled backup + weekly integrity check, reporting to the same host under its **Backups** tab.
@@ -137,7 +150,9 @@ SM_BACKUP_REST_PASSWORD=<the minted credential>
 SM_BACKUP_TIME=02:30
 ```
 
-Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_EXCLUDES`, `SM_BACKUP_ONE_FILE_SYSTEM`, `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for an S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
+Then `docker compose … up -d`. Optional: `SM_BACKUP_PATHS` (default `/etc,/home,/root,/var/lib`), `SM_BACKUP_EXCLUDES`, `SM_BACKUP_ONE_FILE_SYSTEM`, `SM_BACKUP_PRUNE_MODE` (default `external`), `SM_BACKUP_S3_*` for a locally configured S3/B2 endpoint, `SM_BACKUP_SCHEDULE`, `SM_BACKUP_CHECK_TIME`, `SM_BACKUP_CHECK_WEEKDAY`, `SM_BACKUP_CHECK_READ_DATA_SUBSET`, and `TZ` (so schedule times are interpreted in your zone). Repos must use `rest:`, `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, or `tunnel:`; `sftp:` is not supported because the agent image does not include SSH.
+
+For a centrally assigned **Direct external S3** repository, set `SM_ENABLE_BACKUP=1` and `SM_BACKUP_PRUNE_MODE=external`, but do not add that repository or its `SM_BACKUP_S3_*` credentials to `.env.agent`. The agent fetches only its own assignment before Docker backup provisioning, persists the endpoint metadata and credentials in the private `sm-agent-state` volume, initializes the repository before the next run, and removes its credential file after server-side revocation. Local `SM_BACKUP_REPOS` entries remain supported and are merged with centrally assigned repositories.
 
 **What gets backed up.** The default paths are `/etc`, `/home`, `/root`, and `/var/lib`, with `/var/lib/docker/volumes` added explicitly when it exists. Reproducible Docker image layers, writable container layers, build caches, container logs, networking state, and containerd content are excluded; named volumes and Docker swarm state remain in scope. `SM_BACKUP_EXCLUDES=none` disables the defaults, a value beginning with `+` appends comma-separated patterns, and any other comma-separated value replaces the defaults. The first backup after upgrading can be substantially larger because it includes named volumes; check endpoint quota first, or set `SM_BACKUP_EXCLUDES=+/var/lib/docker` to retain the old scope.
 

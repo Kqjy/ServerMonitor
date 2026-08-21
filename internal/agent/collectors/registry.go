@@ -49,6 +49,10 @@ type BackupCollector interface {
 	CollectBackups(ctx context.Context) ([]wire.BackupRepoStatus, error)
 }
 
+type IPBanReporter interface {
+	CollectIPBan(ctx context.Context) *wire.IPBanReport
+}
+
 type StatusReporter interface {
 	Status() wire.CollectorStatus
 }

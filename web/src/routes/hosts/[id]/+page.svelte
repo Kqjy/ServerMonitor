@@ -21,10 +21,11 @@
   import SensorsTab from '$lib/components/host/SensorsTab.svelte';
   import GpuTab from '$lib/components/host/GpuTab.svelte';
   import BackupsTab from '$lib/components/host/BackupsTab.svelte';
+  import SecurityTab from '$lib/components/host/SecurityTab.svelte';
 
   const id = $derived(Number($page.params.id));
   const tab = $derived(($page.url.searchParams.get('tab') ?? 'overview') as TabName);
-  type TabName = 'overview' | 'memory' | 'disk' | 'network' | 'processes' | 'containers' | 'ports' | 'sensors' | 'gpu' | 'backups';
+  type TabName = 'overview' | 'memory' | 'disk' | 'network' | 'processes' | 'containers' | 'ports' | 'sensors' | 'gpu' | 'backups' | 'security';
   const showRange = $derived(tab !== 'processes' && tab !== 'containers' && tab !== 'ports');
 
   let host = $state<Host | null>(null);
@@ -129,7 +130,8 @@
     { value: 'ports', label: 'Ports' },
     { value: 'sensors', label: 'Sensors' },
     { value: 'gpu', label: 'GPU' },
-    { value: 'backups', label: 'Backups' }
+    { value: 'backups', label: 'Backups' },
+    { value: 'security', label: 'Security' }
   ];
 
   async function refresh() {
@@ -514,6 +516,7 @@
       {:else if tabModel === 'sensors'}<SensorsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'gpu'}<GpuTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} />
       {:else if tabModel === 'backups'}<BackupsTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} os={host.os} externallyManaged={host.externally_managed ?? false} />
+      {:else if tabModel === 'security'}<SecurityTab hostId={id} {range} sampleIntervalS={host.sample_interval_s} collectorStatus={host.collector_status ?? {}} os={host.os} />
       {/if}
     </div>
 

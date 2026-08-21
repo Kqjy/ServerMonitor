@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +28,9 @@ type Config struct {
 	Endpoint     string
 	Cutoff       time.Duration
 	UsePathStyle bool
+	AccessKeyID  string
+	SecretKey    string
+	SessionToken string
 }
 
 type Archiver struct {
@@ -34,6 +38,15 @@ type Archiver struct {
 	cfg    Config
 	logger *slog.Logger
 	s3     *s3.Client
+
+	statusMu sync.RWMutex
+	status   Status
+}
+
+type Status struct {
+	LastAttemptAt    time.Time
+	LastSuccessAt    time.Time
+	LastRunSucceeded bool
 }
 
 type Record struct {
@@ -63,6 +76,19 @@ func New(pool *pgxpool.Pool, cfg Config, logger *slog.Logger) (*Archiver, error)
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
+	if cfg.AccessKeyID != "" || cfg.SecretKey != "" || cfg.SessionToken != "" {
+		if cfg.AccessKeyID == "" || cfg.SecretKey == "" {
+			return nil, errors.New("archive s3 access key ID and secret access key must be set together")
+		}
+		awsCfg.Credentials = aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     cfg.AccessKeyID,
+				SecretAccessKey: cfg.SecretKey,
+				SessionToken:    cfg.SessionToken,
+				Source:          "ServerMonitorArchiveS3",
+			}, nil
+		}))
+	}
 	s3Opts := []func(*s3.Options){}
 	if cfg.UsePathStyle {
 		s3Opts = append(s3Opts, func(o *s3.Options) { o.UsePathStyle = true })
@@ -79,25 +105,58 @@ func New(pool *pgxpool.Pool, cfg Config, logger *slog.Logger) (*Archiver, error)
 	}, nil
 }
 
-func (a *Archiver) RunOnce(ctx context.Context) error {
+func (a *Archiver) RunOnce(ctx context.Context) (runErr error) {
+	attemptedAt := time.Now().UTC()
+	defer func() {
+		a.statusMu.Lock()
+		a.status.LastAttemptAt = attemptedAt
+		a.status.LastRunSucceeded = runErr == nil
+		if runErr == nil {
+			a.status.LastSuccessAt = time.Now().UTC()
+		}
+		a.statusMu.Unlock()
+	}()
 	hostIDs, err := a.hostIDs(ctx)
 	if err != nil {
 		return err
 	}
 	cutoff := time.Now().Add(-a.cfg.Cutoff)
 	a.logger.Info("archive run", "cutoff", cutoff.Format(time.RFC3339), "hosts", len(hostIDs))
-	failed := 0
-	for _, h := range hostIDs {
-		if err := a.archiveHost(ctx, h, cutoff); err != nil {
+	failed, err := archiveThenDrop(hostIDs, func(h int64) error {
+		err := a.archiveHost(ctx, h, cutoff)
+		if err != nil {
 			a.logger.Warn("archive host failed", "host", h, "err", err)
+		}
+		return err
+	}, func() error {
+		return a.dropArchivedChunks(ctx, cutoff)
+	})
+	if failed > 0 {
+		a.logger.Warn("archive run incomplete; skipping chunk drop", "failed", failed, "total", len(hostIDs))
+	}
+	return err
+}
+
+func (a *Archiver) Status() Status {
+	if a == nil {
+		return Status{}
+	}
+	a.statusMu.RLock()
+	defer a.statusMu.RUnlock()
+	return a.status
+}
+
+func archiveThenDrop(hostIDs []int64, archiveHost func(int64) error, dropChunks func() error) (int, error) {
+	failed := 0
+	for _, hostID := range hostIDs {
+		if err := archiveHost(hostID); err != nil {
 			failed++
 		}
 	}
 	if failed > 0 {
-		a.logger.Warn("archive run incomplete; skipping chunk drop", "failed", failed, "total", len(hostIDs))
-		return fmt.Errorf("archive: %d of %d hosts failed", failed, len(hostIDs))
+		return failed, fmt.Errorf("archive: %d of %d hosts failed", failed, len(hostIDs))
 	}
-	return a.dropArchivedChunks(ctx, cutoff)
+	return 0, dropChunks()
 }
 
 func (a *Archiver) hostIDs(ctx context.Context) ([]int64, error) {

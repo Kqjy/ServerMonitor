@@ -10,7 +10,8 @@ usage() {
 Usage: $0 [--keep-data] [--keep-user] [--purge-backup-keys]
 
 Removes the ServerMonitor agent installed by install-agent-linux.sh: stops and
-deletes the sm-agent and sm-backup systemd units, removes the binaries
+deletes the sm-agent and sm-backup systemd units, removes the agent's nftables
+ban table (inet sm_agent) if --enable-ipban was used, removes the binaries
 (/usr/local/bin/sm-agent and /opt/servermonitor), the config and spool
 directories, and the sm-agent system user and group.
 
@@ -62,6 +63,12 @@ rm -f /etc/systemd/system/sm-agent.service \
   /etc/systemd/system/sm-backup-restore@.service
 systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed sm-agent.service sm-backup.service sm-backup-check.service 2>/dev/null || true
+
+if [ -x /usr/local/bin/sm-agent ]; then
+  /usr/local/bin/sm-agent ipban teardown 2>/dev/null || true
+elif [ -x /opt/servermonitor/sm-agent ]; then
+  /opt/servermonitor/sm-agent ipban teardown 2>/dev/null || true
+fi
 
 rm -f /usr/local/bin/sm-agent
 rm -rf /opt/servermonitor

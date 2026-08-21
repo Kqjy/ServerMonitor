@@ -10,22 +10,30 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"servermonitor/internal/server/secretbox"
 )
 
 var ErrBackupTargetNameTaken = errors.New("backup target name already in use")
 
 type BackupTarget struct {
-	ID              int64
-	Name            string
-	HostID          *int64
-	Hostname        string
-	NodeHostID      *int64
-	NodeHostname    string
-	QuotaBytes      *int64
-	UsedBytes       int64
-	UsageMeasuredAt *time.Time
-	CreatedAt       time.Time
-	RevokedAt       *time.Time
+	ID                          int64
+	Name                        string
+	HostID                      *int64
+	Hostname                    string
+	NodeHostID                  *int64
+	NodeHostname                string
+	DestinationID               *int64
+	DestinationName             string
+	DestinationKind             string
+	NamespacePrefix             string
+	DirectCredentialsConfigured bool
+	DirectCredentialsScoped     bool
+	QuotaBytes                  *int64
+	UsedBytes                   int64
+	UsageMeasuredAt             *time.Time
+	CreatedAt                   time.Time
+	RevokedAt                   *time.Time
 }
 
 type backupTargetAuth struct {
@@ -37,7 +45,8 @@ type backupTargetAuth struct {
 }
 
 type BackupTargets struct {
-	db *DB
+	db      *DB
+	secrets *secretbox.Box
 
 	mu       sync.RWMutex
 	byName   map[string]backupTargetAuth
@@ -45,12 +54,16 @@ type BackupTargets struct {
 	cacheTTL time.Duration
 }
 
-func NewBackupTargets(db *DB) *BackupTargets {
-	return &BackupTargets{
+func NewBackupTargets(db *DB, boxes ...*secretbox.Box) *BackupTargets {
+	b := &BackupTargets{
 		db:       db,
 		byName:   map[string]backupTargetAuth{},
 		cacheTTL: 30 * time.Second,
 	}
+	if len(boxes) > 0 {
+		b.secrets = boxes[0]
+	}
+	return b
 }
 
 func (b *BackupTargets) Create(ctx context.Context, name string, hostID *int64, quota *int64, secret string, nodeHostID *int64) (int64, error) {
@@ -73,7 +86,7 @@ func (b *BackupTargets) Create(ctx context.Context, name string, hostID *int64, 
 
 func (b *BackupTargets) Rotate(ctx context.Context, id int64, secret string) error {
 	res, err := b.db.Pool.Exec(ctx, `
-		UPDATE backup_targets SET secret_hash = $2, revoked_at = NULL
+		UPDATE backup_targets SET secret_hash = $2, revoked_at = NULL, updated_at = now()
 		WHERE id = $1
 	`, id, tokenHash(secret))
 	if err != nil {
@@ -88,7 +101,7 @@ func (b *BackupTargets) Rotate(ctx context.Context, id int64, secret string) err
 
 func (b *BackupTargets) Revoke(ctx context.Context, id int64) error {
 	res, err := b.db.Pool.Exec(ctx, `
-		UPDATE backup_targets SET revoked_at = now()
+		UPDATE backup_targets SET revoked_at = now(), updated_at = now()
 		WHERE id = $1 AND revoked_at IS NULL
 	`, id)
 	if err != nil {
@@ -137,7 +150,7 @@ func (b *BackupTargets) SetUsage(ctx context.Context, id int64, used int64) erro
 
 func (b *BackupTargets) SetQuota(ctx context.Context, id int64, quota *int64) error {
 	res, err := b.db.Pool.Exec(ctx, `
-		UPDATE backup_targets SET quota_bytes = $2
+		UPDATE backup_targets SET quota_bytes = $2, updated_at = now()
 		WHERE id = $1
 	`, id, quota)
 	if err != nil {
@@ -252,7 +265,7 @@ func (b *BackupTargets) refresh(ctx context.Context) error {
 	rows, err := b.db.Pool.Query(ctx, `
 		SELECT id, name, secret_hash, COALESCE(quota_bytes, 0), used_bytes, revoked_at IS NOT NULL
 		FROM backup_targets
-		WHERE node_host_id IS NULL
+		WHERE node_host_id IS NULL AND destination_id IS NULL
 	`)
 	if err != nil {
 		return err
@@ -289,11 +302,15 @@ func (b *BackupTargets) invalidate() {
 
 func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 	rows, err := b.db.Pool.Query(ctx, `
-		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''), t.quota_bytes,
+		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''),
+		       t.destination_id, COALESCE(d.name, ''), COALESCE(d.kind, ''), COALESCE(t.namespace_prefix, ''),
+		       (t.direct_credentials_ciphertext IS NOT NULL OR d.credentials_ciphertext IS NOT NULL),
+		       t.direct_credentials_ciphertext IS NOT NULL, t.quota_bytes,
 		       t.used_bytes, t.usage_measured_at, t.created_at, t.revoked_at
 		FROM backup_targets t
 		LEFT JOIN hosts h ON h.id = t.host_id AND h.deleted_at IS NULL
 		LEFT JOIN hosts nh ON nh.id = t.node_host_id AND nh.deleted_at IS NULL
+		LEFT JOIN backup_destinations d ON d.id = t.destination_id
 		ORDER BY t.name
 	`)
 	if err != nil {
@@ -303,7 +320,9 @@ func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 	out := []BackupTarget{}
 	for rows.Next() {
 		var t BackupTarget
-		if err := rows.Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname, &t.QuotaBytes,
+		if err := rows.Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname,
+			&t.DestinationID, &t.DestinationName, &t.DestinationKind, &t.NamespacePrefix, &t.DirectCredentialsConfigured,
+			&t.DirectCredentialsScoped, &t.QuotaBytes,
 			&t.UsedBytes, &t.UsageMeasuredAt, &t.CreatedAt, &t.RevokedAt); err != nil {
 			return nil, err
 		}
@@ -318,13 +337,19 @@ func (b *BackupTargets) List(ctx context.Context) ([]BackupTarget, error) {
 func (b *BackupTargets) Get(ctx context.Context, id int64) (BackupTarget, error) {
 	var t BackupTarget
 	err := b.db.Pool.QueryRow(ctx, `
-		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''), t.quota_bytes,
+		SELECT t.id, t.name, t.host_id, COALESCE(h.hostname, ''), t.node_host_id, COALESCE(nh.hostname, ''),
+		       t.destination_id, COALESCE(d.name, ''), COALESCE(d.kind, ''), COALESCE(t.namespace_prefix, ''),
+		       (t.direct_credentials_ciphertext IS NOT NULL OR d.credentials_ciphertext IS NOT NULL),
+		       t.direct_credentials_ciphertext IS NOT NULL, t.quota_bytes,
 		       t.used_bytes, t.usage_measured_at, t.created_at, t.revoked_at
 		FROM backup_targets t
 		LEFT JOIN hosts h ON h.id = t.host_id AND h.deleted_at IS NULL
 		LEFT JOIN hosts nh ON nh.id = t.node_host_id AND nh.deleted_at IS NULL
+		LEFT JOIN backup_destinations d ON d.id = t.destination_id
 		WHERE t.id = $1
-	`, id).Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname, &t.QuotaBytes,
+	`, id).Scan(&t.ID, &t.Name, &t.HostID, &t.Hostname, &t.NodeHostID, &t.NodeHostname,
+		&t.DestinationID, &t.DestinationName, &t.DestinationKind, &t.NamespacePrefix, &t.DirectCredentialsConfigured,
+		&t.DirectCredentialsScoped, &t.QuotaBytes,
 		&t.UsedBytes, &t.UsageMeasuredAt, &t.CreatedAt, &t.RevokedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

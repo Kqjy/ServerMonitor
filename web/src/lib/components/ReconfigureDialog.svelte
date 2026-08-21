@@ -13,6 +13,9 @@
   const ownersMissing = ownerState === 'no_owners' || ownerState === 'partial_owners';
   const ownersWorking = ownerState === 'ok';
   const smartWorking = smartState === 'ok' || smartState === 'raid_unreadable';
+  const ipbanState = cs.ipban?.state;
+  const ipbanWorking = ipbanState === 'ok' || ipbanState === 'observe';
+  const ipbanMissing = ipbanState === 'no_journal' || ipbanState === 'no_caps';
 
   const osName = untrack(() => (host.os ?? '').toLowerCase());
   const isWindows = osName.includes('windows');
@@ -24,6 +27,7 @@
   let enableSmartNvme = $state(untrack(() => smartState === 'read_failed'));
   let enableGpu = $state(false);
   let enableNetwork = $state(false);
+  let enableIPBan = $state(untrack(() => ipbanWorking));
   let adminService = $state(untrack(() => smartFailing || smartWorking));
 
   let baseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
@@ -44,6 +48,7 @@
     if (enableSmart && enableSmartNvme) vars.push('SM_ENABLE_SMART_NVME=1');
     if (enableGpu) vars.push('SM_ENABLE_GPU=1');
     if (enableNetwork) vars.push('SM_ENABLE_NETWORK=1');
+    if (enableIPBan) vars.push('SM_ENABLE_IPBAN=1');
     const run = `bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
     if (vars.length === 0) return `sudo ${run}`;
     const preserve = vars.map((v) => v.split('=')[0]).join(',');
@@ -128,6 +133,10 @@
           <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
             <input type="checkbox" bind:checked={enableNetwork} class="mt-0.5 accent-emerald-500" />
             <span><span class="text-zinc-100">Privileged network</span> <span class="text-zinc-500">— grants <span class="font-mono">CAP_NET_ADMIN</span> + <span class="font-mono">CAP_NET_RAW</span></span></span>
+          </label>
+          <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+            <input type="checkbox" bind:checked={enableIPBan} class="mt-0.5 accent-amber-500" />
+            <span><span class="text-zinc-100">IP banning</span> <span class="text-zinc-500">— joins <span class="font-mono">systemd-journal</span> + <span class="font-mono">adm</span> groups to read sshd login failures and grants <span class="font-mono">CAP_NET_ADMIN</span> to write bans into nftables. <span class="text-amber-300/80">Firewall-write authority for the resident agent — enable only where reactive banning is wanted.</span>{#if ipbanMissing}{' '}<span class="text-amber-300">This host currently reports it is missing.</span>{/if}</span></span>
           </label>
         </div>
       {:else if isWindows}

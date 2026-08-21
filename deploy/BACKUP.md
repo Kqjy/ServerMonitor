@@ -41,4 +41,4 @@ The named `backups` volume lives on the docker host. For real disaster recovery:
 
 `pg_dump` covers all tables and the schema. It does NOT cover:
 - TimescaleDB compressed chunks older than the compression threshold are dumped as-is and will need re-compression after restore (Timescale handles this on first access; no manual step needed for 30d-of-raw deployments).
-- Cold-tier Parquet archives on S3 — those live in the bucket configured via `S3_BUCKET` and need a separate S3 lifecycle/replication policy.
+- Cold-tier Parquet archives on S3 — those live in the bucket configured via `ARCHIVE_S3_BUCKET` (`S3_BUCKET` remains a compatibility alias) and need a separate S3 lifecycle/replication policy.

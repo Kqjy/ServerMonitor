@@ -1,0 +1,4 @@
+services:
+  sm-agent:
+    cap_add:
+      - NET_ADMIN

@@ -45,9 +45,11 @@ The `.env` you must set:
 |--------------------|---------|
 | `POSTGRES_PASSWORD`| Postgres password |
 | `ADMIN_TOKEN`      | Bearer token used by the agent install scripts to register a host |
-| `S3_BUCKET` *(opt)*| Cold-tier archive bucket. Leave empty to disable archiving. |
-| `S3_REGION` *(opt)*| AWS region for the bucket |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` *(opt)*| Credentials for the bucket |
+| `ARCHIVE_S3_BUCKET` *(opt)* | Cold-metrics Parquet archive bucket. Leave empty to disable archiving. |
+| `ARCHIVE_S3_REGION`, `ARCHIVE_S3_PREFIX`, `ARCHIVE_S3_ENDPOINT` *(opt)* | Cold-archive location; `S3_*` remains a compatibility alias. |
+| `ARCHIVE_S3_ACCESS_KEY_ID`, `ARCHIVE_S3_SECRET_ACCESS_KEY` *(opt)* | Archive-only credentials. If omitted, the AWS credential chain is used. |
+| `BACKUP_DIR` or `BACKUP_S3_BUCKET` *(opt)* | Storage behind ServerMonitor's central restic gateway. This is separate from the cold archive. |
+| `BACKUP_SECRETS_KEY` *(opt)* | Stable 32-byte key used to encrypt centrally managed direct-S3 credentials in PostgreSQL. |
 
 ---
 
@@ -75,6 +77,8 @@ Both scripts wrap `sm-agent register` (which calls `POST /api/v1/admin/hosts`), 
 **Reconfiguring an installed agent.** Re-running an installer on a host that already has `agent.toml` reconfigures the service in place rather than registering again: it re-derives capabilities and group memberships (Linux) or the service account and privileges (Windows), refreshes drifted binaries, and restarts — no admin token, re-registration, or identity change. Since 0.3.7 it also installs a root/SYSTEM reconciliation job that independently verifies the resident update's server signature before synchronizing the privileged backup-agent copy. Existing installations need one reconfigure run to bootstrap that job; later self-upgrades update both copies automatically. To flip a capability (e.g. add NVMe SMART with `--enable-smart-nvme`), just re-run with the flag added. Pass `--reinstall` / `-Reinstall` (or `SM_REINSTALL=1`) to force a full fresh install instead.
 
 **Managed backups.** `--enable-backup` (`-EnableBackup` on Windows) additionally provisions scheduled, encrypted restic backups of the host to one or more endpoints you supply, with monitoring, per-repo alerts, and a printed recovery kit. It reads every file on the host at backup time, so it is a separate opt-in and — like `--enable-smart-nvme` — not part of `--enable-all`. Full guide, including the bare-machine restore runbook: **[deploy/BACKUPS.md](deploy/BACKUPS.md)**.
+
+**Reactive IP banning.** `--enable-ipban` (`SM_ENABLE_IPBAN=1`) turns the Linux agent into a fail2ban-style banner: it follows sshd login failures in the journal (or `/var/log/auth.log`), bans an address after the configured number of failures with its own nftables table (`inet sm_agent`, prerouting hook, so Docker-published ports are covered too), and reports every ban to the server. The server keeps the fleet policy — thresholds, ban durations, an allowlist that is always honoured, and the rule for promoting repeat offenders to a fleet-wide blocklist every enforcing host applies — on the **Security** page, so no per-host configuration exists. Detection starts in observe mode; enforcement is a separate switch that refuses to turn on until the allowlist has at least one entry. The flag grants the resident agent `CAP_NET_ADMIN` plus `systemd-journal`/`adm` group membership, which is firewall-write authority and log-read access, so it is a separate opt-in and not part of `--enable-all`. `sm-agent ipban status` lists the kernel sets; `sm-agent ipban teardown` removes the table (the uninstaller and a reconfigure without the flag do this automatically).
 
 **Docker (containerized agent)**
 
@@ -123,6 +127,7 @@ Everything Glances reports, gated by platform:
 | RAID arrays | ✓ | — | — | parses `/proc/mdstat` |
 | Wi-Fi signal | ✓ | — | — | parses `/proc/net/wireless` |
 | Uptime | ✓ | ✓ | ✓ | gopsutil |
+| IP bans (sshd failures, bans, fleet list) | ✓ | — | — | `journalctl -f` / auth-log tail + nftables via netlink; needs `--enable-ipban` |
 
 Run `sm-agent --list-collectors` to see what's active on the current platform.
 
@@ -162,6 +167,8 @@ Dedup is per `(rule, host, label_key)`. Re-notification is suppressed within `co
 
 `GET /api/v1/series` transparently merges all three sources for any time range. Cold-tier reads pull only the Parquet objects whose manifest range overlaps the query.
 
+When `ARCHIVE_S3_BUCKET` is configured, the archive job—not a separate Timescale retention policy—owns expiry of `metric_points_5m`. It uploads and records manifests for every host first, and calls `drop_chunks` only after the entire pass succeeds. Any upload or manifest failure leaves all eligible chunks in TimescaleDB for the next run. Existing `S3_*` settings continue to work as lower-precedence aliases. This prevents future archive/retention races after upgrade; aggregate chunks already deleted by the old independent policy cannot be reconstructed unless another backup contains them.
+
 ---
 
 ## API surface
@@ -192,6 +199,14 @@ All routes under `/api/v1/*` except the public `GET /healthz` and `GET /auth/sta
 | `GET  /alerts/history` | cookie / admin | recent fires; `format=csv` exports matching history |
 | `DELETE /alerts/history` | cookie / admin | clear resolved history, optionally with `older_than_days` |
 | `GET/POST/PUT/DELETE /channels[/{id}]` | cookie / admin | notification channel CRUD |
+| `GET/POST /backup-repositories`, mutations under `/backup-repositories/{id}` | cookie / admin | repository namespaces, assignments, quotas, revocation, and write-only scoped credential replacement |
+| `GET/POST /backup-destinations`, mutations under `/backup-destinations/{id}` | cookie / admin | centrally managed direct S3/R2 storage backends; responses expose only whether credentials exist |
+| `GET /agent/backup-config` | `X-Agent-Token` | calling host's direct repositories in an agent-token-bound AES-GCM envelope; never plaintext secret JSON |
+| `GET  /agent/ipban` | `X-Agent-Token` | effective ban policy, allowlist, fleet blocklist and pending unbans for the calling agent |
+| `GET/PUT /ipban/settings` | cookie / admin | fleet-wide ban policy and allowlist (`PUT` bumps the policy version every agent re-fetches) |
+| `GET  /ipban/summary`, `/ipban/hosts`, `/ipban/active`, `/ipban/fleet`, `/ipban/events` | cookie / admin | fleet overview, per-host state, active bans, fleet blocklist, ban history |
+| `PUT  /ipban/hosts/{id}` | cookie / admin | per-host detect / enforce / share / apply-fleet overrides |
+| `POST /ipban/fleet`, `DELETE /ipban/fleet/{ip}`, `POST /ipban/unban` | cookie / admin | manual fleet ban, lift a fleet ban, unban on one host |
 
 ---
 
@@ -268,6 +283,7 @@ ServerMonitor/
 - **Per-token ingest rate limit** at 10 batches/s (burst 30) per agent token.
 - **Session cookies** are `Secure` when served over HTTPS, always `HttpOnly`, `SameSite=Lax`.
 - **Agent tokens** are stored as SHA-256 hashes; the raw token is shown once at registration.
+- **IP banning guardrails**: agents never ban loopback, link-local, multicast, their own addresses, the server's address, or anything on the allowlist, regardless of what the server sends; private ranges are only bannable when explicitly enabled and never propagate fleet-wide; enforcement cannot be switched on with an empty allowlist; every manual ban/unban is recorded with its actor in `ipban_events` on top of the audit log.
 
 ---
 

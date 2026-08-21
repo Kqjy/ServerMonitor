@@ -4,6 +4,7 @@ param(
     [switch]$Insecure,
     [switch]$PersistInsecure,
     [switch]$AdminService,
+    [switch]$EnableIpban,
     [switch]$EnableSmart,
     [switch]$EnableBackup,
     [switch]$DisableBackup,
@@ -23,6 +24,8 @@ if ($IntervalS -le 0) {
     if ($env:SM_INTERVAL) { $IntervalS = [int]$env:SM_INTERVAL } else { $IntervalS = 10 }
 }
 if ($env:SM_ADMIN_SERVICE -eq '1') { $AdminService = $true }
+if ($env:SM_ENABLE_IPBAN -eq '1') { $EnableIpban = $true }
+if ($EnableIpban) { throw 'IP banning (-EnableIpban / SM_ENABLE_IPBAN=1) is Linux-only: it needs journald or /var/log/auth.log plus nftables, neither of which exists on Windows; the Windows agent reports the feature as unsupported' }
 if ($env:SM_ENABLE_SMART -eq '1')  { $EnableSmart  = $true }
 if ($env:SM_ENABLE_BACKUP -eq '1') { $EnableBackup = $true }
 if ($env:SM_ENABLE_BACKUP -in @('0','false','no','off')) { $DisableBackup = $true }
@@ -39,7 +42,7 @@ if ($env:SM_BACKUP_S3_PATH_STYLE -eq '1') { $BackupS3PathStyle = $true }
 $ErrorActionPreference = 'Stop'
 $ServerUrl = '__SERVER_URL__'
 $DownloadedServerPubkey = ''
-$CanonicalInstallerSha256 = 'b54e447d6a22a7398005350cee3da75d01bc07810d2fa429c9821b24d2890c55'
+$CanonicalInstallerSha256 = 'b1d58a842fa750ea8ec31f9e1aba0af33c21fb8d28f3def3ee0c0271f9fb649b'
 $ResticVersion = '0.19.0'
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -527,6 +530,21 @@ function Show-RecoveryKit {
     Write-Host ''
 }
 
+function Write-EffectiveRecoveryKit {
+    param(
+        [Parameter(Mandatory=$true)][string]$AgentExe,
+        [Parameter(Mandatory=$true)][string]$TomlPath,
+        [Parameter(Mandatory=$true)][string]$KitPath
+    )
+    $kitLines = @(& $AgentExe backup recovery-kit --config $TomlPath 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'could not write a recovery kit containing the effective managed repository; backup not scheduled'
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($KitPath, (($kitLines -join "`r`n") + "`r`n"), $utf8NoBom)
+    Lock-Acl -Path $KitPath -ServiceAccess None
+}
+
 function Move-LegacyBackupFiles {
     param(
         [Parameter(Mandatory=$true)][string]$BackupDir,
@@ -568,6 +586,7 @@ function Invoke-BackupProvisioning {
     $tunnelKey    = Join-Path $backupDir 'tunnel.key'
     $recoveryKit  = Join-Path $backupDir 'recovery-kit.txt'
     $backupStatus = Join-Path $configDir 'backup-status.json'
+    $managedConfig = Join-Path (Join-Path $configDir 'managed-backups') 'repositories.json'
     if ($EnableBackup -or $DisableBackup) {
         Move-LegacyBackupFiles -BackupDir $backupDir -BackupToml $backupToml -BackupKey $backupKey -RecoveryKit $recoveryKit
     }
@@ -593,10 +612,19 @@ function Invoke-BackupProvisioning {
         $hasTunnelRepo = [System.IO.File]::ReadAllText($backupToml) -match '(?m)^\s*tunnel_name\s*='
     }
     $preservedTunnelSection = if ($hasTunnelRepo) { New-TunnelSectionSnapshot -TomlPath $backupToml } else { '' }
+    $hasManagedRepos = $false
+    if (Test-Path -LiteralPath $managedConfig) {
+        try {
+            $managed = [System.IO.File]::ReadAllText($managedConfig) | ConvertFrom-Json
+            $hasManagedRepos = @($managed.repositories).Count -gt 0
+        } catch {
+            throw "centrally managed repository metadata is invalid at $managedConfig; wait for the resident agent to synchronize it again"
+        }
+    }
 
     if ($EnableBackup) {
-        if ((-not (Test-Path -LiteralPath $backupToml)) -and (-not $repoArr)) {
-            throw '-EnableBackup requires -BackupRepos (or $env:SM_BACKUP_REPOS) on a fresh setup'
+        if ((-not (Test-Path -LiteralPath $backupToml)) -and (-not $repoArr) -and (-not $hasManagedRepos)) {
+            throw '-EnableBackup requires -BackupRepos (or $env:SM_BACKUP_REPOS), or a centrally assigned direct repository that the resident agent has already synchronized'
         }
         if (-not (Test-Path -LiteralPath $AgentExe)) {
             throw "agent binary not found at $AgentExe; the backup task runs the admin-only copy in Program Files, not the service-writable one. Set `$env:SM_REINSTALL=1 and re-run to restore it"
@@ -633,6 +661,10 @@ function Invoke-BackupProvisioning {
         } elseif (Test-Path -LiteralPath $backupToml) {
             Write-Host 'note: -BackupRepos not provided; keeping existing backup.toml'
             Lock-Acl -Path $backupToml -ServiceAccess None
+        } elseif ($hasManagedRepos) {
+            Write-BackupToml -TomlPath $backupToml -StatusPath $backupStatus -KeyPath $backupKey -ResticPath (Join-Path $installDir 'restic.exe') -Repos @() -Names @() -Paths $pathArr -EnvFilePath $envFileArg -TunnelSection '' -PruneMode $BackupPruneMode -S3Region $BackupS3Region -S3PathStyle:$BackupS3PathStyle
+            $reposWritten = $true
+            Write-Host 'note: wrote backup.toml for the centrally assigned direct repository'
         }
         if ($hasTunnelRepo) {
             $agentConfig = Join-Path $configDir 'agent.toml'
@@ -656,9 +688,16 @@ function Invoke-BackupProvisioning {
         }
         & $AgentExe backup init --config $backupToml
         if ($LASTEXITCODE -ne 0) { throw 'sm-agent backup init failed; backup not scheduled' }
+        if ($hasManagedRepos) {
+            Write-EffectiveRecoveryKit -AgentExe $AgentExe -TomlPath $backupToml -KitPath $recoveryKit
+        }
         Register-BackupTask -AgentExe $AgentExe -ConfigPath $backupToml -Time $BackupTime
         Register-BackupCheckTask -AgentExe $AgentExe -ConfigPath $backupToml -Time $BackupTime
-        if ($keyFresh) {
+        if ($hasManagedRepos -and $keyFresh) {
+            Show-RecoveryKit -KitPath $recoveryKit
+        } elseif ($hasManagedRepos) {
+            Write-Host "note: recovery kit updated from the effective managed configuration at $recoveryKit (password unchanged, not reprinted)"
+        } elseif ($keyFresh) {
             Write-RecoveryKit -KitPath $recoveryKit -KeyPath $backupKey -TomlPath $backupToml -EnvFilePath $backupEnvFile -TunnelKeyPath $tunnelKey -Repos $repoArr -Names $nameArr
             Show-RecoveryKit -KitPath $recoveryKit
         } elseif ($reposWritten) {

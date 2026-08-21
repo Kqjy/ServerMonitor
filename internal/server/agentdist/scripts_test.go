@@ -31,14 +31,14 @@ func TestEmbeddedInstallerParity(t *testing.T) {
 			canonicalPath: filepath.Join("..", "..", "..", "scripts", "install-agent-linux.sh"),
 			embedded:      installSh,
 			digestPattern: `(?m)^CANONICAL_INSTALLER_SHA256='([0-9a-f]{64})'$`,
-			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "install_bzip2", "refresh_agent_binaries", "agent_binary_version", "refreshed sm-agent binaries", "sm-agent-privileged-sync", "sync-privileged", "agent-signing.pub", "90-servermonitor-smart.rules", "udevadm", "SMART_IOCTL_NODES", "ExecStartPre=+"},
+			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "managed-backups/repositories.json", "backup recovery-kit", "install_bzip2", "refresh_agent_binaries", "agent_binary_version", "refreshed sm-agent binaries", "sm-agent-privileged-sync", "sync-privileged", "agent-signing.pub", "90-servermonitor-smart.rules", "udevadm", "SMART_IOCTL_NODES", "ExecStartPre=+", "ENABLE_IPBAN", "systemd-journal adm", "ipban teardown", "warn_ipban_capability"},
 		},
 		{
 			name:          "windows",
 			canonicalPath: filepath.Join("..", "..", "..", "scripts", "install-agent-windows.ps1"),
 			embedded:      installPs1,
 			digestPattern: `(?m)^\$CanonicalInstallerSha256 = '([0-9a-f]{64})'$`,
-			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "refreshBinaries", "refreshed sm-agent binaries", "ServerMonitor Privileged Agent Sync", "sync-privileged", "agent-signing.pub"},
+			required:      []string{"tunnel_name", "tunnel_node", "tunnel-enroll", "repo-credentials.env", "env_file", "managed-backups", "backup recovery-kit", "refreshBinaries", "refreshed sm-agent binaries", "ServerMonitor Privileged Agent Sync", "sync-privileged", "agent-signing.pub", "SM_ENABLE_IPBAN", "Linux-only"},
 		},
 	}
 

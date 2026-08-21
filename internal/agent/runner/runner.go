@@ -173,6 +173,7 @@ func (r *Runner) tick(ctx context.Context) {
 		conts []wire.Container
 		ports []wire.Port
 		baks  []wire.BackupRepoStatus
+		bans  *wire.IPBanReport
 	)
 
 	for _, c := range r.collectors {
@@ -224,6 +225,13 @@ func (r *Runner) tick(ctx context.Context) {
 					mu.Unlock()
 				}
 			}
+			if ir, ok := col.(collectors.IPBanReporter); ok {
+				if report := ir.CollectIPBan(tickCtx); report != nil {
+					mu.Lock()
+					bans = report
+					mu.Unlock()
+				}
+			}
 		}(c)
 	}
 	wg.Wait()
@@ -233,8 +241,9 @@ func (r *Runner) tick(ctx context.Context) {
 	batch.Containers = conts
 	batch.Ports = ports
 	batch.Backups = baks
+	batch.IPBan = bans
 
-	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(baks) == 0 {
+	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(baks) == 0 && (bans == nil || len(bans.Events) == 0) {
 		return
 	}
 

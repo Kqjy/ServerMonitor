@@ -32,6 +32,7 @@
   let enableSmartNvme = $state(false);
   let enableGpu = $state(false);
   let enableNetwork = $state(false);
+  let enableIPBan = $state(false);
   let adminService = $state(false);
 
   async function loadMeta() {
@@ -105,6 +106,7 @@
     if (enableSmart && enableSmartNvme) vars.push('SM_ENABLE_SMART_NVME=1');
     if (enableGpu)     vars.push('SM_ENABLE_GPU=1');
     if (enableNetwork) vars.push('SM_ENABLE_NETWORK=1');
+    if (enableIPBan)   vars.push('SM_ENABLE_IPBAN=1');
     const preserve = vars.map((v) => v.split('=')[0]).join(',');
     return `${vars.join(' ')} sudo --preserve-env=${preserve} bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`;
   });
@@ -360,6 +362,10 @@ Lock-Path $cfg
                 <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
                   <input type="checkbox" bind:checked={enableNetwork} class="mt-0.5 accent-emerald-500" />
                   <span><span class="text-zinc-100">Privileged network</span> <span class="text-zinc-500">— grants <span class="font-mono">CAP_NET_ADMIN</span> + <span class="font-mono">CAP_NET_RAW</span></span></span>
+                </label>
+                <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <input type="checkbox" bind:checked={enableIPBan} class="mt-0.5 accent-amber-500" />
+                  <span><span class="text-zinc-100">IP banning</span> <span class="text-zinc-500">— joins <span class="font-mono">systemd-journal</span> + <span class="font-mono">adm</span> to read sshd login failures and grants <span class="font-mono">CAP_NET_ADMIN</span> to drop repeat offenders with nftables. <span class="text-amber-300/80">Firewall-write authority for the agent.</span></span></span>
                 </label>
               </div>
             {/if}

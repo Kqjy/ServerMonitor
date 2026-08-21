@@ -235,6 +235,17 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 	return StatusFile{Version: statusVersion, Repos: out}
 }
 
+func removeRepoStatus(status StatusFile, removed map[string]bool) StatusFile {
+	out := make([]RepoStatus, 0, len(status.Repos))
+	for _, repo := range status.Repos {
+		if removed[repo.Name] {
+			continue
+		}
+		out = append(out, repo)
+	}
+	return StatusFile{Version: statusVersion, Repos: out}
+}
+
 func utcSecond(t time.Time) time.Time {
 	return t.UTC().Truncate(time.Second)
 }

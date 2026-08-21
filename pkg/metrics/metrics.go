@@ -124,6 +124,11 @@ const (
 
 	AgentCPUPct   ID = 1050
 	AgentRSSBytes ID = 1051
+
+	IPBanAuthFailuresPerMin ID = 1100
+	IPBanBansPerHour        ID = 1101
+	IPBanActiveLocal        ID = 1102
+	IPBanFleetApplied       ID = 1103
 )
 
 type Meta struct {
@@ -239,6 +244,10 @@ var meta = map[ID]Meta{
 	BackupAgentUnexecutable:  {"backup_agent_unexecutable", "bool"},
 	AgentCPUPct:              {"agent_cpu_pct", "%"},
 	AgentRSSBytes:            {"agent_rss_bytes", "B"},
+	IPBanAuthFailuresPerMin:  {"ipban_auth_failures_per_min", "/min"},
+	IPBanBansPerHour:         {"ipban_bans_per_hour", "/h"},
+	IPBanActiveLocal:         {"ipban_active_local", "count"},
+	IPBanFleetApplied:        {"ipban_fleet_applied", "count"},
 }
 
 func (id ID) Meta() Meta {

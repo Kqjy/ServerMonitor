@@ -72,7 +72,21 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 			}
 			return res, nil
 		}
-		return res, fmt.Errorf("SM_BACKUP_REPOS is required to provision backups, or provide an operator-managed backup.toml at %s", configPath)
+		if !HasManagedBackupRepositories(DefaultStatusPath()) {
+			return res, fmt.Errorf("SM_BACKUP_REPOS is required to provision backups, or assign a centrally managed direct repository before starting the agent")
+		}
+		toml, renderErr := renderBackupTOML(getenv, keyPath, filepath.Join(dir, "repo-credentials.env"), false, func(path string) error {
+			_, statErr := os.Stat(path)
+			return statErr
+		})
+		if renderErr != nil {
+			return res, renderErr
+		}
+		if err := writeFileAtomic(configPath, []byte(toml), 0o600); err != nil {
+			return res, err
+		}
+		res.Rewrote = true
+		return res, nil
 	}
 
 	credsPath := filepath.Join(dir, "repo-credentials.env")

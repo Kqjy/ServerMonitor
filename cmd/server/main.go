@@ -27,7 +27,9 @@ import (
 	"servermonitor/internal/server/auth"
 	"servermonitor/internal/server/config"
 	"servermonitor/internal/server/ingest"
+	"servermonitor/internal/server/ipban"
 	"servermonitor/internal/server/notify"
+	"servermonitor/internal/server/secretbox"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
 	"servermonitor/internal/server/tasks"
@@ -91,12 +93,13 @@ func main() {
 	defer db.Close()
 
 	applied, err := storage.ApplyRetentionPolicies(ctx, db.Pool, storage.RetentionPolicies{
-		Raw:           cfg.RetentionRaw,
-		Aggregate5m:   cfg.RetentionAggregate5m,
-		Processes:     cfg.RetentionProcesses,
-		Containers:    cfg.RetentionContainers,
-		Ports:         cfg.RetentionPorts,
-		CompressAfter: cfg.CompressionAfter,
+		Raw:                cfg.RetentionRaw,
+		Aggregate5m:        cfg.RetentionAggregate5m,
+		Processes:          cfg.RetentionProcesses,
+		Containers:         cfg.RetentionContainers,
+		Ports:              cfg.RetentionPorts,
+		CompressAfter:      cfg.CompressionAfter,
+		ArchiveAggregate5m: cfg.ArchiveS3Bucket != "",
 	})
 	if err != nil {
 		logger.Error("apply retention", "err", err)
@@ -141,28 +144,43 @@ func main() {
 
 	var archiver *archive.Archiver
 	var archiveScheduler *tasks.ArchiveScheduler
-	if cfg.S3Bucket != "" {
+	if cfg.ArchiveS3Bucket != "" {
 		archiver, err = archive.New(db.Pool, archive.Config{
-			Bucket:       cfg.S3Bucket,
-			Region:       cfg.S3Region,
-			Prefix:       cfg.S3Prefix,
-			Endpoint:     cfg.S3Endpoint,
+			Bucket:       cfg.ArchiveS3Bucket,
+			Region:       cfg.ArchiveS3Region,
+			Prefix:       cfg.ArchiveS3Prefix,
+			Endpoint:     cfg.ArchiveS3Endpoint,
 			Cutoff:       config.IntervalToDuration(cfg.RetentionAggregate5m),
-			UsePathStyle: cfg.S3UsePathStyle,
+			UsePathStyle: cfg.ArchiveS3UsePathStyle,
+			AccessKeyID:  cfg.ArchiveS3AccessKeyID,
+			SecretKey:    cfg.ArchiveS3SecretKey,
+			SessionToken: cfg.ArchiveS3SessionToken,
 		}, logger)
 		if err != nil {
-			logger.Warn("archive disabled", "err", err)
+			logger.Error("archive configured but unavailable; refusing to run without its archive-before-delete ownership", "err", err)
+			os.Exit(1)
 		} else {
 			archiveScheduler, err = tasks.NewArchiveScheduler(archiver, logger)
 			if err != nil {
-				logger.Warn("archive scheduler init", "err", err)
+				logger.Error("archive scheduler init; refusing to run without archive-before-delete scheduling", "err", err)
+				return
 			} else if err := archiveScheduler.Start(ctx); err != nil {
-				logger.Warn("archive scheduler start", "err", err)
+				logger.Error("archive scheduler start; refusing to run without archive-before-delete scheduling", "err", err)
+				return
 			}
 		}
 	}
 
-	backupTargets := storage.NewBackupTargets(db)
+	backupSecrets, err := secretbox.ParseKey(cfg.BackupSecretsKey)
+	if err != nil {
+		logger.Error("backup secrets key", "err", err)
+		os.Exit(1)
+	}
+	backupTargets := storage.NewBackupTargets(db, backupSecrets)
+	if err := backupTargets.ValidateStoredCredentials(ctx); err != nil {
+		logger.Error("stored backup credentials are unavailable; check BACKUP_SECRETS_KEY", "err", err)
+		os.Exit(1)
+	}
 	var backupServer *restserver.Server
 	if cfg.BackupEnabled() {
 		store, storeErr := restserver.NewStore(ctx, restserver.StoreConfig{
@@ -173,6 +191,9 @@ func main() {
 				Prefix:       cfg.BackupS3Prefix,
 				Endpoint:     cfg.BackupS3Endpoint,
 				UsePathStyle: cfg.BackupS3UsePathStyle,
+				AccessKeyID:  cfg.BackupS3AccessKeyID,
+				SecretKey:    cfg.BackupS3SecretKey,
+				SessionToken: cfg.BackupS3SessionToken,
 			},
 		})
 		if storeErr != nil {
@@ -251,6 +272,13 @@ func main() {
 	}
 	backupNodes := storage.NewBackupNodes(db)
 
+	ipbanSvc := ipban.New(db.Pool, logger, config.IntervalToDuration(cfg.RetentionIPBanEvents))
+	if err := ipbanSvc.Load(ctx); err != nil {
+		logger.Error("ipban load", "err", err)
+		os.Exit(1)
+	}
+	go ipbanSvc.Run(ctx)
+
 	go sessionSweeper(ctx, authSvc, logger)
 
 	webHandler, err := web.Handler()
@@ -293,17 +321,21 @@ func main() {
 			PublicHTTP:    cfg.BackupServesPublicHTTP(),
 			ServerStorage: cfg.BackupEnabled(),
 		},
-		BackupPublic: cfg.BackupServesPublicHTTP(),
-		BackupNodes:  backupNodes,
+		BackupPublic:        cfg.BackupServesPublicHTTP(),
+		BackupSecretsSecure: cfg.SecureBrowserSide(),
+		BackupNodes:         backupNodes,
+		IPBan:               ipbanSvc,
 		Retention: api.RetentionConfig{
-			Raw:               cfg.RetentionRaw,
-			Aggregate5m:       cfg.RetentionAggregate5m,
-			Processes:         cfg.RetentionProcesses,
-			Containers:        cfg.RetentionContainers,
-			Ports:             cfg.RetentionPorts,
-			CompressAfter:     cfg.CompressionAfter,
-			RawCutoff:         config.IntervalToDuration(cfg.RetentionRaw),
-			Aggregate5mCutoff: config.IntervalToDuration(cfg.RetentionAggregate5m),
+			Raw:                cfg.RetentionRaw,
+			Aggregate5m:        cfg.RetentionAggregate5m,
+			Processes:          cfg.RetentionProcesses,
+			Containers:         cfg.RetentionContainers,
+			Ports:              cfg.RetentionPorts,
+			IPBanEvents:        cfg.RetentionIPBanEvents,
+			CompressAfter:      cfg.CompressionAfter,
+			ArchiveAggregate5m: cfg.ArchiveS3Bucket != "",
+			RawCutoff:          config.IntervalToDuration(cfg.RetentionRaw),
+			Aggregate5mCutoff:  config.IntervalToDuration(cfg.RetentionAggregate5m),
 		},
 	})
 

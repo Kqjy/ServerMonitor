@@ -1,10 +1,27 @@
 # Managed backups
 
-ServerMonitor agents can orchestrate scheduled, encrypted [restic](https://restic.net/) backups of their own host. Encryption is client-side: the repository password never leaves the host, so the backup endpoint — a rest-server VPS, an S3 bucket, anything restic speaks to — only ever sees ciphertext. The monitoring server sees even less: it receives status and metrics (`backup_*`, labeled per repo), never the repository password or the repository URLs, which may embed credentials.
+ServerMonitor agents can orchestrate scheduled, encrypted [restic](https://restic.net/) backups of their own host. Encryption is client-side: the repository password never leaves the host, so the storage backend only sees ciphertext. For locally configured repositories the monitoring server receives status and metrics only. For centrally managed direct S3 repositories it also holds destination metadata and encrypted transport credentials, but it still never receives the restic repository password.
 
 Monitoring comes for free once a host backs up: the host detail page gains a **Backups** tab (last success age, duration, added bytes, snapshot inventory per repo), and the alert rule dialog offers suggested presets — *backup stale*, *backup failed*, *repo check failing* — built on the `backup_*` metrics.
 
 > **Enable this deliberately.** Backing up a host means reading every file on it. On Linux the grant (`CAP_DAC_READ_SEARCH`) is confined to a oneshot systemd unit that runs only at backup time — the resident agent gains nothing — but it is still a whole-host read capability, which is why `--enable-backup` is excluded from `--enable-all`.
+
+## Three separate layers
+
+The UI and API keep these concepts independent:
+
+- **Storage backend / destination** — where bytes ultimately live: ServerMonitor disk, the S3 bucket behind ServerMonitor's gateway, a promoted storage node, or an external S3/R2 destination.
+- **Repository namespace** — one restic repository and its isolated path/prefix. A direct destination can be reused while each linked host gets a distinct expanded prefix such as `backups/hosts/17-web-01/nightly`.
+- **Network/data path** — the systems that carry each object. This is not implied by the word “S3.”
+
+| UI path | Storage backend | Effective data path |
+|---|---|---|
+| Server disk | Server filesystem | **Agent → Server disk** |
+| Server gateway backed by S3 | `BACKUP_S3_*` bucket | **Agent → ServerMonitor → S3** |
+| Promoted storage node | Node filesystem | **Agent → storage node** |
+| Direct external S3 | Centrally defined S3/R2 destination | **Agent → S3 directly** |
+
+The gateway-backed S3 path terminates the restic REST request on ServerMonitor, temporarily spools each object, and uploads it with the server's credentials. Direct external S3 uses ServerMonitor as control plane only; backup objects never traverse or spool on the monitoring server.
 
 ## Disaster recovery — the runbook
 
@@ -127,7 +144,7 @@ The drill is opt-in and not part of the installed weekly check. To run it automa
 
 ## Enabling backup on a host
 
-Pass `--enable-backup` plus at least one repository URL to the install script — on a host that already has an agent, re-running the script reconfigures in place (no token, no re-registration), exactly like the other `--enable-*` flags:
+Pass `--enable-backup` plus at least one repository URL to the install script — on a host that already has an agent, re-running the script reconfigures in place (no token, no re-registration), exactly like the other `--enable-*` flags. The exception is a centrally assigned direct S3 repository: after its assignment has synchronized, `--enable-backup` can provision the runtime without a local repository URL.
 
 ```bash
 sudo ./scripts/install-agent-linux.sh \
@@ -154,7 +171,7 @@ The installer prints a capability warning when enabling, and rewrites all three 
 
 ### Containerized (Docker) agents
 
-A host running only the [Dockerized agent](AGENT-DOCKER.md) can back **itself** up without a second host-installed agent — there is no `--enable-backup` installer step; the resident agent provisions and schedules everything from env. Set `SM_ENABLE_BACKUP=1`, `SM_BACKUP_REPOS`, and the credential in `.env.agent`; full recipe in [AGENT-DOCKER.md → Managed backups](AGENT-DOCKER.md#managed-backups). The differences from a host install:
+A host running only the [Dockerized agent](AGENT-DOCKER.md) can back **itself** up without a second host-installed agent — there is no `--enable-backup` installer step; the resident agent provisions and schedules everything from env. Set `SM_ENABLE_BACKUP=1` plus either a local `SM_BACKUP_REPOS`/credential set or a centrally synchronized direct assignment; full recipe in [AGENT-DOCKER.md → Managed backups](AGENT-DOCKER.md#managed-backups). The differences from a host install:
 
 - **No systemd.** The schedule (daily backup + weekly check) runs inside the agent and is caught up on boot; there is no `sm-backup` timer/unit.
 - **Chrooted backups.** The backup runs restic chrooted into `/host`, so snapshots record host-native paths and interoperate with host-installed snapshots — provided the recipe keeps `uts: host`, `cap_add: SYS_CHROOT`, and the state-volume aliases at `/tmp` and `/host/tmp`. The alias hides host `/tmp`, which therefore is not a supported container-managed backup path.
@@ -355,7 +372,7 @@ Keep two repositories if that was the old corruption boundary; the managed setup
 
 For object storage, use a bucket per fleet and a prefix plus access key per host. The repository URL is the namespace and, for self-hosted S3, carries the endpoint: `s3:s3.amazonaws.com/servermonitor-backups/host1` for AWS, `s3:https://minio.internal:9000/servermonitor-backups/host1` for MinIO/Ceph/Garage, `b2:servermonitor-backups:host1` for B2. Keep the same two-repo posture by adding two `[[repo]]` blocks, not by copying objects between endpoints.
 
-**Supplying credentials (managed path).** The installer takes S3/B2 credentials as environment variables only (never flags — argv is world-readable) and writes them to a root-owned `/etc/servermonitor-backup/repo-credentials.env` (`0440 root:sm-agent`), then sets `env_file` on every `s3:`/`b2:`/`rest:` repo so restic reads them for that repo alone. They never enter `backup.toml`, the recovery kit, the status file, metrics, logs, or the UI, and are scrubbed from restic error text.
+**Supplying credentials (local path).** The installer takes S3/B2 credentials as environment variables only (never flags — argv is world-readable) and writes them to a root-owned `/etc/servermonitor-backup/repo-credentials.env` (`0440 root:sm-agent`), then sets `env_file` on every `s3:`/`b2:`/`rest:` repo so restic reads them for that repo alone. They never enter `backup.toml`, the status file, metrics, logs, or the UI, and are scrubbed from restic error text. The explicitly requested recovery kit includes them because that offline artifact must be sufficient for a bare-machine restore.
 
 ```bash
 sudo SM_ENABLE_BACKUP=1 \
@@ -415,6 +432,64 @@ Lifecycle rules and Object Lock are endpoint controls, not ServerMonitor control
 
 For B2, create one application key per host scoped to the bucket and host prefix with list/read/write capability and no `deleteFiles`; keep a separate key that can delete only on the trusted prune machine.
 
+## Centrally managed direct external S3/R2
+
+This is the managed version of the object-storage path above. Configure an external destination once on **Backups → Direct external S3 destinations**, then create a repository namespace linked to a host. The agent receives that assignment and uploads to S3/R2 itself; ServerMonitor is not a proxy and never handles backup objects.
+
+Before storing any destination credential, set a stable server master key and restart:
+
+```bash
+openssl rand -base64 32
+# Put the output in deploy/.env as BACKUP_SECRETS_KEY, then restart the app.
+```
+
+Back up this key with the server's other disaster-recovery secrets. It is not stored in PostgreSQL, and changing or losing it makes the encrypted destination credentials already in the database unreadable. Once encrypted credentials exist, the server validates every ciphertext at startup and refuses to run with a missing or incorrect key. There is intentionally no plaintext fallback or automatic key reset.
+
+**Destination setup.** Enter the endpoint (leave blank for AWS), bucket, region, addressing mode, and a prefix template. A custom endpoint must be an `https://` origin without embedded credentials, a path, a query, or a fragment. Templates must include both `{host_id}` and `{repository}`; `{hostname}` is optional. Hostnames and repository names are sanitized to safe path segments and the fully expanded prefix is saved on the repository record, so renaming a host cannot silently move a repository.
+
+Credentials have two scopes:
+
+- **Per-repository credentials (recommended)** — entered while assigning a namespace to a host. Use a provider key restricted to exactly that host prefix, ideally read/list/write with deletes denied.
+- **Destination-shared credentials** — convenient for small installations, but every assigned agent receives the same key. A compromised agent can exercise every permission that key has, so the provider policy—not the UI prefix—is the security boundary.
+
+Centrally managed direct repositories are always treated as externally pruned, even when the host already has `prune_mode = "host"` for older local repositories. Apply retention at S3/R2 or from a separately trusted prune runner; the managed agent credential should remain prefix-scoped and deny deletes.
+
+ServerMonitor never creates IAM users, R2 tokens, bucket policies, lifecycle rules, or Object Lock settings. Create and revoke those at the provider. Revoking a repository in ServerMonitor removes its assignment and local credential file on the next agent sync, but cannot invalidate a copied provider key; revoke that key at S3/R2 as well.
+
+**Secret handling.** Admin create/replace requests are write-only: list and mutation responses contain `credentials_configured`, never access keys, secret keys, session tokens, or ciphertext. PostgreSQL stores AES-256-GCM ciphertext bound to the destination or repository record, using `BACKUP_SECRETS_KEY`. The authenticated agent endpoint returns only an AES-GCM envelope derived from the calling agent's bearer token, with `Cache-Control: no-store`; plaintext credentials are never an API JSON response. HTTPS is still mandatory because the bearer token itself is sensitive. The agent decrypts only its own assignments and writes one mode-`0600` credential env file per repository beneath `/var/lib/servermonitor/managed-backups` (ACL-protected equivalent on Windows). Metadata, status, metrics, UI responses, and request logs exclude the secrets.
+
+The restic repository password remains host-only and is shared by that host's local and centrally managed repositories. After the first managed assignment arrives, run `sm-agent backup recovery-kit` again and save the refreshed output offline; it is the break-glass copy of the repository URL, provider credential, and repository password.
+
+Agents poll for assignments every minute. Existing backup-enabled hosts need no installer rerun or per-host S3 environment change: the next scheduled run loads the new repository and idempotently initializes it before backup. A host that has never enabled backups still needs the one-time opt-in below because that provisions restic, the repository password, schedule, and whole-host read capability. Wait up to one minute after assignment so the resident agent has written the managed configuration; no repository URL or provider secret is passed to either installer.
+
+Linux:
+
+```bash
+SM_ENABLE_BACKUP=1 SM_BACKUP_PRUNE_MODE=external \
+  sudo --preserve-env=SM_ENABLE_BACKUP,SM_BACKUP_PRUNE_MODE \
+  bash -c "curl -fsSL https://monitor.example.com/install.sh | bash"
+```
+
+Windows (elevated PowerShell):
+
+```powershell
+$env:SM_ENABLE_BACKUP = "1"
+$env:SM_BACKUP_PRUNE_MODE = "external"
+iex (iwr -useb https://monitor.example.com/install.ps1).Content
+```
+
+After the last managed assignment is revoked, the already-enabled runtime remains healthy but idle, removes the revoked credential on its next configuration poll, and drops the retired repository from reported status on its next backup/check cycle. Provider credentials must still be revoked at S3/R2.
+
+### Backward-compatible migration
+
+No existing repository is converted automatically:
+
+- Existing server and storage-node rows remain valid after migration `0019`; their IDs, namespaces, credentials, routes, and data stay unchanged.
+- `/api/v1/backup-targets` remains an alias for existing clients. New code uses `/api/v1/backup-repositories` and exposes `storage_backend`, `repository_namespace`, and `data_path` explicitly.
+- Existing agent-local `SM_BACKUP_S3_*` / `[[repo]]` configuration stays supported and is merged with centrally assigned direct repositories. Those environment variables now mean **local/unmanaged direct S3 only**.
+- Existing cold archive `S3_*` variables remain lower-precedence aliases. New deployments should use `ARCHIVE_S3_*`.
+- `BACKUP_S3_*` continues to mean only the S3 storage behind ServerMonitor's central REST gateway. The backup-specific credential pair overrides the shared AWS chain for that gateway only, with the old chain retained as fallback.
+
 ## Backing up to the ServerMonitor server (managed backup endpoint)
 
 Instead of standing up a rest-server on a storage VPS by hand (the section above), you can **promote a ServerMonitor server itself into the restic endpoint** other hosts back up to. The server binary speaks the restic REST protocol on `/backup/…`; there is no second process to install or supervise.
@@ -422,7 +497,7 @@ Instead of standing up a rest-server on a storage VPS by hand (the section above
 **Enable it.** Set exactly one storage backend and restart the server:
 
 - `BACKUP_DIR=/var/lib/servermonitor/backup-repos` — store blobs on the server's own disk. Simplest; watch capacity with an `fs_used_pct` alert (install the agent on the backup server itself).
-- `BACKUP_S3_BUCKET=...` (plus `BACKUP_S3_REGION`, `BACKUP_S3_ENDPOINT` for self-hosted S3, `BACKUP_S3_USE_PATH_STYLE=1`, `BACKUP_S3_PREFIX`) — store blobs in a bring-your-own object-storage bucket the server holds credentials for (standard AWS credential chain).
+- `BACKUP_S3_BUCKET=...` (plus `BACKUP_S3_REGION`, `BACKUP_S3_ENDPOINT` for self-hosted S3, `BACKUP_S3_USE_PATH_STYLE=1`, `BACKUP_S3_PREFIX`) — store blobs in a bring-your-own object-storage bucket. Set `BACKUP_S3_ACCESS_KEY_ID` and `BACKUP_S3_SECRET_ACCESS_KEY` (plus optional `BACKUP_S3_SESSION_TOKEN`) for backup-only credentials. If the backup-specific pair is unset, the server falls back to its standard AWS credential chain for compatibility. This lets the cold-metrics archive and backup storage use different accounts or providers.
 
 Setting both is a startup error. `BACKUP_MAX_BLOB_BYTES` (default 1 GiB) caps a single upload.
 
@@ -433,7 +508,9 @@ Setting both is a startup error. `BACKUP_MAX_BLOB_BYTES` (default 1 GiB) caps a 
 
 The Backups tab shows which posture is active.
 
-**Provision a target in the UI.** Open **Backups → New backup target**, give it a name (becomes the repo path and login), an optional linked host, and an optional quota. The server mints a credential shown **once** and stored only as a SHA-256 hash — it authenticates uploads only and cannot decrypt anything (the repo password never leaves the client). The page renders the exact install/`backup.toml` snippet to paste on the target host, using the `SM_BACKUP_REST_USERNAME`/`SM_BACKUP_REST_PASSWORD` credential-file mechanism above. The repo URL is `rest:https://backup.example.com/backup/<name>`.
+**Provision a repository namespace in the UI.** Open **Backups → New repository**, choose the ServerMonitor destination, give the namespace a name, and optionally link a host and set a quota. The server mints a credential shown **once** and stored only as a SHA-256 hash — it authenticates uploads only and cannot decrypt anything (the repo password never leaves the client). The page renders the exact install/`backup.toml` snippet to paste on the target host, using the `SM_BACKUP_REST_USERNAME`/`SM_BACKUP_REST_PASSWORD` credential-file mechanism above. The repo URL is `rest:https://backup.example.com/backup/<name>`.
+
+When `BACKUP_S3_BUCKET` is the gateway storage backend, the effective path is **Agent → ServerMonitor → S3**. ServerMonitor must receive the full upload, temporarily spools each restic object to disk, and then relays it to object storage. Use **Direct external S3** instead when the desired path is **Agent → S3 directly**.
 
 Point a host at it exactly like any other repo, with `prune_mode = "external"` (the endpoint is append-only):
 
@@ -446,25 +523,27 @@ sudo SM_ENABLE_BACKUP=1 \
   ./scripts/install-agent-linux.sh --enable-backup --backup-repos '...'
 ```
 
-**Guarantees.** The endpoint is **append-only**: it refuses every delete and every attempt to overwrite an existing object (the ransomware boundary), with the sole exception of restic's own lock files (so `restic unlock` works). Per-host isolation is absolute — a credential can only ever address its own `/backup/<name>` namespace. Revoking a target from the UI stops new uploads immediately but never deletes stored blobs (append-only applies to admins too); reclaim space by deleting on the storage backend directly. **Prune/`forget` must run elsewhere** — from a trusted box holding a full-power credential and the repo password — never from the monitored host.
+**Guarantees.** The endpoint is **append-only**: it refuses every delete and every attempt to overwrite an existing object (the ransomware boundary), with the sole exception of restic's own lock files (so `restic unlock` works). Per-host isolation is absolute — a credential can only ever address its own `/backup/<name>` namespace. Revoking a repository from the UI stops new uploads immediately but never deletes stored blobs (append-only applies to admins too); reclaim space by deleting on the storage backend directly. **Prune/`forget` must run elsewhere** — from a trusted box holding a full-power credential and the repo password — never from the monitored host.
 
-A target the endpoint holds **no objects** for — one created by mistake, or emptied on the backend — can be deleted outright from the UI (**Delete** replaces **Revoke** on empty rows). This never touches stored data: the server refuses the delete with `409` if the backend namespace holds any object, down to a zero-byte one. The check is a preflight, not a lock, so in the narrow window where a first upload lands mid-delete the row can still be removed while that object is written; the result is an orphaned, still-encrypted repo you reclaim on the backend like any other — no snapshot is ever destroyed. Reusing a deleted name is refused while the old namespace still holds objects, so a new credential can never rebind to leftover blobs.
+A repository the endpoint holds **no objects** for — one created by mistake, or emptied on the backend — can be deleted outright from the UI (**Delete** replaces **Revoke** on empty rows). This never touches stored data: the server refuses the delete with `409` if the backend namespace holds any object, down to a zero-byte one. The check is a preflight, not a lock, so in the narrow window where a first upload lands mid-delete the row can still be removed while that object is written; the result is an orphaned, still-encrypted repo you reclaim on the backend like any other — no snapshot is ever destroyed. Reusing a deleted name is refused while the old namespace still holds objects, so a new credential can never rebind to leftover blobs.
 
-Use **Measure** on a target to walk its repo and refresh the stored-bytes figure and quota bar. Storage totals also appear in the summary tiles at the top of the Backups tab.
+Use **Measure** on a repository to walk its namespace and refresh the stored-bytes figure and quota bar. Storage totals also appear in the summary tiles at the top of the Backups tab.
 
 ## Backing up over the built-in WireGuard tunnel (no exposed endpoint)
 
-The managed endpoint above rides the server's public HTTPS listener. Tunnel mode removes even that: each backup host establishes a **per-host WireGuard tunnel** to the server, and the restic REST endpoint is served **only inside the tunnel** — it does not exist on any real network interface. The only thing the internet can see is one UDP port, and WireGuard never replies to a packet that isn't signed by an enrolled peer key, so scanners see nothing at all. TLS and `BACKUP_ACME_DOMAIN` become unnecessary for backups: the tunnel is the transport encryption, restic's client-side encryption still covers the data, and the per-target Basic-auth credential still gates every request (a tunnel IP grants no authorization by itself).
+The managed endpoint above rides the server's public HTTPS listener. Tunnel mode removes even that: each backup host establishes a **per-host WireGuard tunnel** to the server, and the restic REST endpoint is served **only inside the tunnel** — it does not exist on any real network interface. The public transport is `BACKUP_WG_ENDPOINT:BACKUP_WG_PORT` over UDP. Inside the tunnel, restic reaches the fixed server address `10.83.0.1:8443` by default; port 8443 is not the public listener and should not be published. WireGuard never replies to a packet that isn't signed by an enrolled peer key, so scanners see nothing at all. TLS and `BACKUP_ACME_DOMAIN` become unnecessary for backups: the tunnel is the transport encryption, restic's client-side encryption still covers the data, and the per-repository Basic-auth credential still gates every request (a tunnel IP grants no authorization by itself).
 
 Everything is userspace Go inside the existing binaries — no kernel WireGuard, no `wg-quick`, no TUN devices, no new capabilities on either side, no interference with an existing WireGuard or Tailscale setup on the host. The agent's tunnel exists **only while a backup, check, restore or init is running**; there is no resident tunnel process.
 
 **Enable it on the server.** Keep one storage backend (`BACKUP_DIR` or `BACKUP_S3_BUCKET`) and add:
 
-- `BACKUP_WG_PORT=51820` — turns tunnel mode on; the UDP port to expose.
+- `BACKUP_WG_PORT=51820` — turns tunnel mode on; this is the public UDP transport port to expose, not restic's internal port.
 - `BACKUP_WG_ENDPOINT=` — optional `host[:port]` agents should dial. Defaults to the host agents already reach the server by, so most setups leave it empty.
 - `BACKUP_WG_SUBNET=10.83.0.0/16` — tunnel address pool; the server takes the first address.
 - `BACKUP_WG_MTU=1280` — conservative default that survives PPPoE/IPv6 encapsulation; raise toward 1420 on clean paths.
 - `BACKUP_PUBLIC_HTTP=1` — optional. By default tunnel mode takes `/backup` **off** the public listener; set this to serve both (mixed fleet where some hosts cannot use UDP).
+
+With the default subnet the resulting path is `agent → UDP BACKUP_WG_PORT → WireGuard → 10.83.0.1:8443 → ServerMonitor storage backend`. The Backups UI labels the external UDP endpoint and internal REST address separately so 8443 is never mistaken for a port to expose.
 
 The server generates and persists its WireGuard key on first start; peers survive restarts. Publishing the UDP port is opt-in: add `-f deploy/docker-compose.wg.yml` to the `docker compose` command and it binds `${BACKUP_WG_PORT:-51820}` on the same host and container port. The base compose file reserves nothing, so a server with tunnel mode off never sits on UDP 51820. When tunnel mode is enabled, the server fails loudly at startup if that port is already in use. In node-only fleets this published server port is harmless and is not part of the backup data path; each promoted node's own UDP port must separately be reachable from backup clients. Storage-node endpoint start failures now surface on the Backups page.
 
@@ -505,7 +584,7 @@ Requirements: the server must run with `BACKUP_WG_PORT` (the tunnel control plan
 
 `tunnel:NODE/NAME` = repository `NAME` on node `NODE`; plain `tunnel:NAME` still targets the server. In `backup.toml` this becomes `tunnel_name = "web-01"` plus `tunnel_node = "nas-01"`, and `sm-agent backup tunnel-enroll` resolves the node's public key, endpoint and tunnel address into `[[tunnel.node]]` blocks. A host can mix destinations freely — one repo on a node, one on S3 — and each still fails independently.
 
-**Trust model.** The node stores ciphertext only: repo passwords never leave the backing-up host, and the node verifies upload credentials against server-distributed hashes, so a compromised node can neither read nor forge backups — it can, at worst, delete its own disk (which is why the two-independent-repos rule still applies; pair a node repo with S3/B2 or a second node). The node's endpoint is append-only exactly like the server's. Upload credentials are still minted and revoked centrally in the UI; per-target usage flows back to the server for quota display.
+**Trust model.** The node stores ciphertext only: repo passwords never leave the backing-up host, and the node verifies upload credentials against server-distributed hashes, so a compromised node can neither read nor forge backups — it can, at worst, delete its own disk (which is why the two-independent-repos rule still applies; pair a node repo with S3/B2 or a second node). The node's endpoint is append-only exactly like the server's. Upload credentials are still minted and revoked centrally in the UI; per-repository usage flows back to the server for quota display.
 
 **Fate sharing note.** A node-hosted repo dies with the node's disk. For the borg-style posture: repo 1 on a storage node in another room/site, repo 2 on object storage with a deny-delete policy — both over their own transports, no shared fate, nothing internet-exposed except silent UDP.
 

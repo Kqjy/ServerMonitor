@@ -338,6 +338,7 @@
                 <td class="px-4 sm:px-5 py-2.5 align-top">
                   <div class="text-zinc-100 whitespace-nowrap">{p.label}</div>
                   <div class="text-[11px] text-zinc-500 mt-0.5 max-w-md">{p.description}</div>
+                  <div class="text-[10px] text-zinc-500 mt-1">Deletion owner · {p.owner}</div>
                   <div class="text-[10px] text-zinc-600 font-mono mt-1 whitespace-nowrap">{p.target}</div>
                 </td>
                 <td class="px-3 py-2.5 align-top font-mono text-xs numeric whitespace-nowrap {isModified(p) ? 'text-emerald-300' : 'text-zinc-300'}">
@@ -362,7 +363,7 @@
           <div>Changes take effect on the next server start.</div>
         {/if}
         <div>
-          Raw data outside <span class="font-mono text-zinc-400">RETENTION_RAW</span> is summarised into 5-minute buckets, then archived to S3 (if configured) past the 5-minute window.
+          Raw data outside <span class="font-mono text-zinc-400">RETENTION_RAW</span> is summarised into 5-minute buckets. When cold archive is configured, it exclusively owns 5-minute expiry and deletes only after a successful archive pass.
         </div>
       </div>
     {/if}
@@ -407,7 +408,13 @@
               {#if storage.archive.objects > 0}
                 {storage.archive.objects.toLocaleString()} {storage.archive.objects === 1 ? 'object' : 'objects'} · ≈ {storage.archive.row_count.toLocaleString()} rows
               {:else}
-                configured · no archived objects yet
+                {#if storage.archive.last_run_ok === false}
+                  last pass failed {storage.archive.last_attempt_at ? `· ${timeAgo(storage.archive.last_attempt_at)}` : ''} · check server logs; source chunks were kept
+                {:else if storage.archive.last_run_ok === true}
+                  last pass succeeded {storage.archive.last_success_at ? `· ${timeAgo(storage.archive.last_success_at)}` : ''} · no eligible rows
+                {:else}
+                  waiting for first pass · runs daily at 03:00 server time
+                {/if}
               {/if}
             </div>
           {:else}

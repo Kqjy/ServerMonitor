@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"servermonitor/internal/server/archive"
 	"servermonitor/internal/server/storage"
 )
 
@@ -28,12 +29,15 @@ type storageTable struct {
 }
 
 type storageArchive struct {
-	Configured bool       `json:"configured"`
-	Objects    int64      `json:"objects"`
-	TotalBytes int64      `json:"total_bytes"`
-	RowCount   int64      `json:"row_count"`
-	Oldest     *time.Time `json:"oldest"`
-	Newest     *time.Time `json:"newest"`
+	Configured    bool       `json:"configured"`
+	Objects       int64      `json:"objects"`
+	TotalBytes    int64      `json:"total_bytes"`
+	RowCount      int64      `json:"row_count"`
+	Oldest        *time.Time `json:"oldest"`
+	Newest        *time.Time `json:"newest"`
+	LastAttemptAt *time.Time `json:"last_attempt_at,omitempty"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	LastRunOK     *bool      `json:"last_run_ok,omitempty"`
 }
 
 type storageResp struct {
@@ -62,7 +66,7 @@ var storageTableMeta = map[string]struct{ label, kind string }{
 	"ports":            {"Open-port snapshots", "Snapshot"},
 }
 
-func storageUsageHandler(db *storage.DB, archiveConfigured bool) http.HandlerFunc {
+func storageUsageHandler(db *storage.DB, archiver *archive.Archiver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
@@ -133,7 +137,20 @@ func storageUsageHandler(db *storage.DB, archiveConfigured bool) http.HandlerFun
 			resp.OtherDatabaseBytes = resp.DatabaseBytes - resp.TablesTotalBytes
 		}
 
-		resp.Archive.Configured = archiveConfigured
+		resp.Archive.Configured = archiver != nil
+		if archiver != nil {
+			status := archiver.Status()
+			if !status.LastAttemptAt.IsZero() {
+				attemptedAt := status.LastAttemptAt
+				lastRunOK := status.LastRunSucceeded
+				resp.Archive.LastAttemptAt = &attemptedAt
+				resp.Archive.LastRunOK = &lastRunOK
+			}
+			if !status.LastSuccessAt.IsZero() {
+				succeededAt := status.LastSuccessAt
+				resp.Archive.LastSuccessAt = &succeededAt
+			}
+		}
 		if err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(sum(byte_size),0), COALESCE(sum(row_count),0), min(bucket_from), max(bucket_to) FROM archive_manifests`).
 			Scan(&resp.Archive.Objects, &resp.Archive.TotalBytes, &resp.Archive.RowCount, &resp.Archive.Oldest, &resp.Archive.Newest); err != nil {
 			warn("archive stats unavailable: %v", err)

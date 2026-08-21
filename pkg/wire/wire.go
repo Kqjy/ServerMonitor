@@ -126,6 +126,22 @@ type TunnelEnrollResponse struct {
 	ServerStorage   bool   `json:"server_storage"`
 }
 
+type ManagedBackupConfig struct {
+	Version      int64                     `json:"version"`
+	Repositories []ManagedBackupRepository `json:"repositories"`
+}
+
+type ManagedBackupRepository struct {
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	S3Region        string `json:"s3_region,omitempty"`
+	S3PathStyle     bool   `json:"s3_path_style,omitempty"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+	SessionToken    string `json:"session_token,omitempty"`
+}
+
 type TunnelNodeInfo struct {
 	HostID    int64  `json:"host_id"`
 	Hostname  string `json:"hostname"`
@@ -181,6 +197,67 @@ type BackupNodeUsage struct {
 	Error   string           `json:"error,omitempty"`
 }
 
+type IPBanSourceStatus struct {
+	Name    string `json:"name"`
+	State   string `json:"state"`
+	Message string `json:"message,omitempty"`
+}
+
+type IPBanEvent struct {
+	Time      time.Time  `json:"time"`
+	IP        string     `json:"ip"`
+	Action    string     `json:"action"`
+	Source    string     `json:"source,omitempty"`
+	Failures  int        `json:"failures,omitempty"`
+	User      string     `json:"user,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Enforced  bool       `json:"enforced"`
+	Count     int        `json:"count,omitempty"`
+}
+
+type IPBanReport struct {
+	Supported      bool                `json:"supported"`
+	Detect         string              `json:"detect"`
+	DetectMessage  string              `json:"detect_message,omitempty"`
+	Enforce        string              `json:"enforce"`
+	EnforceMessage string              `json:"enforce_message,omitempty"`
+	Sources        []IPBanSourceStatus `json:"sources,omitempty"`
+	ActiveLocal    int                 `json:"active_local"`
+	FleetApplied   int                 `json:"fleet_applied"`
+	AppliedVersion int64               `json:"applied_version"`
+	Events         []IPBanEvent        `json:"events,omitempty"`
+}
+
+type IPBanPolicy struct {
+	Detect      bool   `json:"detect"`
+	Enforce     bool   `json:"enforce"`
+	ApplyFleet  bool   `json:"apply_fleet"`
+	Mode        string `json:"mode"`
+	MaxRetry    int    `json:"max_retry"`
+	FindTimeS   int    `json:"find_time_s"`
+	BanTimeS    int    `json:"ban_time_s"`
+	BanTimeMaxS int    `json:"ban_time_max_s"`
+	BanPrivate  bool   `json:"ban_private"`
+}
+
+type IPBanFleetEntry struct {
+	IP        string    `json:"ip"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type IPBanUnban struct {
+	IP string    `json:"ip"`
+	At time.Time `json:"at"`
+}
+
+type IPBanConfig struct {
+	Version   int64             `json:"version"`
+	Policy    IPBanPolicy       `json:"policy"`
+	Allowlist []string          `json:"allowlist,omitempty"`
+	Fleet     []IPBanFleetEntry `json:"fleet,omitempty"`
+	Unban     []IPBanUnban      `json:"unban,omitempty"`
+}
+
 type CollectorStatus struct {
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
@@ -209,6 +286,7 @@ type Batch struct {
 	Containers []Container        `json:"containers,omitempty"`
 	Ports      []Port             `json:"ports,omitempty"`
 	Backups    []BackupRepoStatus `json:"backups,omitempty"`
+	IPBan      *IPBanReport       `json:"ipban,omitempty"`
 	Sent       time.Time          `json:"sent"`
 }
 
@@ -222,6 +300,7 @@ type IngestAck struct {
 	UpgradeNow          bool   `json:"upgrade_now,omitempty"`
 	ServerPubkey        string `json:"server_pubkey,omitempty"`
 	BackupBrowsePending bool   `json:"backup_browse_pending,omitempty"`
+	IPBanVersion        int64  `json:"ipban_version,omitempty"`
 }
 
 type RegisterRequest struct {

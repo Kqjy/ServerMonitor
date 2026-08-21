@@ -21,6 +21,9 @@ type S3Config struct {
 	Prefix       string
 	Endpoint     string
 	UsePathStyle bool
+	AccessKeyID  string
+	SecretKey    string
+	SessionToken string
 }
 
 type s3Store struct {
@@ -49,6 +52,19 @@ func newS3Store(ctx context.Context, cfg S3Config) (*s3Store, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
+	}
+	if cfg.AccessKeyID != "" || cfg.SecretKey != "" || cfg.SessionToken != "" {
+		if cfg.AccessKeyID == "" || cfg.SecretKey == "" {
+			return nil, errors.New("backup s3 access key ID and secret access key must be set together")
+		}
+		awsCfg.Credentials = aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     cfg.AccessKeyID,
+				SecretAccessKey: cfg.SecretKey,
+				SessionToken:    cfg.SessionToken,
+				Source:          "ServerMonitorBackupS3",
+			}, nil
+		}))
 	}
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.UsePathStyle {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"servermonitor/internal/server/ingest"
+	"servermonitor/internal/server/ipban"
 	"servermonitor/internal/server/sse"
 	"servermonitor/internal/server/storage"
 	"servermonitor/pkg/agentsig"
@@ -23,7 +24,7 @@ const (
 	maxIngestDecompressed = 256 << 20
 )
 
-func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer *agentsig.Signer, logger *slog.Logger, browse *browseStore) http.HandlerFunc {
+func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer *agentsig.Signer, logger *slog.Logger, browse *browseStore, bans *ipban.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hostID, ok := hostIDFromContext(r.Context())
 		if !ok {
@@ -61,13 +62,16 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			return
 		}
 
-		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 {
+		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 && (batch.IPBan == nil || len(batch.IPBan.Events) == 0) {
 			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
 			if browse != nil {
 				emptyAck.BackupBrowsePending = browse.HasPending(hostID)
 			}
 			if signer != nil {
 				emptyAck.ServerPubkey = signer.PublicKeyHex()
+			}
+			if bans != nil {
+				emptyAck.IPBanVersion = bans.Version()
 			}
 			writeJSON(w, http.StatusOK, emptyAck)
 			return
@@ -170,6 +174,12 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 		})
 		selfUpgradeStalled := stallSince != nil && time.Since(*stallSince) >= upgradeStallWindow
 
+		if bans != nil && batch.IPBan != nil {
+			if err := bans.Ingest(r.Context(), hostID, batch.IPBan); err != nil {
+				logger.Warn("ipban ingest", "err", err, "host", hostID, "events", len(batch.IPBan.Events))
+			}
+		}
+
 		hub.Broadcast(hostID, batch.Points)
 
 		ack := wire.IngestAck{
@@ -179,6 +189,9 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 		}
 		if browse != nil {
 			ack.BackupBrowsePending = browse.HasPending(hostID)
+		}
+		if bans != nil {
+			ack.IPBanVersion = bans.Version()
 		}
 		if signer != nil {
 			ack.ServerPubkey = signer.PublicKeyHex()
