@@ -34,6 +34,9 @@ type hostDTO struct {
 	OS                    string                        `json:"os,omitempty"`
 	Arch                  string                        `json:"arch,omitempty"`
 	Kernel                string                        `json:"kernel,omitempty"`
+	CPUModel              string                        `json:"cpu_model,omitempty"`
+	CPUCores              int                           `json:"cpu_cores,omitempty"`
+	CPUThreads            int                           `json:"cpu_threads,omitempty"`
 	AgentVersion          string                        `json:"agent_version,omitempty"`
 	LatestAgentVersion    string                        `json:"latest_agent_version,omitempty"`
 	UpdateAvailable       bool                          `json:"update_available,omitempty"`
@@ -74,6 +77,9 @@ func toDTO(h storage.Host) hostDTO {
 		OS:                    h.OS,
 		Arch:                  h.Arch,
 		Kernel:                h.Kernel,
+		CPUModel:              h.CPUModel,
+		CPUCores:              h.CPUCores,
+		CPUThreads:            h.CPUThreads,
 		AgentVersion:          h.AgentVersion,
 		LatestAgentVersion:    version.Version,
 		UpdateAvailable:       updateAvailable,

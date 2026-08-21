@@ -191,6 +191,9 @@ type HostInfo struct {
 	OS              string                     `json:"os"`
 	Arch            string                     `json:"arch"`
 	Kernel          string                     `json:"kernel,omitempty"`
+	CPUModel        string                     `json:"cpu_model,omitempty"`
+	CPUCores        int                        `json:"cpu_cores,omitempty"`
+	CPUThreads      int                        `json:"cpu_threads,omitempty"`
 	AgentVersion    string                     `json:"agent_version"`
 	Collectors      []string                   `json:"collectors,omitempty"`
 	CollectorStatus map[string]CollectorStatus `json:"collector_status,omitempty"`

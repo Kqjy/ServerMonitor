@@ -9,6 +9,9 @@ export interface Host {
   os?: string;
   arch?: string;
   kernel?: string;
+  cpu_model?: string;
+  cpu_cores?: number;
+  cpu_threads?: number;
   agent_version?: string;
   latest_agent_version?: string;
   update_available?: boolean;
@@ -64,6 +67,20 @@ export interface MultiSeriesResp {
   step_sec: number;
   split_by?: string;
   series: SeriesEntry[];
+}
+
+export interface SeriesGroupMetricResp {
+  metric: string;
+  unit: string;
+  step_sec: number;
+  split_by?: string;
+  series: SeriesEntry[];
+}
+
+export interface SeriesGroupResp {
+  host_id: number;
+  step_sec: number;
+  metrics: Record<string, SeriesGroupMetricResp>;
 }
 
 export interface BatchSeriesResp {
@@ -560,6 +577,24 @@ export const api = {
     if (params.step) q.set('step', String(params.step));
     if (params.splitBy) q.set('split_by', params.splitBy);
     return request<MultiSeriesResp>(`/api/v1/series/multi?${q}`, { signal: params.signal });
+  },
+  seriesGroup: (params: {
+    host: number;
+    series: { metric: string; splitBy?: string }[];
+    from?: string;
+    to?: string;
+    step?: number;
+    signal?: AbortSignal;
+  }) => {
+    const q = new URLSearchParams();
+    q.set('host', String(params.host));
+    for (const item of params.series) {
+      q.append('series', item.splitBy ? `${item.metric}:${item.splitBy}` : item.metric);
+    }
+    if (params.from) q.set('from', params.from);
+    if (params.to) q.set('to', params.to);
+    if (params.step) q.set('step', String(params.step));
+    return request<SeriesGroupResp>(`/api/v1/series/group?${q}`, { signal: params.signal });
   },
   processes: (
     hostId: number,

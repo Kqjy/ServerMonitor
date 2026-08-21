@@ -82,6 +82,59 @@ func TestBatchBucketMerge(t *testing.T) {
 	}
 }
 
+func TestParseSeriesGroupSpecs(t *testing.T) {
+	specs, err := parseSeriesGroupSpecs([]string{"cpu_total_pct", "cpu_core_pct:core"})
+	if err != nil {
+		t.Fatalf("parse group specs: %v", err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("spec count = %d, want 2", len(specs))
+	}
+	if specs[0].name != "cpu_total_pct" || specs[0].splitBy != "" {
+		t.Fatalf("scalar spec = %#v", specs[0])
+	}
+	if specs[1].name != "cpu_core_pct" || specs[1].splitBy != "core" {
+		t.Fatalf("split spec = %#v", specs[1])
+	}
+
+	for _, values := range [][]string{
+		nil,
+		{"unknown_metric"},
+		{"cpu_total_pct", "cpu_total_pct"},
+	} {
+		if _, err := parseSeriesGroupSpecs(values); err == nil {
+			t.Fatalf("parseSeriesGroupSpecs(%v) succeeded, want error", values)
+		}
+	}
+}
+
+func TestSeriesGroupAccumulator(t *testing.T) {
+	at := time.Unix(1700000000, 0).UTC()
+	scalar := &seriesGroupAcc{
+		spec:   seriesGroupSpec{name: "cpu_total_pct"},
+		groups: map[string]*labelGroup{},
+	}
+	scalar.add(map[string]string{"source": "a"}, at, 30, 3)
+	scalar.add(map[string]string{"source": "b"}, at, 20, 1)
+	if len(scalar.groups) != 1 {
+		t.Fatalf("scalar groups = %d, want 1", len(scalar.groups))
+	}
+	bucket := scalar.groups[""].buckets[at.Unix()]
+	if got := bucket.sum / float64(bucket.n); got != 12.5 {
+		t.Fatalf("scalar weighted average = %v, want 12.5", got)
+	}
+
+	split := &seriesGroupAcc{
+		spec:   seriesGroupSpec{name: "cpu_core_pct", splitBy: "core"},
+		groups: map[string]*labelGroup{},
+	}
+	split.add(map[string]string{"core": "0"}, at, 10, 1)
+	split.add(map[string]string{"core": "1"}, at, 20, 1)
+	if len(split.groups) != 2 || split.groups["0"] == nil || split.groups["1"] == nil {
+		t.Fatalf("split groups = %#v", split.groups)
+	}
+}
+
 func TestColdRawClamp(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	day := 24 * time.Hour

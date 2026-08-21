@@ -184,7 +184,7 @@ All routes under `/api/v1/*` except the public `GET /healthz` and `GET /auth/sta
 | `POST /hosts/{id}/backups/browse` | cookie / admin | queue a snapshot directory listing |
 | `GET  /hosts/{id}/backups/browse/{jobID}` | cookie / admin | poll a snapshot directory listing |
 | `GET  /hosts/{id}/labels?key=device` | cookie / admin | distinct label values |
-| `GET  /series`, `/series/multi` | cookie / admin | time-series query (single / per-label) |
+| `GET  /series`, `/series/multi`, `/series/group` | cookie / admin | time-series query (single / per-label / bundled metrics) |
 | `GET  /metrics` | cookie / admin | canonical metric registry |
 | `GET  /stream` | cookie / admin | Server-Sent Events live feed |
 | `GET  /stats` | cookie / admin | batcher queue depth, dropped count |

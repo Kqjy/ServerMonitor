@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, isPreset, type Range } from '$lib/time';
+  import { groupSeries, incrementalFromMs, mergeSeries } from '$lib/series';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
@@ -20,6 +21,8 @@
   let inflight: AbortController | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
+  const historySpecs = [{ metric: 'sensor_temp_c', splitBy: 'sensor' }];
+  let refreshBusy = false;
 
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
@@ -28,15 +31,25 @@
     }));
   }
 
-  async function refresh() {
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -47,11 +60,21 @@
       toMs = b.toMs;
     }
     try {
-      const t = await api.seriesMulti({ host: hostId, metric: 'sensor_temp_c', from, to, splitBy: 'sensor', signal: ac.signal });
+      const history = await api.seriesGroup({
+        host: hostId,
+        series: historySpecs,
+        from,
+        to,
+        step: incremental ? loadedStep : undefined,
+        signal: ac.signal
+      });
       if (gen !== refreshGen) return;
-      loadedStep = t.step_sec;
+      const nextTemps = groupSeries(history, 'sensor_temp_c');
+      temps = incremental
+        ? mergeSeries(temps, nextTemps, fromMs, toMs, 'sensor', replaceFromMs)
+        : nextTemps;
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      temps = t.series;
       error = null;
       loading = false;
       masking = false;
@@ -61,6 +84,11 @@
       error = (e as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -79,7 +107,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);

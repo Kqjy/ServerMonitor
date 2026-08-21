@@ -40,6 +40,17 @@
   let restoreBusy = $state(false);
   let restoreError = $state<string | null>(null);
   const isArchived = $derived(!!host?.archived_at);
+  const cpuIdentity = $derived.by(() => {
+    if (!host) return '';
+    const parts: string[] = [];
+    if (host.cpu_model) parts.push(host.cpu_model);
+    const cores = host.cpu_cores ?? 0;
+    const threads = host.cpu_threads ?? 0;
+    if (cores && threads && threads !== cores) parts.push(`${cores} cores / ${threads} threads`);
+    else if (threads) parts.push(`${threads} ${threads === 1 ? 'thread' : 'threads'}`);
+    else if (cores) parts.push(`${cores} ${cores === 1 ? 'core' : 'cores'}`);
+    return parts.join(' · ');
+  });
   let installBaseUrl = $state(typeof window !== 'undefined' ? window.location.origin : '');
   let agentHealthCopy = $state<'idle' | 'stale' | 'perms' | 'failed'>('idle');
   let agentCpuPct = $state<number | null>(null);
@@ -353,6 +364,9 @@
           · agent v{host.agent_version || '?'} · seen {timeAgo(host.last_seen)}
           {#if agentCpuPct !== null && agentRssBytes !== null}<span> · {agentCpuPct.toFixed(1)}% CPU · {bytes(agentRssBytes)}</span>{/if}
         </div>
+        {#if cpuIdentity}
+          <div class="mt-0.5 text-[11px] sm:text-xs text-zinc-500 numeric break-words">{cpuIdentity}</div>
+        {/if}
         {#if healthPrimary && !isArchived}
           <div class="mt-3 rounded-lg border {healthToneClass}">
             <div class="flex items-start justify-between gap-3 px-4 py-2.5 text-xs">

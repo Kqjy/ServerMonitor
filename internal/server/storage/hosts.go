@@ -34,6 +34,9 @@ type Host struct {
 	OS                  string
 	Arch                string
 	Kernel              string
+	CPUModel            string
+	CPUCores            int
+	CPUThreads          int
 	AgentVersion        string
 	SampleIntervalS     int
 	EnabledCollectors   []string
@@ -281,7 +284,8 @@ func constantTimeLookup(byToken map[[32]byte]int64, candidate []byte) (int64, bo
 func (h *Hosts) refresh(ctx context.Context) error {
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, hostname, agent_token_hash, COALESCE(os,''), COALESCE(arch,''),
-		       COALESCE(kernel,''), COALESCE(agent_version,''),
+		       COALESCE(kernel,''), COALESCE(cpu_model,''), COALESCE(cpu_cores,0), COALESCE(cpu_threads,0),
+		       COALESCE(agent_version,''),
 		       sample_interval_s, enabled_collectors, tags, collector_status,
 		       last_seen, created_at, deleted_at, archived_at,
 		       auto_upgrade, upgrade_requested_at, externally_managed, upgrade_stall_since,
@@ -304,7 +308,7 @@ func (h *Hosts) refresh(ctx context.Context) error {
 		)
 		if err := rows.Scan(
 			&host.ID, &host.Hostname, &hash, &host.OS, &host.Arch,
-			&host.Kernel, &host.AgentVersion,
+			&host.Kernel, &host.CPUModel, &host.CPUCores, &host.CPUThreads, &host.AgentVersion,
 			&host.SampleIntervalS, &host.EnabledCollectors, &tags, &collStatus,
 			&host.LastSeen, &host.CreatedAt, &host.DeletedAt, &host.ArchivedAt,
 			&host.AutoUpgrade, &host.UpgradeRequestedAt, &host.ExternallyManaged, &host.UpgradeStallSince,
@@ -426,6 +430,9 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) (*time
 		  os = COALESCE(NULLIF($2,''), os),
 		  arch = COALESCE(NULLIF($3,''), arch),
 		  kernel = COALESCE(NULLIF($4,''), kernel),
+		  cpu_model = COALESCE(NULLIF($11::text,''), cpu_model),
+		  cpu_cores = COALESCE(NULLIF($12::int,0), cpu_cores),
+		  cpu_threads = COALESCE(NULLIF($13::int,0), cpu_threads),
 		  agent_version = COALESCE(NULLIF($5,''), agent_version),
 		  enabled_collectors = CASE WHEN cardinality($6::text[]) > 0 THEN $6 ELSE enabled_collectors END,
 		  tags = CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE tags END,
@@ -448,7 +455,8 @@ func (h *Hosts) Touch(ctx context.Context, id int64, info HostInfoUpdate) (*time
 		  last_seen = now()
 		WHERE id = $1 AND deleted_at IS NULL AND archived_at IS NULL
 		RETURNING upgrade_stall_since, upgrade_dispatched_at
-	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus, info.ExternallyManaged, info.ShouldSelfUpgrade).Scan(&stallSince, &dispatchedAt)
+	`, id, info.OS, info.Arch, info.Kernel, info.AgentVersion, info.Collectors, tags, collStatus, info.ExternallyManaged, info.ShouldSelfUpgrade,
+		info.CPUModel, info.CPUCores, info.CPUThreads).Scan(&stallSince, &dispatchedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -484,6 +492,9 @@ type HostInfoUpdate struct {
 	OS                string
 	Arch              string
 	Kernel            string
+	CPUModel          string
+	CPUCores          int
+	CPUThreads        int
 	AgentVersion      string
 	Collectors        []string
 	CollectorStatus   map[string]CollectorStatus

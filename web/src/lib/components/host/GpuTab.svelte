@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, isPreset, type Range } from '$lib/time';
+  import { groupSeries, incrementalFromMs, mergeSeries } from '$lib/series';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import DownloadCsv from '$lib/components/DownloadCsv.svelte';
 
@@ -24,6 +25,14 @@
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
 
+  const historySpecs = [
+    { metric: 'gpu_usage_pct', splitBy: 'gpu' },
+    { metric: 'gpu_mem_used_pct', splitBy: 'gpu' },
+    { metric: 'gpu_temp_c', splitBy: 'gpu' },
+    { metric: 'gpu_power_w', splitBy: 'gpu' }
+  ];
+  let refreshBusy = false;
+
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
       label: `GPU ${e.labels.gpu}${e.labels.name ? ' · ' + e.labels.name : ''}`,
@@ -31,15 +40,25 @@
     }));
   }
 
-  async function refresh() {
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -50,19 +69,32 @@
       toMs = b.toMs;
     }
     try {
-      const [u, mp, t, p] = await Promise.all([
-        api.seriesMulti({ host: hostId, metric: 'gpu_usage_pct', from, to, splitBy: 'gpu', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'gpu_mem_used_pct', from, to, splitBy: 'gpu', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'gpu_temp_c', from, to, splitBy: 'gpu', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'gpu_power_w', from, to, splitBy: 'gpu', signal: ac.signal })
-      ]);
+      const history = await api.seriesGroup({
+        host: hostId,
+        series: historySpecs,
+        from,
+        to,
+        step: incremental ? loadedStep : undefined,
+        signal: ac.signal
+      });
       if (gen !== refreshGen) return;
-      loadedStep = u.step_sec;
+      const nextUsage = groupSeries(history, 'gpu_usage_pct');
+      const nextMem = groupSeries(history, 'gpu_mem_used_pct');
+      const nextTemp = groupSeries(history, 'gpu_temp_c');
+      const nextPower = groupSeries(history, 'gpu_power_w');
+      if (incremental) {
+        usage = mergeSeries(usage, nextUsage, fromMs, toMs, 'gpu', replaceFromMs);
+        memUsedPct = mergeSeries(memUsedPct, nextMem, fromMs, toMs, 'gpu', replaceFromMs);
+        temp = mergeSeries(temp, nextTemp, fromMs, toMs, 'gpu', replaceFromMs);
+        power = mergeSeries(power, nextPower, fromMs, toMs, 'gpu', replaceFromMs);
+      } else {
+        usage = nextUsage;
+        memUsedPct = nextMem;
+        temp = nextTemp;
+        power = nextPower;
+      }
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      usage = u.series;
-      memUsedPct = mp.series;
-      temp = t.series;
-      power = p.series;
       error = null;
       loading = false;
       masking = false;
@@ -72,6 +104,11 @@
       error = (e as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -93,7 +130,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);

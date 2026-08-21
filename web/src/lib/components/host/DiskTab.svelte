@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry, type SeriesPoint, type CollectorStatus } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range, type CustomRange } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, isPreset, type Range, type CustomRange } from '$lib/time';
+  import { groupSeries, incrementalFromMs, mergeSeries } from '$lib/series';
   import { bytes, pct, dur, timeAgo } from '$lib/format';
   import { modalFocus } from '$lib/modal';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
@@ -95,6 +96,38 @@
   let detailGen = 0;
   let detailInflight: AbortController | null = null;
 
+  const historySpecs = [
+    { metric: 'disk_read_bytes', splitBy: 'device' },
+    { metric: 'disk_write_bytes', splitBy: 'device' },
+    { metric: 'disk_read_ops', splitBy: 'device' },
+    { metric: 'disk_write_ops', splitBy: 'device' },
+    { metric: 'smart_temp_c', splitBy: 'device' },
+    { metric: 'smart_data_written_bytes', splitBy: 'device' },
+    { metric: 'smart_data_read_bytes', splitBy: 'device' },
+    { metric: 'fs_used_pct', splitBy: 'mount' }
+  ];
+  const liveSpecs = [
+    { metric: 'fs_total', splitBy: 'mount' },
+    { metric: 'fs_used', splitBy: 'mount' },
+    { metric: 'fs_used_pct', splitBy: 'mount' },
+    { metric: 'fs_overall_total' },
+    { metric: 'fs_overall_used' },
+    { metric: 'fs_overall_used_pct' },
+    { metric: 'smart_temp_c', splitBy: 'device' },
+    { metric: 'smart_healthy', splitBy: 'device' },
+    { metric: 'smart_power_on_hours', splitBy: 'device' },
+    { metric: 'smart_realloc_sectors', splitBy: 'device' },
+    { metric: 'smart_pending_sectors', splitBy: 'device' },
+    { metric: 'smart_data_written_bytes', splitBy: 'device' },
+    { metric: 'smart_data_read_bytes', splitBy: 'device' },
+    { metric: 'smart_percent_used', splitBy: 'device' },
+    { metric: 'smart_media_errors', splitBy: 'device' },
+    { metric: 'smart_unsafe_shutdowns', splitBy: 'device' },
+    { metric: 'raid_degraded', splitBy: 'array' },
+    { metric: 'raid_sync_pct', splitBy: 'array' }
+  ];
+  let refreshBusy = false;
+
   const smartFreshness = $derived.by(() => {
     if (smartNewestAt === null) return null;
     return {
@@ -173,15 +206,25 @@
     detailOpen = false;
   }
 
-  async function refresh() {
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -192,39 +235,59 @@
       toMs = b.toMs;
     }
     try {
-      const [r, wr, rOps, wOps, fsTotal, fsUsed, fsPct, overallTotal, overallUsed, overallPct, sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe, raidDegraded, raidSync, fsUsage] = await Promise.all([
-        api.seriesMulti({ host: hostId, metric: 'disk_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'disk_write_bytes', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'disk_read_ops', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'disk_write_ops', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'fs_total', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'fs_used', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from: '-2m', step: 30, splitBy: 'mount', signal: ac.signal }),
-        api.series({ host: hostId, metric: 'fs_overall_total', from: '-2m', step: 30, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'fs_overall_used', from: '-2m', step: 30, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'fs_overall_used_pct', from: '-2m', step: 30, signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_temp_c', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_healthy', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_power_on_hours', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_realloc_sectors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_pending_sectors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_data_written_bytes', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_data_read_bytes', from, to, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_percent_used', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_media_errors', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'smart_unsafe_shutdowns', from: '-20m', step: 30, splitBy: 'device', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'raid_degraded', from: '-20m', step: 30, splitBy: 'array', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'raid_sync_pct', from: '-20m', step: 30, splitBy: 'array', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'fs_used_pct', from, to, splitBy: 'mount', signal: ac.signal })
+      const [history, live] = await Promise.all([
+        api.seriesGroup({ host: hostId, series: historySpecs, from, to, step: incremental ? loadedStep : undefined, signal: ac.signal }),
+        api.seriesGroup({ host: hostId, series: liveSpecs, from: '-20m', step: 30, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      loadedStep = r.step_sec;
+      const nextRead = groupSeries(history, 'disk_read_bytes');
+      const nextWrite = groupSeries(history, 'disk_write_bytes');
+      const nextReadOps = groupSeries(history, 'disk_read_ops');
+      const nextWriteOps = groupSeries(history, 'disk_write_ops');
+      const nextSmartTemps = groupSeries(history, 'smart_temp_c');
+      const nextSmartWritten = groupSeries(history, 'smart_data_written_bytes');
+      const nextSmartRead = groupSeries(history, 'smart_data_read_bytes');
+      const nextFSUsedPct = groupSeries(history, 'fs_used_pct');
+      if (incremental) {
+        read = mergeSeries(read, nextRead, fromMs, toMs, 'device', replaceFromMs);
+        write = mergeSeries(write, nextWrite, fromMs, toMs, 'device', replaceFromMs);
+        readOps = mergeSeries(readOps, nextReadOps, fromMs, toMs, 'device', replaceFromMs);
+        writeOps = mergeSeries(writeOps, nextWriteOps, fromMs, toMs, 'device', replaceFromMs);
+        smartTemps = mergeSeries(smartTemps, nextSmartTemps, fromMs, toMs, 'device', replaceFromMs);
+        smartWritten = mergeSeries(smartWritten, nextSmartWritten, fromMs, toMs, 'device', replaceFromMs);
+        smartRead = mergeSeries(smartRead, nextSmartRead, fromMs, toMs, 'device', replaceFromMs);
+        fsUsedPct = mergeSeries(fsUsedPct, nextFSUsedPct, fromMs, toMs, 'mount', replaceFromMs);
+      } else {
+        read = nextRead;
+        write = nextWrite;
+        readOps = nextReadOps;
+        writeOps = nextWriteOps;
+        smartTemps = nextSmartTemps;
+        smartWritten = nextSmartWritten;
+        smartRead = nextSmartRead;
+        fsUsedPct = nextFSUsedPct;
+      }
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      read = r.series;
-      write = wr.series;
-      readOps = rOps.series;
-      writeOps = wOps.series;
-      fsUsedPct = fsUsage.series;
+
+      const fsTotal = { series: groupSeries(live, 'fs_total') };
+      const fsUsed = { series: groupSeries(live, 'fs_used') };
+      const fsPct = { series: groupSeries(live, 'fs_used_pct') };
+      const overallTotal = { points: live.metrics.fs_overall_total?.series[0]?.points ?? [] };
+      const overallUsed = { points: live.metrics.fs_overall_used?.series[0]?.points ?? [] };
+      const overallPct = { points: live.metrics.fs_overall_used_pct?.series[0]?.points ?? [] };
+      const sTemp = { series: groupSeries(live, 'smart_temp_c') };
+      const sHealthy = { series: groupSeries(live, 'smart_healthy') };
+      const sHours = { series: groupSeries(live, 'smart_power_on_hours') };
+      const sRealloc = { series: groupSeries(live, 'smart_realloc_sectors') };
+      const sPending = { series: groupSeries(live, 'smart_pending_sectors') };
+      const sWritten = { series: groupSeries(live, 'smart_data_written_bytes') };
+      const sRead = { series: groupSeries(live, 'smart_data_read_bytes') };
+      const sUsed = { series: groupSeries(live, 'smart_percent_used') };
+      const sMedia = { series: groupSeries(live, 'smart_media_errors') };
+      const sUnsafe = { series: groupSeries(live, 'smart_unsafe_shutdowns') };
+      const raidDegraded = { series: groupSeries(live, 'raid_degraded') };
+      const raidSync = { series: groupSeries(live, 'raid_sync_pct') };
 
       const byMount: Record<string, { mount: string; fstype: string; used: number; total: number; pct: number }> = {};
       for (const e of fsTotal.series) {
@@ -274,9 +337,6 @@
       fill(sMedia.series, (r, v) => (r.mediaErrors = v));
       fill(sUnsafe.series, (r, v) => (r.unsafeShutdowns = v));
       smart = Object.values(byDev).sort((a, b) => a.device.localeCompare(b.device, undefined, { numeric: true }));
-      smartTemps = sTemp.series;
-      smartWritten = sWritten.series;
-      smartRead = sRead.series;
       const smartEntries = [sTemp, sHealthy, sHours, sRealloc, sPending, sWritten, sRead, sUsed, sMedia, sUnsafe].flatMap((response) => response.series);
       let newest = 0;
       for (const entry of smartEntries) {
@@ -311,6 +371,11 @@
       error = (e as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -336,7 +401,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);

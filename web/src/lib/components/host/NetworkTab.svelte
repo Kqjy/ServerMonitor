@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesEntry } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, isPreset, type Range } from '$lib/time';
+  import { groupPoints, groupSeries, incrementalFromMs, mergeSeries } from '$lib/series';
   import { bytes } from '$lib/format';
   import MultiChart, { type Series, type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
@@ -33,6 +34,23 @@
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
 
+  const historySpecs = [
+    { metric: 'net_rx_bytes', splitBy: 'iface' },
+    { metric: 'net_tx_bytes', splitBy: 'iface' },
+    { metric: 'net_rx_packets', splitBy: 'iface' },
+    { metric: 'net_tx_packets', splitBy: 'iface' },
+    { metric: 'net_rx_errors', splitBy: 'iface' },
+    { metric: 'net_tx_errors', splitBy: 'iface' },
+    { metric: 'net_rx_dropped', splitBy: 'iface' },
+    { metric: 'net_tx_dropped', splitBy: 'iface' }
+  ];
+  const liveSpecs = [
+    { metric: 'conn_estab' },
+    { metric: 'conn_listen' },
+    { metric: 'conn_timewait' }
+  ];
+  let refreshBusy = false;
+
   function toSeries(entries: SeriesEntry[]): Series[] {
     return entries.map((e) => ({
       label: e.labels.iface ?? Object.values(e.labels).join(' '),
@@ -40,15 +58,25 @@
     }));
   }
 
-  async function refresh() {
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -59,33 +87,43 @@
       toMs = b.toMs;
     }
     try {
-      const [r, t, rp, tp, re, te, rd, td, e, l, w] = await Promise.all([
-        api.seriesMulti({ host: hostId, metric: 'net_rx_bytes', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_tx_bytes', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_rx_packets', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_tx_packets', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_rx_errors', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_tx_errors', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_rx_dropped', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'net_tx_dropped', from, to, splitBy: 'iface', signal: ac.signal }),
-        api.series({ host: hostId, metric: 'conn_estab', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'conn_listen', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'conn_timewait', from: '-2m', step: 10, signal: ac.signal })
+      const [history, live] = await Promise.all([
+        api.seriesGroup({ host: hostId, series: historySpecs, from, to, step: incremental ? loadedStep : undefined, signal: ac.signal }),
+        api.seriesGroup({ host: hostId, series: liveSpecs, from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      loadedStep = r.step_sec;
+      const nextRx = groupSeries(history, 'net_rx_bytes');
+      const nextTx = groupSeries(history, 'net_tx_bytes');
+      const nextRxPkts = groupSeries(history, 'net_rx_packets');
+      const nextTxPkts = groupSeries(history, 'net_tx_packets');
+      const nextRxErr = groupSeries(history, 'net_rx_errors');
+      const nextTxErr = groupSeries(history, 'net_tx_errors');
+      const nextRxDrop = groupSeries(history, 'net_rx_dropped');
+      const nextTxDrop = groupSeries(history, 'net_tx_dropped');
+      if (incremental) {
+        rx = mergeSeries(rx, nextRx, fromMs, toMs, 'iface', replaceFromMs);
+        tx = mergeSeries(tx, nextTx, fromMs, toMs, 'iface', replaceFromMs);
+        rxPkts = mergeSeries(rxPkts, nextRxPkts, fromMs, toMs, 'iface', replaceFromMs);
+        txPkts = mergeSeries(txPkts, nextTxPkts, fromMs, toMs, 'iface', replaceFromMs);
+        rxErr = mergeSeries(rxErr, nextRxErr, fromMs, toMs, 'iface', replaceFromMs);
+        txErr = mergeSeries(txErr, nextTxErr, fromMs, toMs, 'iface', replaceFromMs);
+        rxDrop = mergeSeries(rxDrop, nextRxDrop, fromMs, toMs, 'iface', replaceFromMs);
+        txDrop = mergeSeries(txDrop, nextTxDrop, fromMs, toMs, 'iface', replaceFromMs);
+      } else {
+        rx = nextRx;
+        tx = nextTx;
+        rxPkts = nextRxPkts;
+        txPkts = nextTxPkts;
+        rxErr = nextRxErr;
+        txErr = nextTxErr;
+        rxDrop = nextRxDrop;
+        txDrop = nextTxDrop;
+      }
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      rx = r.series;
-      tx = t.series;
-      rxPkts = rp.series;
-      txPkts = tp.series;
-      rxErr = re.series;
-      txErr = te.series;
-      rxDrop = rd.series;
-      txDrop = td.series;
-      estab = e.points.at(-1)?.v ?? 0;
-      listen = l.points.at(-1)?.v ?? 0;
-      timeWait = w.points.at(-1)?.v ?? 0;
+      estab = groupPoints(live, 'conn_estab').at(-1)?.v ?? 0;
+      listen = groupPoints(live, 'conn_listen').at(-1)?.v ?? 0;
+      timeWait = groupPoints(live, 'conn_timewait').at(-1)?.v ?? 0;
       error = null;
       loading = false;
       masking = false;
@@ -95,6 +133,11 @@
       error = (err as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -120,7 +163,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);

@@ -46,6 +46,32 @@ type multiSeriesResp struct {
 	Series  []seriesEntry `json:"series"`
 }
 
+type seriesGroupMetricResp struct {
+	Metric  string        `json:"metric"`
+	Unit    string        `json:"unit"`
+	StepSec int           `json:"step_sec"`
+	SplitBy string        `json:"split_by,omitempty"`
+	Series  []seriesEntry `json:"series"`
+}
+
+type seriesGroupResp struct {
+	HostID  int64                            `json:"host_id"`
+	StepSec int                              `json:"step_sec"`
+	Metrics map[string]seriesGroupMetricResp `json:"metrics"`
+}
+
+type seriesGroupSpec struct {
+	id      metrics.ID
+	name    string
+	splitBy string
+}
+
+type seriesGroupAcc struct {
+	spec   seriesGroupSpec
+	groups map[string]*labelGroup
+	order  []string
+}
+
 type bucketAcc struct {
 	sum float64
 	n   int64
@@ -60,6 +86,7 @@ const (
 	caStepMin      = 300
 	rollupMinRange = 12 * time.Hour
 	rollupLiveTail = 15 * time.Minute
+	seriesGroupMax = 64
 )
 
 func rollupBoundary(now, from, to time.Time, step *int) time.Time {
@@ -587,6 +614,300 @@ func multiSeriesHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiv
 			SplitBy: splitBy,
 			Series:  series,
 		})
+	}
+}
+
+func parseSeriesGroupSpecs(values []string) ([]seriesGroupSpec, error) {
+	if len(values) == 0 {
+		return nil, errors.New("at least one series is required")
+	}
+	if len(values) > seriesGroupMax {
+		return nil, fmt.Errorf("too many series (max %d)", seriesGroupMax)
+	}
+
+	out := make([]seriesGroupSpec, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return nil, errors.New("series names must not be empty")
+		}
+		name, splitBy, _ := strings.Cut(raw, ":")
+		name = strings.TrimSpace(name)
+		splitBy = strings.TrimSpace(splitBy)
+		if name == "" {
+			return nil, errors.New("series names must not be empty")
+		}
+		if _, dup := seen[name]; dup {
+			return nil, fmt.Errorf("duplicate series %q", name)
+		}
+		id, ok := metrics.ByName(name)
+		if !ok {
+			return nil, fmt.Errorf("unknown metric %q", name)
+		}
+		seen[name] = struct{}{}
+		out = append(out, seriesGroupSpec{id: id, name: name, splitBy: splitBy})
+	}
+	return out, nil
+}
+
+func (a *seriesGroupAcc) add(labels map[string]string, t time.Time, sum float64, n int64) {
+	key := ""
+	storedLabels := map[string]string{}
+	if a.spec.splitBy != "" {
+		key = splitKey(labels, a.spec.splitBy)
+		storedLabels = labels
+	}
+	g := a.groups[key]
+	if g == nil {
+		g = &labelGroup{labels: storedLabels, buckets: map[int64]*bucketAcc{}}
+		a.groups[key] = g
+		a.order = append(a.order, key)
+	}
+	k := t.Unix()
+	b := g.buckets[k]
+	if b == nil {
+		b = &bucketAcc{}
+		g.buckets[k] = b
+	}
+	b.sum += sum
+	b.n += n
+}
+
+func seriesGroupHandler(db *storage.DB, hosts *storage.Hosts, ar *archive.Archiver, ret RetentionConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		hostID, err := strconv.ParseInt(q.Get("host"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid host")
+			return
+		}
+		specs, err := parseSeriesGroupSpecs(q["series"])
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		host, err := hosts.Get(r.Context(), hostID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "host not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		now := time.Now()
+		from := parseTime(q.Get("from"), now.Add(-time.Hour))
+		to := parseTime(q.Get("to"), now)
+		if !to.After(from) {
+			writeError(w, http.StatusBadRequest, "to must be after from")
+			return
+		}
+
+		step, _ := strconv.Atoi(q.Get("step"))
+		if step <= 0 {
+			step = chooseStep(to.Sub(from), host.SampleIntervalS)
+		} else if host.SampleIntervalS > 0 && step < host.SampleIntervalS {
+			step = host.SampleIntervalS
+		}
+		step = clampStepBuckets(to.Sub(from), step)
+
+		metricIDs := make([]int16, 0, len(specs))
+		accs := make(map[metrics.ID]*seriesGroupAcc, len(specs))
+		for _, spec := range specs {
+			metricIDs = append(metricIDs, int16(spec.id))
+			accs[spec.id] = &seriesGroupAcc{
+				spec:   spec,
+				groups: map[string]*labelGroup{},
+			}
+		}
+		add := func(metricID metrics.ID, labels map[string]string, t time.Time, sum float64, n int64) {
+			if a := accs[metricID]; a != nil {
+				a.add(labels, t, sum, n)
+			}
+		}
+
+		coldStep := step
+		if coldStep < caStepMin {
+			coldStep = caStepMin
+		}
+		addSlot := func(metricID metrics.ID, labels map[string]string, slot time.Time, value float64) {
+			bucket := (slot.Unix() / int64(coldStep)) * int64(coldStep)
+			add(metricID, labels, time.Unix(bucket, 0).UTC(), value, 1)
+		}
+
+		readRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT metric, labels, time_bucket($1::interval, time) AS bucket, sum(value), count(*)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = ANY($3::smallint[]) AND time >= $4 AND time < $5
+				GROUP BY metric, labels, bucket
+				ORDER BY metric, labels, bucket ASC
+			`, []any{intervalString(step), hostID, metricIDs, lo, hi}, func(rows pgx.Rows) error {
+				var (
+					metricID int16
+					labels   map[string]string
+					t        time.Time
+					sum      float64
+					n        int64
+				)
+				if err := rows.Scan(&metricID, &labels, &t, &sum, &n); err != nil {
+					return err
+				}
+				add(metrics.ID(metricID), labels, t, sum, n)
+				return nil
+			})
+		}
+		readColdRaw := func(lo, hi time.Time) error {
+			return queryRows(r.Context(), db, `
+				SELECT metric, labels, time_bucket($1::interval, time) AS slot, avg(value)
+				FROM metric_points
+				WHERE host_id = $2 AND metric = ANY($3::smallint[]) AND time >= $4 AND time < $5
+				GROUP BY metric, labels, slot
+				ORDER BY metric, labels, slot ASC
+			`, []any{intervalString(caStepMin), hostID, metricIDs, lo, hi}, func(rows pgx.Rows) error {
+				var (
+					metricID int16
+					labels   map[string]string
+					t        time.Time
+					value    float64
+				)
+				if err := rows.Scan(&metricID, &labels, &t, &value); err != nil {
+					return err
+				}
+				addSlot(metrics.ID(metricID), labels, t, value)
+				return nil
+			})
+		}
+
+		rawAvail := now.Add(-ret.RawCutoff)
+		coldCutoff := now.Add(-ret.Aggregate5mCutoff)
+		rawStart := rawAvail
+		if b := rollupBoundary(now, from, to, &step); b.After(rawStart) {
+			rawStart = b
+		}
+
+		var coldCovered []archive.Interval
+		if ar != nil && from.Before(coldCutoff) && rawAvail.Before(coldCutoff) {
+			coldCovered, err = ar.CoverageIntervals(r.Context(), hostID, from, coldCutoff)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "archive coverage failed: "+err.Error())
+				return
+			}
+		}
+		if lo, hi, ok := coldRawClamp(from, rawAvail, coldCutoff, rawStart); ok {
+			for _, gap := range coldRawGaps(lo, hi, coldCovered) {
+				if err := readColdRaw(gap[0], gap[1]); err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+		}
+
+		if ar != nil && from.Before(coldCutoff) {
+			coldTo := to
+			if coldTo.After(coldCutoff) {
+				coldTo = coldCutoff
+			}
+			for _, spec := range specs {
+				recs, readErr := ar.Read(r.Context(), hostID, int16(spec.id), from, coldTo, nil)
+				if readErr != nil {
+					writeError(w, http.StatusInternalServerError, "archive read failed: "+readErr.Error())
+					return
+				}
+				for _, rec := range recs {
+					labels := map[string]string{}
+					if rec.Labels != "" {
+						if err := json.Unmarshal([]byte(rec.Labels), &labels); err != nil {
+							continue
+						}
+					}
+					addSlot(spec.id, labels, time.UnixMicro(rec.Bucket), rec.Avg)
+				}
+			}
+		}
+
+		caFrom := from
+		if caFrom.Before(coldCutoff) {
+			caFrom = coldCutoff
+		}
+		caTo := to
+		if caTo.After(rawStart) {
+			caTo = rawStart
+		}
+		if caTo.After(caFrom) {
+			caStep := step
+			if caStep < caStepMin {
+				caStep = caStepMin
+			}
+			err = queryRows(r.Context(), db, `
+				SELECT metric, labels, time_bucket($1::interval, bucket) AS b, sum(avg), count(*)
+				FROM metric_points_5m
+				WHERE host_id = $2 AND metric = ANY($3::smallint[]) AND bucket >= $4 AND bucket < $5
+				GROUP BY metric, labels, b
+				ORDER BY metric, labels, b ASC
+			`, []any{intervalString(caStep), hostID, metricIDs, caFrom, caTo}, func(rows pgx.Rows) error {
+				var (
+					metricID int16
+					labels   map[string]string
+					t        time.Time
+					sum      float64
+					n        int64
+				)
+				if err := rows.Scan(&metricID, &labels, &t, &sum, &n); err != nil {
+					return err
+				}
+				add(metrics.ID(metricID), labels, t, sum, n)
+				return nil
+			})
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+
+		rawFrom := from
+		if rawFrom.Before(rawStart) {
+			rawFrom = rawStart
+		}
+		if to.After(rawFrom) {
+			if err := readRaw(rawFrom, to); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+
+		response := seriesGroupResp{
+			HostID:  hostID,
+			StepSec: step,
+			Metrics: make(map[string]seriesGroupMetricResp, len(specs)),
+		}
+		for _, spec := range specs {
+			a := accs[spec.id]
+			series := make([]seriesEntry, 0, len(a.order))
+			for _, key := range a.order {
+				group := a.groups[key]
+				points := make([]seriesPoint, 0, len(group.buckets))
+				for bucket, value := range group.buckets {
+					points = append(points, seriesPoint{
+						Ts: time.Unix(bucket, 0).UTC(),
+						V:  value.sum / float64(value.n),
+					})
+				}
+				sort.Slice(points, func(i, j int) bool { return points[i].Ts.Before(points[j].Ts) })
+				series = append(series, seriesEntry{Labels: group.labels, Points: points})
+			}
+			response.Metrics[spec.name] = seriesGroupMetricResp{
+				Metric:  spec.name,
+				Unit:    spec.id.Meta().Unit,
+				StepSec: step,
+				SplitBy: spec.splitBy,
+				Series:  series,
+			}
+		}
+		writeJSON(w, http.StatusOK, response)
 	}
 }
 

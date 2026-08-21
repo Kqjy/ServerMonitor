@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesPoint } from '$lib/api';
-  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, type Range } from '$lib/time';
+  import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, chooseStepSec, isPreset, type Range } from '$lib/time';
+  import { groupPoints, incrementalFromMs, mergePoints } from '$lib/series';
   import { bytes, pct } from '$lib/format';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
   import StatCard from '$lib/components/StatCard.svelte';
@@ -32,15 +33,41 @@
   let timer: ReturnType<typeof setInterval> | null = null;
   let prevRange: Range | null = null;
 
-  async function refresh() {
+  const historySpecs = [
+    { metric: 'mem_used' },
+    { metric: 'mem_cached' },
+    { metric: 'mem_buffers' },
+    { metric: 'mem_free' },
+    { metric: 'swap_used' }
+  ];
+  const liveSpecs = [
+    { metric: 'mem_used' },
+    { metric: 'mem_total' },
+    { metric: 'mem_available' },
+    { metric: 'swap_used' },
+    { metric: 'swap_total' }
+  ];
+  let refreshBusy = false;
+
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -51,29 +78,36 @@
       toMs = b.toMs;
     }
     try {
-      const [u, c, b2, f, su, t, av, st] = await Promise.all([
-        api.series({ host: hostId, metric: 'mem_used', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_cached', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_buffers', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_free', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'swap_used', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_total', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_available', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'swap_total', from: '-2m', step: 10, signal: ac.signal })
+      const [history, live] = await Promise.all([
+        api.seriesGroup({ host: hostId, series: historySpecs, from, to, step: incremental ? loadedStep : undefined, signal: ac.signal }),
+        api.seriesGroup({ host: hostId, series: liveSpecs, from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      loadedStep = u.step_sec;
+      const nextUsed = groupPoints(history, 'mem_used');
+      const nextCached = groupPoints(history, 'mem_cached');
+      const nextBuffers = groupPoints(history, 'mem_buffers');
+      const nextFree = groupPoints(history, 'mem_free');
+      const nextSwapUsed = groupPoints(history, 'swap_used');
+      if (incremental) {
+        used = mergePoints(used, nextUsed, fromMs, toMs, replaceFromMs);
+        cached = mergePoints(cached, nextCached, fromMs, toMs, replaceFromMs);
+        buffers = mergePoints(buffers, nextBuffers, fromMs, toMs, replaceFromMs);
+        free = mergePoints(free, nextFree, fromMs, toMs, replaceFromMs);
+        swapUsed = mergePoints(swapUsed, nextSwapUsed, fromMs, toMs, replaceFromMs);
+      } else {
+        used = nextUsed;
+        cached = nextCached;
+        buffers = nextBuffers;
+        free = nextFree;
+        swapUsed = nextSwapUsed;
+      }
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      used = u.points;
-      cached = c.points;
-      buffers = b2.points;
-      free = f.points;
-      swapUsed = su.points;
-      total = t.points.at(-1)?.v ?? 0;
-      usedNow = u.points.at(-1)?.v ?? 0;
-      availNow = av.points.at(-1)?.v ?? 0;
-      swapTotal = st.points.at(-1)?.v ?? 0;
-      swapUsedNow = su.points.at(-1)?.v ?? 0;
+      total = groupPoints(live, 'mem_total').at(-1)?.v ?? 0;
+      usedNow = groupPoints(live, 'mem_used').at(-1)?.v ?? 0;
+      availNow = groupPoints(live, 'mem_available').at(-1)?.v ?? 0;
+      swapTotal = groupPoints(live, 'swap_total').at(-1)?.v ?? 0;
+      swapUsedNow = groupPoints(live, 'swap_used').at(-1)?.v ?? 0;
       error = null;
       loading = false;
       masking = false;
@@ -83,6 +117,11 @@
       error = (e as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -105,7 +144,7 @@
     untrack(() => refresh());
   });
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 10_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 10_000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);

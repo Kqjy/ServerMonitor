@@ -2,6 +2,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import { api, type SeriesPoint, type SeriesEntry } from '$lib/api';
   import { rangeBoundsMs, rangeToFrom, rangeToTo, rangeEquals, rangeMs, isPreset, chooseStepSec, type Range } from '$lib/time';
+  import { groupPoints, groupSeries, incrementalFromMs, mergePoints, mergeSeries } from '$lib/series';
   import { pct, bytes, dur } from '$lib/format';
   import { subscribeHost, appendLive } from '$lib/sse';
   import MultiChart, { type ChartZoom } from '$lib/components/MultiChart.svelte';
@@ -44,15 +45,50 @@
   let unsub: (() => void) | null = null;
   let prevRange: Range | null = null;
 
-  async function refresh() {
+  const historySpecs = [
+    { metric: 'cpu_total_pct' },
+    { metric: 'cpu_user_pct' },
+    { metric: 'cpu_system_pct' },
+    { metric: 'cpu_iowait_pct' },
+    { metric: 'cpu_steal_pct' },
+    { metric: 'cpu_core_pct', splitBy: 'core' },
+    { metric: 'load_avg_1' },
+    { metric: 'load_avg_5' },
+    { metric: 'load_avg_15' },
+    { metric: 'mem_used_pct' }
+  ];
+  const liveSpecs = [
+    { metric: 'mem_used' },
+    { metric: 'mem_total' },
+    { metric: 'load_avg_1' },
+    { metric: 'load_avg_5' },
+    { metric: 'load_avg_15' },
+    { metric: 'uptime_sec' },
+    { metric: 'cpu_iowait_pct' },
+    { metric: 'cpu_steal_pct' },
+    { metric: 'cpu_freq_mhz' }
+  ];
+  let refreshBusy = false;
+
+  async function refresh(incremental = false) {
+    const zoomed = chartZoom;
+    if (incremental && (refreshBusy || zoomed !== null || !isPreset(range) || loadedStep <= 0)) return;
     const gen = ++refreshGen;
     inflight?.abort();
     const ac = new AbortController();
     inflight = ac;
-    const zoomed = chartZoom;
+    refreshBusy = true;
     let from: string;
     let to: string | undefined;
-    if (zoomed) {
+    let replaceFromMs: number | undefined;
+    if (incremental) {
+      const now = Date.now();
+      const b = rangeBoundsMs(range, now);
+      replaceFromMs = Math.max(b.fromMs, incrementalFromMs(loadedStep, now));
+      from = new Date(replaceFromMs).toISOString();
+      fromMs = b.fromMs;
+      toMs = b.toMs;
+    } else if (zoomed) {
       from = new Date(zoomed.fromMs).toISOString();
       to = new Date(zoomed.toMs).toISOString();
     } else {
@@ -63,53 +99,60 @@
       toMs = b.toMs;
     }
     try {
-      const [c, cu, cs, ci, ck, cores, lc1, lc5, lc15, mp, mu, mt, lo1, lo5, lo15, up, iw, st, fq] = await Promise.all([
-        api.series({ host: hostId, metric: 'cpu_total_pct', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_user_pct', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_system_pct', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_iowait_pct', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_steal_pct', from, to, signal: ac.signal }),
-        api.seriesMulti({ host: hostId, metric: 'cpu_core_pct', splitBy: 'core', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'load_avg_1', from, to, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'load_avg_5', from, to, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'load_avg_15', from, to, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'mem_used_pct', from, to, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_used', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'mem_total', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'load_avg_1', from: '-2m', step: 10, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'load_avg_5', from: '-2m', step: 10, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'load_avg_15', from: '-2m', step: 10, signal: ac.signal }).catch(() => null),
-        api.series({ host: hostId, metric: 'uptime_sec', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_iowait_pct', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_steal_pct', from: '-2m', step: 10, signal: ac.signal }),
-        api.series({ host: hostId, metric: 'cpu_freq_mhz', from: '-2m', step: 10, signal: ac.signal })
+      const [history, live] = await Promise.all([
+        api.seriesGroup({ host: hostId, series: historySpecs, from, to, step: incremental ? loadedStep : undefined, signal: ac.signal }),
+        api.seriesGroup({ host: hostId, series: liveSpecs, from: '-2m', step: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
-      loadedStep = c.step_sec;
+      const nextCpu = groupPoints(history, 'cpu_total_pct');
+      const nextCPUUser = groupPoints(history, 'cpu_user_pct');
+      const nextCPUSystem = groupPoints(history, 'cpu_system_pct');
+      const nextCPUIOWait = groupPoints(history, 'cpu_iowait_pct');
+      const nextCPUSteal = groupPoints(history, 'cpu_steal_pct');
+      const nextCores = groupSeries(history, 'cpu_core_pct');
+      const nextLoad1 = groupPoints(history, 'load_avg_1');
+      const nextLoad5 = groupPoints(history, 'load_avg_5');
+      const nextLoad15 = groupPoints(history, 'load_avg_15');
+      const nextMemPct = groupPoints(history, 'mem_used_pct');
+      if (incremental) {
+        cpu = mergePoints(cpu, nextCpu, fromMs, toMs, replaceFromMs);
+        cpuUser = mergePoints(cpuUser, nextCPUUser, fromMs, toMs, replaceFromMs);
+        cpuSystem = mergePoints(cpuSystem, nextCPUSystem, fromMs, toMs, replaceFromMs);
+        cpuIowait = mergePoints(cpuIowait, nextCPUIOWait, fromMs, toMs, replaceFromMs);
+        cpuSteal = mergePoints(cpuSteal, nextCPUSteal, fromMs, toMs, replaceFromMs);
+        cpuCores = mergeSeries(cpuCores, nextCores, fromMs, toMs, 'core', replaceFromMs);
+        load1Series = mergePoints(load1Series, nextLoad1, fromMs, toMs, replaceFromMs);
+        load5Series = mergePoints(load5Series, nextLoad5, fromMs, toMs, replaceFromMs);
+        load15Series = mergePoints(load15Series, nextLoad15, fromMs, toMs, replaceFromMs);
+        memPct = mergePoints(memPct, nextMemPct, fromMs, toMs, replaceFromMs);
+      } else {
+        cpu = nextCpu;
+        cpuUser = nextCPUUser;
+        cpuSystem = nextCPUSystem;
+        cpuIowait = nextCPUIOWait;
+        cpuSteal = nextCPUSteal;
+        cpuCores = nextCores;
+        load1Series = nextLoad1;
+        load5Series = nextLoad5;
+        load15Series = nextLoad15;
+        memPct = nextMemPct;
+      }
+      loadedStep = history.step_sec;
       zoomFetched = zoomed !== null;
-      cpu = c.points;
-      cpuUser = cu.points;
-      cpuSystem = cs.points;
-      cpuIowait = ci.points;
-      cpuSteal = ck.points;
-      cpuCores = (cores.series ?? []).slice().sort((a, b2) => {
+      cpuCores = cpuCores.slice().sort((a, b2) => {
         const ai = parseInt(a.labels?.core ?? '0', 10);
         const bi = parseInt(b2.labels?.core ?? '0', 10);
         return ai - bi;
       });
-      load1Series = lc1?.points ?? [];
-      load5Series = lc5?.points ?? [];
-      load15Series = lc15?.points ?? [];
-      memPct = mp.points;
-      memUsed = mu.points.at(-1)?.v ?? 0;
-      memTotal = mt.points.at(-1)?.v ?? 0;
-      load1 = lo1?.points.at(-1)?.v ?? 0;
-      load5 = lo5?.points.at(-1)?.v ?? 0;
-      load15 = lo15?.points.at(-1)?.v ?? 0;
-      upSec = up.points.at(-1)?.v ?? 0;
-      iowaitNow = iw.points.at(-1)?.v ?? 0;
-      stealNow = st.points.at(-1)?.v ?? 0;
-      freqNow = fq.points.at(-1)?.v ?? 0;
+      memUsed = groupPoints(live, 'mem_used').at(-1)?.v ?? 0;
+      memTotal = groupPoints(live, 'mem_total').at(-1)?.v ?? 0;
+      load1 = groupPoints(live, 'load_avg_1').at(-1)?.v ?? 0;
+      load5 = groupPoints(live, 'load_avg_5').at(-1)?.v ?? 0;
+      load15 = groupPoints(live, 'load_avg_15').at(-1)?.v ?? 0;
+      upSec = groupPoints(live, 'uptime_sec').at(-1)?.v ?? 0;
+      iowaitNow = groupPoints(live, 'cpu_iowait_pct').at(-1)?.v ?? 0;
+      stealNow = groupPoints(live, 'cpu_steal_pct').at(-1)?.v ?? 0;
+      freqNow = groupPoints(live, 'cpu_freq_mhz').at(-1)?.v ?? 0;
       error = null;
       loading = false;
       masking = false;
@@ -119,6 +162,11 @@
       error = (e as Error).message;
       loading = false;
       masking = false;
+    } finally {
+      if (gen === refreshGen) {
+        refreshBusy = false;
+        if (inflight === ac) inflight = null;
+      }
     }
   }
 
@@ -147,7 +195,7 @@
   });
 
   onMount(() => {
-    timer = setInterval(() => { if (chartZoom === null) refresh(); }, 30_000);
+    timer = setInterval(() => { if (chartZoom === null) void refresh(true); }, 30_000);
     unsub = subscribeHost(
       hostId,
       ['cpu_total_pct', 'cpu_user_pct', 'cpu_system_pct', 'cpu_iowait_pct', 'cpu_steal_pct', 'cpu_core_pct', 'cpu_freq_mhz', 'mem_used_pct', 'mem_used', 'load_avg_1', 'load_avg_5', 'load_avg_15', 'uptime_sec'],

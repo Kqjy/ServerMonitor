@@ -7,9 +7,11 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/host"
 
 	"servermonitor/internal/agent/collectors"
@@ -57,12 +59,36 @@ func (r *Runner) SetInterval(d time.Duration) {
 	}
 }
 
+type cpuIdentity struct {
+	model   string
+	cores   int
+	threads int
+}
+
+var cpuIdent = sync.OnceValue(func() cpuIdentity {
+	var id cpuIdentity
+	if infos, err := cpu.Info(); err == nil && len(infos) > 0 {
+		id.model = strings.TrimSpace(infos[0].ModelName)
+		if id.model == "" {
+			id.model = strings.TrimSpace(infos[0].VendorID)
+		}
+	}
+	if n, err := cpu.Counts(true); err == nil && n > 0 {
+		id.threads = n
+	}
+	if n, err := cpu.Counts(false); err == nil && n > 0 && (id.threads == 0 || n <= id.threads) {
+		id.cores = n
+	}
+	return id
+})
+
 func (r *Runner) HostInfo() wire.HostInfo {
 	hn, _ := os.Hostname()
 	var kernel string
 	if info, err := host.Info(); err == nil {
 		kernel = info.KernelVersion
 	}
+	cpuID := cpuIdent()
 	names := make([]string, 0, len(r.collectors))
 	var statuses map[string]wire.CollectorStatus
 	for _, c := range r.collectors {
@@ -80,6 +106,9 @@ func (r *Runner) HostInfo() wire.HostInfo {
 		OS:                runtime.GOOS,
 		Arch:              runtime.GOARCH,
 		Kernel:            kernel,
+		CPUModel:          cpuID.model,
+		CPUCores:          cpuID.cores,
+		CPUThreads:        cpuID.threads,
 		AgentVersion:      Version,
 		Collectors:        names,
 		CollectorStatus:   statuses,
