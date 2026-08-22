@@ -99,8 +99,42 @@
     return nodes.find((node) => node.host_id === target.node_host_id) ?? null;
   }
 
+  function registeredTarget(repo: string) {
+    return endpoint?.targets.find((candidate) => candidate.host_id === hostId && candidate.name === repo) ?? null;
+  }
+
   function managedDataPath(repo: string): string | null {
-    return endpoint?.targets.find((candidate) => candidate.host_id === hostId && candidate.name === repo)?.data_path.label ?? null;
+    return registeredTarget(repo)?.data_path.label ?? null;
+  }
+
+  type TransportBadge = { text: string; title: string; cls: string };
+
+  function transportBadge(repo: string, agentReportedTunnel: boolean): TransportBadge | null {
+    const target = registeredTarget(repo);
+    switch (target?.data_path.kind) {
+      case 'agent_to_s3_direct':
+        return {
+          text: 's3 direct',
+          title: `Agent uploads straight to ${target.storage_backend.location || 'the object store'} over the S3 API. No WireGuard tunnel, and backup data never passes through ServerMonitor.`,
+          cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+        };
+      case 'agent_to_storage_node':
+        return {
+          text: 'tunnel → node',
+          title: `Backs up through the WireGuard tunnel to the storage node ${target.storage_backend.location || ''}`.trim(),
+          cls: 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+        };
+      case 'agent_via_server_to_s3':
+      case 'agent_to_server_disk':
+      case 'agent_to_server_unavailable':
+        return agentReportedTunnel
+          ? { text: 'tunnel → server', title: 'Backs up through the WireGuard tunnel to the ServerMonitor server', cls: 'border-sky-500/30 bg-sky-500/10 text-sky-300' }
+          : { text: 'server endpoint', title: 'Backs up to the ServerMonitor restic endpoint over HTTPS', cls: 'border-zinc-700 bg-zinc-900 text-zinc-400' };
+      default:
+        return agentReportedTunnel
+          ? { text: 'tunnel', title: 'Backs up through the WireGuard tunnel', cls: 'border-sky-500/30 bg-sky-500/10 text-sky-300' }
+          : null;
+    }
   }
 
   function condenseRepoError(error: string): string | null {
@@ -964,13 +998,14 @@
           </thead>
           <tbody class="divide-y divide-zinc-800/70">
             {#each views as v (v.repo)}
+              {@const badge = transportBadge(v.repo, v.tunnel)}
               <tr class="hover:bg-zinc-900/60">
                 <td class="px-3 sm:px-5 py-2.5">
                   <div class="flex items-center gap-2 min-w-0">
                     <span class="h-1.5 w-1.5 shrink-0 rounded-full {toneDot[v.backupTone]}"></span>
                     <span class="truncate font-mono text-zinc-100">{v.repo}</span>
                     {#if v.engine}<span class="hidden sm:inline shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}</span>{/if}
-                    {#if v.tunnel}<span class="shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}
+                    {#if badge}<span class="shrink-0 rounded border px-1 py-px text-[10px] uppercase tracking-wider {badge.cls}" title={badge.title}>{badge.text}</span>{/if}
                   </div>
                   {#if managedDataPath(v.repo)}<div class="mt-1 pl-3.5 text-[10px] text-zinc-500">{managedDataPath(v.repo)}</div>{/if}
                 </td>
@@ -1001,14 +1036,15 @@
       <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-4 border-t border-zinc-800">
         {#each views as v (v.repo)}
           {@const condensedError = v.error ? condenseRepoError(v.error) : null}
-          {@const storageNode = v.tunnel ? storageNodeForRepo(v.repo) : null}
+          {@const storageNode = storageNodeForRepo(v.repo)}
+          {@const badge = transportBadge(v.repo, v.tunnel)}
           {@const storageNodeAvailability = nodeAvailability(storageNode)}
           <section class="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
             <header class="flex items-center justify-between gap-3">
               <div class="min-w-0">
                 <h3 class="min-w-0 truncate font-mono text-sm text-zinc-100">{v.repo}</h3>
                 {#if managedDataPath(v.repo)}<div class="mt-0.5 text-[10px] text-zinc-500">{managedDataPath(v.repo)}</div>{/if}
-                {#if v.engine}<div class="mt-0.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine}{#if v.tunnel}<span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300" title="Backs up through the WireGuard tunnel to the ServerMonitor server">tunnel</span>{/if}</div>{:else if v.tunnel}<div class="mt-0.5 text-[10px] uppercase tracking-wider"><span class="rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-sky-300">tunnel</span></div>{/if}
+                {#if v.engine || badge}<div class="mt-0.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500">{v.engine ?? ''}{#if badge}<span class="rounded border px-1 py-px {badge.cls}" title={badge.title}>{badge.text}</span>{/if}</div>{/if}
               </div>
               {#if isRunning(v.repo)}
                 <span class="shrink-0 rounded-md border border-emerald-900/60 bg-emerald-950/40 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300">running</span>

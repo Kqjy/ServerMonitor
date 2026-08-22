@@ -2,6 +2,7 @@ package collectors
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -24,17 +25,55 @@ var nvidiaSMICandidates = map[string][]string{
 	},
 }
 
+const (
+	gpuStateUnknown = "unknown"
+	gpuStateOK      = "ok"
+	gpuStateBinary  = "binary_missing"
+	gpuStateFailed  = "query_failed"
+	gpuStateNoDevs  = "no_devices"
+)
+
 type gpuCollector struct {
 	mu        sync.Mutex
 	probed    bool
 	bin       string
 	available bool
+	state     string
+	stateMsg  string
 }
 
 func init() { Register(&gpuCollector{}) }
 
 func (c *gpuCollector) Name() string        { return "gpu" }
 func (c *gpuCollector) Platforms() []string { return []string{"linux", "windows"} }
+
+func (c *gpuCollector) Status() wire.CollectorStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state := c.state
+	if state == "" {
+		state = gpuStateUnknown
+	}
+	return wire.CollectorStatus{State: state, Message: c.stateMsg}
+}
+
+func (c *gpuCollector) setState(state, msg string) {
+	c.mu.Lock()
+	c.state, c.stateMsg = state, msg
+	c.mu.Unlock()
+}
+
+func gpuErrMessage(err error) string {
+	msg := err.Error()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+			msg = stderr
+		}
+	}
+	msg, _, _ = strings.Cut(msg, "\n")
+	return truncateProbeMessage(msg, 200)
+}
 
 func (c *gpuCollector) probe() {
 	c.mu.Lock()
@@ -45,6 +84,7 @@ func (c *gpuCollector) probe() {
 	c.probed = true
 	bin := resolveTrustedBin(nvidiaSMICandidates[runtime.GOOS])
 	if bin == "" {
+		c.state, c.stateMsg = gpuStateBinary, "nvidia-smi not found; no nvidia driver on this host"
 		return
 	}
 	c.bin = bin
@@ -64,6 +104,7 @@ func (c *gpuCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		"--query-gpu="+gpuQuery,
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
+		c.setState(gpuStateFailed, "nvidia-smi query failed: "+gpuErrMessage(err))
 		return nil, nil
 	}
 	now := time.Now()
@@ -91,6 +132,11 @@ func (c *gpuCollector) Collect(ctx context.Context) ([]wire.Point, error) {
 		points = appendIfNum(points, now, metrics.GPUFanPct, labels, fields[7])
 		points = appendIfNum(points, now, metrics.GPUClockMHz, labels, fields[8])
 		points = appendIfNum(points, now, metrics.GPUMemClockMHz, labels, fields[9])
+	}
+	if len(points) == 0 {
+		c.setState(gpuStateNoDevs, "nvidia-smi ran but reported no readable GPUs")
+	} else {
+		c.setState(gpuStateOK, "")
 	}
 	return points, nil
 }

@@ -8,12 +8,14 @@
     type IPBanHostPolicy,
     type IPBanFleet,
     type IPBanEvent,
-    type IPBanSummary
+    type IPBanSummary,
+    type IPBanStats
   } from '$lib/api';
   import { timeAgo, timeUntil, statusFor } from '$lib/format';
   import { announcer } from '$lib/announce.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import StatusDot from '$lib/components/StatusDot.svelte';
+  import MultiChart from '$lib/components/MultiChart.svelte';
 
   type Tone = 'good' | 'warn' | 'bad' | 'info' | 'none';
   const toneText: Record<Tone, string> = {
@@ -42,6 +44,42 @@
   let hosts = $state<IPBanHost[]>([]);
   let fleet = $state<IPBanFleet[]>([]);
   let events = $state<IPBanEvent[]>([]);
+  const evPageSizes = [8, 16, 50];
+  let evPage = $state(0);
+  let evPageSize = $state(evPageSizes[0]);
+  const evPageCount = $derived(Math.max(1, Math.ceil(events.length / evPageSize)));
+  const evPageIndex = $derived(Math.min(Math.max(evPage, 0), evPageCount - 1));
+  const evFrom = $derived(evPageIndex * evPageSize);
+  const evTo = $derived(Math.min(evFrom + evPageSize, events.length));
+  const pagedEvents = $derived(events.slice(evFrom, evTo));
+  let stats = $state<IPBanStats | null>(null);
+  let statsWindow = $state('168h');
+  const statsWindows = [
+    { label: '24 h', value: '24h' },
+    { label: '7 d', value: '168h' },
+    { label: '30 d', value: '720h' },
+    { label: '90 d', value: '2160h' }
+  ];
+  function gotoEvPage(page: number) {
+    evPage = Math.min(Math.max(page, 0), evPageCount - 1);
+  }
+
+  function setEvPageSize(size: number) {
+    evPageSize = size;
+    evPage = 0;
+  }
+
+  const banSeries = $derived(
+    stats
+      ? [
+          { label: 'bans', points: stats.buckets.map((b) => ({ ts: b.time, v: b.bans })) },
+          { label: 'distinct addresses', points: stats.buckets.map((b) => ({ ts: b.time, v: b.distinct_ips })) }
+        ]
+      : []
+  );
+  const statsFromMs = $derived(stats ? new Date(stats.from).getTime() : 0);
+  const statsToMs = $derived(stats ? new Date(stats.to).getTime() : 0);
+  const onceOnlyIPs = $derived(stats ? Math.max(0, stats.distinct_ips - stats.repeat_ips) : 0);
   let settings = $state<IPBanSettings | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -116,11 +154,12 @@
     const ac = new AbortController();
     inflight = ac;
     try {
-      const [sum, hs, fl, ev, st] = await Promise.all([
+      const [sum, hs, fl, ev, stt, st] = await Promise.all([
         api.ipbanSummary({ signal: ac.signal }),
         api.ipbanHosts({ signal: ac.signal }),
         api.ipbanFleet({ signal: ac.signal }),
         api.ipbanEvents({ limit: 100, signal: ac.signal }),
+        api.ipbanStats({ window: statsWindow, top: 12, signal: ac.signal }),
         includeSettings || !settings ? api.ipbanSettings({ signal: ac.signal }) : Promise.resolve(null)
       ]);
       if (gen !== refreshGen) return;
@@ -128,6 +167,7 @@
       hosts = hs;
       fleet = fl;
       events = ev;
+      stats = stt;
       if (st) {
         settings = st;
         if (!formDirty) hydrate(st);
@@ -153,6 +193,23 @@
     if (timer) clearInterval(timer);
     inflight?.abort();
   });
+
+  function setStatsWindow(value: string) {
+    if (statsWindow === value) return;
+    statsWindow = value;
+    stats = null;
+    void refresh();
+  }
+
+  function banOffender(ip: string) {
+    banIP = ip;
+    banError = null;
+    confirmManualBan = true;
+  }
+
+  function windowLabel(value: string): string {
+    return statsWindows.find((w) => w.value === value)?.label ?? value;
+  }
 
   function markDirty() {
     formDirty = true;
@@ -326,10 +383,10 @@
     return '';
   }
 
-  function actionLabel(action: string): { text: string; tone: Tone } {
+  function actionLabel(action: string, enforced: boolean): { text: string; tone: Tone } {
     switch (action) {
       case 'ban':
-        return { text: 'banned', tone: 'bad' };
+        return enforced ? { text: 'banned', tone: 'bad' } : { text: 'would ban', tone: 'info' };
       case 'unban':
         return { text: 'unbanned', tone: 'good' };
       case 'fleet_ban':
@@ -398,6 +455,116 @@
       {#if settings && !settings.enforce && summary.hosts_detecting > 0}
         <div class="px-4 sm:px-5 py-3 border-t border-sky-900/40 bg-sky-950/20 text-xs text-sky-100/90">
           Detection is running in observe mode: bans are recorded so you can review what would be blocked, but nothing is enforced yet. Add your own address to the allowlist below, then turn enforcement on.
+        </div>
+      {/if}
+    </section>
+
+    <section class="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+      <header class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-5 py-3 border-b border-zinc-800">
+        <div>
+          <div class="text-xs uppercase tracking-wider text-zinc-500">Ban activity</div>
+          <p class="mt-0.5 text-[11px] text-zinc-500">Every address the fleet decided to ban, whether or not enforcement applied it.</p>
+        </div>
+        <div class="flex items-center gap-1">
+          {#each statsWindows as w (w.value)}
+            <button
+              type="button"
+              onclick={() => setStatsWindow(w.value)}
+              class="rounded-md border px-2 py-1 text-[11px] {statsWindow === w.value
+                ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
+                : 'border-zinc-800 text-zinc-400 hover:text-zinc-200'}">{w.label}</button>
+          {/each}
+        </div>
+      </header>
+      {#if stats === null}
+        <div class="p-4"><div class="h-40 rounded-lg shimmer"></div></div>
+      {:else}
+        <div class="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 divide-zinc-800 lg:divide-x border-b border-zinc-800">
+          <div class="px-4 sm:px-5 py-3">
+            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Bans issued</div>
+            <div class="mt-1 text-2xl font-semibold text-zinc-100 numeric">{stats.total_bans}</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">{stats.enforced_bans} actually blocked</div>
+          </div>
+          <div class="px-4 sm:px-5 py-3">
+            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Distinct addresses</div>
+            <div class="mt-1 text-2xl font-semibold text-zinc-100 numeric">{stats.distinct_ips}</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">across {stats.hosts_seen} host{stats.hosts_seen === 1 ? '' : 's'}</div>
+          </div>
+          <div class="px-4 sm:px-5 py-3">
+            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Repeat offenders</div>
+            <div class="mt-1 text-2xl font-semibold numeric {stats.repeat_ips > 0 ? 'text-amber-300' : 'text-zinc-100'}">{stats.repeat_ips}</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">banned more than once</div>
+          </div>
+          <div class="px-4 sm:px-5 py-3">
+            <div class="text-[11px] uppercase tracking-wider text-zinc-500">One-off addresses</div>
+            <div class="mt-1 text-2xl font-semibold text-zinc-100 numeric">{onceOnlyIPs}</div>
+            <div class="text-[11px] text-zinc-500 mt-0.5">seen once in {windowLabel(statsWindow)}</div>
+          </div>
+        </div>
+        <div class="px-3 py-3">
+          <MultiChart
+            series={banSeries}
+            fromMs={statsFromMs}
+            toMs={statsToMs}
+            height={180}
+            bars
+            yClampMin={0}
+            yMinSpan={4}
+            format={(v, e = 0) => v.toFixed(e)}
+            emptyText="No bans in this range" />
+        </div>
+        {#if stats.window_clipped}
+          <div class="px-4 sm:px-5 pb-3 text-[11px] text-zinc-500">
+            History only reaches back {Math.round(stats.retention_s / 86400)} days, so this window is not fully populated. Raise RETENTION_IPBAN_EVENTS to keep more.
+          </div>
+        {/if}
+        <div class="border-t border-zinc-800">
+          <div class="px-4 sm:px-5 py-2.5 text-[11px] uppercase tracking-wider text-zinc-500">Top offenders</div>
+          {#if stats.offenders.length === 0}
+            <div class="px-5 pb-5 text-sm text-zinc-500">No bans recorded in this window.</div>
+          {:else}
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead class="text-[10px] uppercase tracking-wider text-zinc-500 bg-zinc-900/60">
+                  <tr>
+                    <th class="text-left font-medium px-5 py-2.5">Address</th>
+                    <th class="text-right font-medium px-3 py-2.5">Bans</th>
+                    <th class="text-right font-medium px-3 py-2.5 hidden sm:table-cell">Hosts</th>
+                    <th class="text-left font-medium px-3 py-2.5 hidden md:table-cell">Last user</th>
+                    <th class="text-left font-medium px-3 py-2.5 hidden sm:table-cell">First seen</th>
+                    <th class="text-left font-medium px-3 py-2.5">Last seen</th>
+                    <th class="text-right font-medium px-5 py-2.5"></th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-800/70">
+                  {#each stats.offenders as o (o.ip)}
+                    <tr class="hover:bg-zinc-900/60">
+                      <td class="px-5 py-2.5 font-mono text-zinc-200">
+                        {o.ip}
+                        {#if o.fleet}<span class="ml-2 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300">fleet</span>{/if}
+                        {#if o.active}<span class="ml-2 rounded border border-zinc-700 bg-zinc-800/60 px-1 py-px text-[10px] uppercase tracking-wider text-zinc-400">active</span>{/if}
+                      </td>
+                      <td class="px-3 py-2.5 text-right numeric {o.bans > 1 ? 'text-amber-300' : 'text-zinc-300'}">{o.bans}</td>
+                      <td class="px-3 py-2.5 text-right numeric text-zinc-300 hidden sm:table-cell">{o.hosts}</td>
+                      <td class="px-3 py-2.5 font-mono text-xs text-zinc-400 hidden md:table-cell">{o.user || '—'}</td>
+                      <td class="px-3 py-2.5 text-zinc-400 numeric hidden sm:table-cell" title={absTime(o.first_seen)}>{timeAgo(o.first_seen)}</td>
+                      <td class="px-3 py-2.5 text-zinc-400 numeric" title={absTime(o.last_seen)}>{timeAgo(o.last_seen)}</td>
+                      <td class="px-5 py-2.5 text-right">
+                        {#if o.fleet}
+                          <span class="text-[11px] text-zinc-600">on blocklist</span>
+                        {:else}
+                          <button
+                            type="button"
+                            onclick={() => banOffender(o.ip)}
+                            class="text-[11px] px-2 py-1 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">Ban fleet-wide</button>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
         </div>
       {/if}
     </section>
@@ -746,17 +913,29 @@
       </section>
 
       <section>
-        <div>
-          <h2 class="text-sm font-medium text-zinc-100">Recent activity</h2>
-          <p class="mt-0.5 text-xs text-zinc-500">Bans, unbans and fleet changes across all hosts.</p>
+        <div class="flex flex-wrap items-end justify-between gap-2">
+          <div>
+            <h2 class="text-sm font-medium text-zinc-100">Recent activity</h2>
+            <p class="mt-0.5 text-xs text-zinc-500">Bans, unbans and fleet changes across all hosts.</p>
+          </div>
+          <a
+            href={api.ipbanEventsCsvUrl()}
+            download
+            class="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 px-2.5 py-1.5 text-[11px] text-zinc-300 hover:text-zinc-100 hover:border-zinc-700"
+            title="Download the full ban event history as CSV">
+            <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
+              <path d="M6 1.5v6m0 0L3.75 5.25M6 7.5l2.25-2.25M2 9.5h8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>CSV</span>
+          </a>
         </div>
         <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
           {#if events.length === 0}
             <div class="px-5 py-6 text-sm text-zinc-500">Nothing recorded yet.</div>
           {:else}
             <ul class="divide-y divide-zinc-800/70">
-              {#each events as ev (ev.id)}
-                {@const a = actionLabel(ev.action)}
+              {#each pagedEvents as ev (ev.id)}
+                {@const a = actionLabel(ev.action, ev.enforced)}
                 <li class="px-4 sm:px-5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
                   <span class="text-[11px] text-zinc-500 numeric w-24 shrink-0" title={absTime(ev.time)}>{timeAgo(ev.time)}</span>
                   <span class="rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {tonePill[a.tone]}">{a.text}</span>
@@ -768,7 +947,7 @@
                   {/if}
                   <span class="text-xs text-zinc-500">
                     {#if ev.action === 'ban'}
-                      {ev.failures} failures{ev.user ? ` · last user ${ev.user}` : ''}{ev.enforced ? '' : ' · observed only'}
+                      {ev.failures} failures{ev.user ? ` · last user ${ev.user}` : ''}
                     {:else if ev.actor}
                       by {ev.actor}
                     {/if}
@@ -777,6 +956,47 @@
                 </li>
               {/each}
             </ul>
+            {#if events.length > evPageSizes[0]}
+              <div class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-5 py-2.5 border-t border-zinc-800">
+                <div class="flex items-center gap-2">
+                  <div class="text-[10px] uppercase tracking-wider text-zinc-500">Rows</div>
+                  <div class="flex items-center gap-0.5">
+                    {#each evPageSizes as size (size)}
+                      <button
+                        type="button"
+                        onclick={() => setEvPageSize(size)}
+                        aria-pressed={evPageSize === size}
+                        class="px-2 py-1 rounded-md text-xs font-medium numeric transition-colors {evPageSize === size ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">{size}</button>
+                    {/each}
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="text-xs text-zinc-500 numeric">{evFrom + 1}–{evTo} of {events.length} · page {evPageIndex + 1} of {evPageCount}</div>
+                  <button
+                    type="button"
+                    onclick={() => gotoEvPage(evPageIndex - 1)}
+                    disabled={evPageIndex === 0}
+                    aria-label="Newer events"
+                    title="Newer"
+                    class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
+                    <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
+                      <path d="M8 2.25 4.25 6 8 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => gotoEvPage(evPageIndex + 1)}
+                    disabled={evPageIndex >= evPageCount - 1}
+                    aria-label="Older events"
+                    title="Older"
+                    class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
+                    <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
+                      <path d="M4 2.25 7.75 6 4 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            {/if}
           {/if}
         </div>
       </section>

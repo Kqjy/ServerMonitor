@@ -1,0 +1,67 @@
+services:
+  sm-agent:
+    image: ${SM_AGENT_IMAGE:-servermonitor-agent:local}
+    build:
+      context: ..
+      dockerfile: deploy/agent.Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 35s
+    pid: host
+    network_mode: host
+    uts: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+      - SYS_PTRACE
+      - SYS_CHROOT
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    command: ["--config", "/var/lib/servermonitor/agent.toml"]
+    environment:
+      SM_SERVER_URL: ${SM_SERVER_URL:?set SM_SERVER_URL in .env.agent}
+      SM_TOKEN: ${SM_TOKEN:?set SM_TOKEN in .env.agent}
+      SM_INTERVAL_S: ${SM_INTERVAL_S:-}
+      SM_SMART_SAMPLE_S: ${SM_SMART_SAMPLE_S:-}
+      SM_SPOOL_PATH: /var/lib/servermonitor/spool.db
+      SM_HOST_FS_ROOT: /host
+      SM_AUTO_UPGRADE: "false"
+      SM_EXTERNALLY_MANAGED: "true"
+      TZ: ${TZ:-UTC}
+      SM_ENABLE_BACKUP: ${SM_ENABLE_BACKUP:-}
+      SM_BACKUP_CONFIG: /tmp/backup/backup.toml
+      SM_BACKUP_STATUS_PATH: /tmp/backup-status.json
+      SM_BACKUP_REPOS: ${SM_BACKUP_REPOS:-}
+      SM_BACKUP_REPO_NAMES: ${SM_BACKUP_REPO_NAMES:-}
+      SM_BACKUP_PATHS: ${SM_BACKUP_PATHS:-}
+      SM_BACKUP_EXCLUDES: ${SM_BACKUP_EXCLUDES:-}
+      SM_BACKUP_ONE_FILE_SYSTEM: ${SM_BACKUP_ONE_FILE_SYSTEM:-}
+      SM_BACKUP_TIME: ${SM_BACKUP_TIME:-}
+      SM_BACKUP_PRUNE_MODE: ${SM_BACKUP_PRUNE_MODE:-}
+      SM_BACKUP_REST_USERNAME: ${SM_BACKUP_REST_USERNAME:-}
+      SM_BACKUP_REST_PASSWORD: ${SM_BACKUP_REST_PASSWORD:-}
+      SM_BACKUP_S3_REGION: ${SM_BACKUP_S3_REGION:-}
+      SM_BACKUP_S3_PATH_STYLE: ${SM_BACKUP_S3_PATH_STYLE:-}
+      SM_BACKUP_S3_ACCESS_KEY_ID: ${SM_BACKUP_S3_ACCESS_KEY_ID:-}
+      SM_BACKUP_S3_SECRET_ACCESS_KEY: ${SM_BACKUP_S3_SECRET_ACCESS_KEY:-}
+      SM_BACKUP_S3_SESSION_TOKEN: ${SM_BACKUP_S3_SESSION_TOKEN:-}
+      SM_BACKUP_SCHEDULE: ${SM_BACKUP_SCHEDULE:-}
+      SM_BACKUP_CHECK_TIME: ${SM_BACKUP_CHECK_TIME:-}
+      SM_BACKUP_CHECK_WEEKDAY: ${SM_BACKUP_CHECK_WEEKDAY:-}
+      SM_BACKUP_CHECK_READ_DATA_SUBSET: ${SM_BACKUP_CHECK_READ_DATA_SUBSET:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+      - sm-agent-state:/var/lib/servermonitor
+      - sm-agent-state:/tmp
+      - sm-agent-state:/host/tmp
+
+volumes:
+  sm-agent-state:

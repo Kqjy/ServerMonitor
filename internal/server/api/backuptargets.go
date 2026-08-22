@@ -67,12 +67,30 @@ type backupDataPathView struct {
 }
 
 type backupTargetsResponse struct {
-	Configured   bool                    `json:"configured"`
-	Storage      *restserver.BackendInfo `json:"storage,omitempty"`
-	TLS          BackupTLSInfo           `json:"tls"`
-	Targets      []backupTargetView      `json:"targets"`
-	Repositories []backupTargetView      `json:"repositories"`
-	Destinations []backupDestinationView `json:"destinations"`
+	Configured     bool                     `json:"configured"`
+	Storage        *restserver.BackendInfo  `json:"storage,omitempty"`
+	TLS            BackupTLSInfo            `json:"tls"`
+	ManagedSecrets backupManagedSecretsView `json:"managed_secrets"`
+	Targets        []backupTargetView       `json:"targets"`
+	Repositories   []backupTargetView       `json:"repositories"`
+	Destinations   []backupDestinationView  `json:"destinations"`
+}
+
+type backupManagedSecretsView struct {
+	KeyConfigured  bool   `json:"key_configured"`
+	SecureDelivery bool   `json:"secure_delivery"`
+	Blocker        string `json:"blocker,omitempty"`
+}
+
+func managedSecretsView(targets *storage.BackupTargets, secureDelivery bool) backupManagedSecretsView {
+	view := backupManagedSecretsView{KeyConfigured: targets.SecretsConfigured(), SecureDelivery: secureDelivery}
+	switch {
+	case !view.KeyConfigured:
+		view.Blocker = "BACKUP_SECRETS_KEY is not set on the server, so S3 credentials cannot be stored encrypted."
+	case !view.SecureDelivery:
+		view.Blocker = "Direct S3 credentials are delivered to agents over HTTPS only; this server is reachable over plain HTTP."
+	}
+	return view
 }
 
 var backupTargetNameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
@@ -127,9 +145,9 @@ func toBackupTargetView(t storage.BackupTarget, server *restserver.Server) backu
 	return view
 }
 
-func listBackupTargetsHandler(targets *storage.BackupTargets, server *restserver.Server, tlsInfo BackupTLSInfo) http.HandlerFunc {
+func listBackupTargetsHandler(targets *storage.BackupTargets, server *restserver.Server, tlsInfo BackupTLSInfo, secureSecretDelivery bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		resp := backupTargetsResponse{Configured: server != nil, TLS: tlsInfo, Targets: []backupTargetView{}, Repositories: []backupTargetView{}, Destinations: []backupDestinationView{}}
+		resp := backupTargetsResponse{Configured: server != nil, TLS: tlsInfo, ManagedSecrets: managedSecretsView(targets, secureSecretDelivery), Targets: []backupTargetView{}, Repositories: []backupTargetView{}, Destinations: []backupDestinationView{}}
 		if server != nil {
 			backend := server.Backend()
 			resp.Storage = &backend
@@ -214,6 +232,15 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 			host, err := hosts.Get(r.Context(), *req.HostID)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "host_id does not refer to an active host")
+				return
+			}
+			collides, err := targets.HostReportsRepo(r.Context(), host.ID, name)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if collides {
+				writeError(w, http.StatusConflict, "this host already backs up a repository with that name; the agent refuses a configuration holding two repositories of the same name, which would stop every backup on the host. Pick another name, or remove the existing repository from the host's backup.toml first")
 				return
 			}
 			prefix, err := storage.ExpandDirectPrefix(destination.PrefixTemplate, host.ID, host.Hostname, name)

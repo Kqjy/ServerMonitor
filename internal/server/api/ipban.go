@@ -227,12 +227,79 @@ func ipbanEventsHandler(svc *ipban.Service) http.HandlerFunc {
 			}
 			f.Before = t
 		}
+		if strings.EqualFold(q.Get("format"), "csv") {
+			f.Export = true
+			events, err := svc.Events(r.Context(), f)
+			if err != nil {
+				writeIPBanError(w, err)
+				return
+			}
+			writeIPBanEventsCSV(w, events)
+			return
+		}
 		events, err := svc.Events(r.Context(), f)
 		if err != nil {
 			writeIPBanError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, events)
+	}
+}
+
+func writeIPBanEventsCSV(w http.ResponseWriter, events []ipban.Event) {
+	filename := "ipban-events-" + time.Now().UTC().Format("20060102-150405") + ".csv"
+	cw := setCSVHeadersFilename(w, filename)
+	_ = cw.Write([]string{"time", "action", "ip", "host", "enforced", "failures", "user", "expires_at", "repeat_count", "source", "actor", "note"})
+	for _, e := range events {
+		expires := ""
+		if e.ExpiresAt != nil {
+			expires = e.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		_ = cw.Write([]string{
+			e.Time.UTC().Format(time.RFC3339),
+			csvSafe(e.Action),
+			csvSafe(e.IP),
+			csvSafe(e.Hostname),
+			strconv.FormatBool(e.Enforced),
+			strconv.Itoa(e.Failures),
+			csvSafe(e.User),
+			expires,
+			strconv.Itoa(e.RepeatCount),
+			csvSafe(e.Source),
+			csvSafe(e.Actor),
+			csvSafe(e.Note),
+		})
+	}
+	cw.Flush()
+}
+
+func ipbanStatsHandler(svc *ipban.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		var f ipban.StatsFilter
+		if h := q.Get("host"); h != "" {
+			id, err := strconv.ParseInt(h, 10, 64)
+			if err != nil || id <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid host id")
+				return
+			}
+			f.HostID = id
+		}
+		if raw := q.Get("window"); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil || d <= 0 {
+				writeError(w, http.StatusBadRequest, "window must be a positive Go duration such as 168h")
+				return
+			}
+			f.Window = d
+		}
+		f.Top, _ = strconv.Atoi(q.Get("top"))
+		stats, err := svc.Stats(r.Context(), f)
+		if err != nil {
+			writeIPBanError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, stats)
 	}
 }
 

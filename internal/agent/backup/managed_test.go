@@ -141,6 +141,40 @@ func TestHasManagedBackupRepositoriesRequiresAnAssignment(t *testing.T) {
 	}
 }
 
+func TestLoadSkipsManagedRepositoryCollidingWithALocalRepo(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "backup-status.json")
+	if err := ApplyManagedBackupConfig(statusPath, wire.ManagedBackupConfig{
+		Version: 1,
+		Repositories: []wire.ManagedBackupRepository{{
+			ID: 4, Name: "offsite", URL: "s3:https://s3.example.test/bucket/hosts/4",
+			AccessKeyID: "key", SecretAccessKey: "secret",
+		}},
+	}); err != nil {
+		t.Fatalf("ApplyManagedBackupConfig: %v", err)
+	}
+	keyPath := filepath.Join(dir, "backup.key")
+	if err := os.WriteFile(keyPath, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localURL := "rest:https://user:pass@backup.example.test/offsite"
+	configBody := "status_path = " + q(filepath.ToSlash(statusPath)) + "\npaths = [\"/etc\"]\n\n[[repo]]\n  name = \"offsite\"\n  url = " + q(localURL) + "\n  password_file = " + q(filepath.ToSlash(keyPath)) + "\n"
+	configPath := filepath.Join(dir, "backup.toml")
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("a colliding managed assignment must not break the whole config: %v", err)
+	}
+	if len(cfg.Repos) != 1 || cfg.Repos[0].URL != localURL {
+		t.Fatalf("repos = %+v", cfg.Repos)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "offsite") {
+		t.Fatalf("warnings = %+v", cfg.Warnings)
+	}
+}
+
 func TestLoadAllowsEmptyManagedAssignmentAfterRevocation(t *testing.T) {
 	dir := t.TempDir()
 	statusPath := filepath.Join(dir, "backup-status.json")

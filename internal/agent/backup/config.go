@@ -23,6 +23,7 @@ type Config struct {
 	Repos         []Repo
 	Tunnel        *TunnelSettings
 	Schedule      *ScheduleSettings
+	Warnings      []string
 }
 
 type ScheduleSettings struct {
@@ -262,7 +263,17 @@ func loadConfig(path string, allowUnenrolledTunnel bool) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("load centrally managed repositories: %w", err)
 	}
-	cfg.Repos = append(cfg.Repos, managedRepos...)
+	local := make(map[string]bool, len(cfg.Repos))
+	for _, repo := range cfg.Repos {
+		local[repo.Name] = true
+	}
+	for _, repo := range managedRepos {
+		if local[repo.Name] {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("centrally managed repository %q is skipped: %s already defines a repository with that name; rename one of them, or remove the local [[repo]] block to adopt the managed one", repo.Name, path))
+			continue
+		}
+		cfg.Repos = append(cfg.Repos, repo)
+	}
 	if err := cfg.validate(allowUnenrolledTunnel); err != nil {
 		return Config{}, fmt.Errorf("validate backup config %s: %w", path, err)
 	}

@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.5.0 .
-docker push registry.example.com/servermonitor-agent:0.5.0
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.5.1 .
+docker push registry.example.com/servermonitor-agent:0.5.1
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.5.0
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.5.1
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -160,7 +160,7 @@ For a centrally assigned **Direct external S3** repository, set `SM_ENABLE_BACKU
 
 **What the recipe already provides for this** (don't remove): `uts: host` (so restic records the host's hostname — needed for restic's `host,paths` retention grouping), `cap_add: SYS_CHROOT`, and the `sm-agent-state` volume mounted at `/var/lib/servermonitor`, `/tmp`, and `/host/tmp`.
 
-**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. The `/tmp` + `/host/tmp` aliases give restic the same state paths before and after it chroots into `/host`; using the already-existing host `/tmp` mountpoint also avoids runc having to create a directory beneath the read-only `/host` bind. Each backup therefore records host-native paths (`/etc`, not `/host/etc`) and is interchangeable with a host-installed agent's snapshots. Host `/tmp` is hidden from this container and cannot be selected as a container-managed backup path. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot). To run the first backup immediately instead of waiting for `SM_BACKUP_TIME`:
+**How it works.** The agent generates `backup.key` **once** (never regenerated), writes `backup.toml` from the env on every boot, and stages the image's pinned restic into the volume. The environment is authoritative: dropping a repository from `SM_BACKUP_REPOS` removes it from the generated config at the next `up -d`, and blanking `SM_BACKUP_REPOS` entirely leaves a config with no local repositories — only centrally assigned ones remain. That is how you retire a dead storage node without editing files inside the volume; a stale `tunnel:` entry left behind would otherwise fail enrollment and abort the whole run before any other repository executes. With `SM_BACKUP_REPOS` blank **and** no central assignment there is nothing to back up, so provisioning fails and scheduled backups stay off for that boot; unset `SM_ENABLE_BACKUP` instead if that is what you meant. `backup.key` and the endpoint credentials file are never touched by a re-render. The `/tmp` + `/host/tmp` aliases give restic the same state paths before and after it chroots into `/host`; using the already-existing host `/tmp` mountpoint also avoids runc having to create a directory beneath the read-only `/host` bind. Each backup therefore records host-native paths (`/etc`, not `/host/etc`) and is interchangeable with a host-installed agent's snapshots. Host `/tmp` is hidden from this container and cannot be selected as a container-managed backup path. The schedule lives in the agent (daily backup + weekly `restic check`) — no systemd needed — and survives restarts (missed runs are caught up on boot). To run the first backup immediately instead of waiting for `SM_BACKUP_TIME`:
 
 ```bash
 docker compose -f deploy/docker-compose.agent.yml exec sm-agent \

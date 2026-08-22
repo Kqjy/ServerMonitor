@@ -137,6 +137,7 @@ type EventFilter struct {
 	IP     string
 	Limit  int
 	Before time.Time
+	Export bool
 }
 
 type Summary struct {
@@ -959,9 +960,13 @@ func (s *Service) HostUnban(ctx context.Context, hostID int64, rawIP, actor stri
 	return nil
 }
 
+const maxEventExport = 100000
+
 func (s *Service) Events(ctx context.Context, f EventFilter) ([]Event, error) {
 	limit := f.Limit
-	if limit <= 0 || limit > 1000 {
+	if f.Export {
+		limit = maxEventExport
+	} else if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	var ipFilter *string
@@ -1096,4 +1101,173 @@ func matchesAny(ip netip.Addr, prefixes []netip.Prefix) bool {
 		}
 	}
 	return false
+}
+
+type StatsFilter struct {
+	HostID int64
+	Window time.Duration
+	Top    int
+}
+
+type StatsBucket struct {
+	Time        time.Time `json:"time"`
+	Bans        int       `json:"bans"`
+	DistinctIPs int       `json:"distinct_ips"`
+}
+
+type Offender struct {
+	IP           string    `json:"ip"`
+	Bans         int       `json:"bans"`
+	Hosts        int       `json:"hosts"`
+	Failures     int       `json:"failures"`
+	User         string    `json:"user,omitempty"`
+	FirstSeen    time.Time `json:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"`
+	EnforcedBans int       `json:"enforced_bans"`
+	Fleet        bool      `json:"fleet"`
+	Active       bool      `json:"active"`
+}
+
+type Stats struct {
+	From          time.Time     `json:"from"`
+	To            time.Time     `json:"to"`
+	BucketS       int           `json:"bucket_s"`
+	RetentionS    int           `json:"retention_s"`
+	WindowClipped bool          `json:"window_clipped"`
+	Buckets       []StatsBucket `json:"buckets"`
+	TotalBans     int           `json:"total_bans"`
+	EnforcedBans  int           `json:"enforced_bans"`
+	DistinctIPs   int           `json:"distinct_ips"`
+	RepeatIPs     int           `json:"repeat_ips"`
+	HostsSeen     int           `json:"hosts_seen"`
+	Offenders     []Offender    `json:"offenders"`
+}
+
+func statsBucket(window time.Duration) time.Duration {
+	switch {
+	case window <= 6*time.Hour:
+		return 10 * time.Minute
+	case window <= 48*time.Hour:
+		return time.Hour
+	case window <= 14*24*time.Hour:
+		return 6 * time.Hour
+	default:
+		return 24 * time.Hour
+	}
+}
+
+func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
+	window := f.Window
+	if window <= 0 {
+		window = 7 * 24 * time.Hour
+	}
+	if window > 365*24*time.Hour {
+		window = 365 * 24 * time.Hour
+	}
+	top := f.Top
+	if top <= 0 || top > 200 {
+		top = 20
+	}
+	bucket := statsBucket(window)
+	to := time.Now().UTC()
+	from := to.Add(-window)
+	out := Stats{
+		From:          from,
+		To:            to,
+		BucketS:       int(bucket / time.Second),
+		RetentionS:    int(s.eventRetention / time.Second),
+		WindowClipped: s.eventRetention > 0 && window > s.eventRetention,
+		Buckets:       []StatsBucket{},
+		Offenders:     []Offender{},
+	}
+	bucketArg := fmt.Sprintf("%d seconds", int(bucket/time.Second))
+
+	rows, err := s.pool.Query(ctx, `
+		WITH slots AS (
+			SELECT generate_series(
+				time_bucket($2::interval, $3::timestamptz),
+				time_bucket($2::interval, now()),
+				$2::interval) AS slot
+		)
+		SELECT slots.slot,
+		       COUNT(e.id),
+		       COUNT(DISTINCT e.ip)
+		FROM slots
+		LEFT JOIN ipban_events e
+		  ON time_bucket($2::interval, e.time) = slots.slot
+		 AND e.action = 'ban'
+		 AND e.time >= $3::timestamptz
+		 AND ($1 = 0 OR e.host_id = $1)
+		GROUP BY slots.slot
+		ORDER BY slots.slot
+	`, f.HostID, bucketArg, from)
+	if err != nil {
+		return Stats{}, err
+	}
+	for rows.Next() {
+		var b StatsBucket
+		if err := rows.Scan(&b.Time, &b.Bans, &b.DistinctIPs); err != nil {
+			rows.Close()
+			return Stats{}, err
+		}
+		out.Buckets = append(out.Buckets, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Stats{}, err
+	}
+
+	err = s.pool.QueryRow(ctx, `
+		WITH banned AS (
+			SELECT ip, host_id, enforced
+			FROM ipban_events
+			WHERE action = 'ban' AND time >= $2::timestamptz AND ($1 = 0 OR host_id = $1)
+		)
+		SELECT (SELECT COUNT(*) FROM banned),
+		       (SELECT COUNT(*) FROM banned WHERE enforced),
+		       (SELECT COUNT(DISTINCT ip) FROM banned),
+		       (SELECT COUNT(DISTINCT host_id) FROM banned WHERE host_id IS NOT NULL),
+		       (SELECT COUNT(*) FROM (SELECT ip FROM banned GROUP BY ip HAVING COUNT(*) > 1) r)
+	`, f.HostID, from).Scan(&out.TotalBans, &out.EnforcedBans, &out.DistinctIPs, &out.HostsSeen, &out.RepeatIPs)
+	if err != nil {
+		return Stats{}, err
+	}
+
+	orows, err := s.pool.Query(ctx, `
+		SELECT e.ip,
+		       COUNT(*),
+		       COUNT(DISTINCT e.host_id),
+		       COALESCE(MAX(e.failures), 0),
+		       MIN(e.time),
+		       MAX(e.time),
+		       COUNT(*) FILTER (WHERE e.enforced),
+		       COALESCE((SELECT x.user_sample FROM ipban_events x
+		                 WHERE x.ip = e.ip AND x.action = 'ban' AND x.user_sample <> ''
+		                   AND ($1 = 0 OR x.host_id = $1)
+		                 ORDER BY x.time DESC LIMIT 1), ''),
+		       EXISTS (SELECT 1 FROM ipban_fleet f WHERE f.ip = e.ip AND f.expires_at > now()),
+		       EXISTS (SELECT 1 FROM ipban_active a WHERE a.ip = e.ip AND a.expires_at > now() AND ($1 = 0 OR a.host_id = $1))
+		FROM ipban_events e
+		WHERE e.action = 'ban' AND e.time >= $2::timestamptz AND ($1 = 0 OR e.host_id = $1)
+		GROUP BY e.ip
+		ORDER BY COUNT(*) DESC, MAX(e.time) DESC
+		LIMIT $3
+	`, f.HostID, from, top)
+	if err != nil {
+		return Stats{}, err
+	}
+	defer orows.Close()
+	for orows.Next() {
+		var o Offender
+		var ip netip.Addr
+		if err := orows.Scan(&ip, &o.Bans, &o.Hosts, &o.Failures, &o.FirstSeen, &o.LastSeen, &o.EnforcedBans, &o.User, &o.Fleet, &o.Active); err != nil {
+			return Stats{}, err
+		}
+		o.IP = ip.Unmap().String()
+		out.Offenders = append(out.Offenders, o)
+	}
+	if err := orows.Err(); err != nil {
+		return Stats{}, err
+	}
+	return out, nil
 }

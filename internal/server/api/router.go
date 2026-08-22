@@ -172,17 +172,18 @@ func New(d Deps) *Router {
 					r.Delete("/ipban/fleet/{ip}", ipbanFleetUnbanHandler(d.IPBan))
 					r.Post("/ipban/unban", ipbanHostUnbanHandler(d.IPBan))
 					r.Get("/ipban/events", ipbanEventsHandler(d.IPBan))
+					r.Get("/ipban/stats", ipbanStatsHandler(d.IPBan))
 				}
 
 				if d.BackupTargets != nil {
-					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
+					r.Get("/backup-targets", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS, d.BackupSecretsSecure))
 					r.Post("/backup-targets", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes, d.Hosts, d.BackupSecretsSecure))
 					r.Patch("/backup-targets/{id}", updateBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))
 					r.Post("/backup-targets/{id}/measure", measureBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-targets/{id}/revoke", revokeBackupTargetHandler(d.BackupTargets))
 					r.Delete("/backup-targets/{id}", deleteBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes))
-					r.Get("/backup-repositories", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS))
+					r.Get("/backup-repositories", listBackupTargetsHandler(d.BackupTargets, d.BackupServer, d.BackupTLS, d.BackupSecretsSecure))
 					r.Post("/backup-repositories", createBackupTargetHandler(d.BackupTargets, d.BackupServer, d.BackupNodes, d.Hosts, d.BackupSecretsSecure))
 					r.Patch("/backup-repositories/{id}", updateBackupTargetHandler(d.BackupTargets, d.BackupServer))
 					r.Post("/backup-repositories/{id}/rotate", rotateBackupTargetHandler(d.BackupTargets))

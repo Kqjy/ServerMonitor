@@ -55,6 +55,9 @@ func Init(ctx context.Context, cfg Config, opts Options) (InitResult, error) {
 	}
 	result := InitResult{Repos: make([]InitRepoResult, 0, len(cfg.Repos))}
 	logger := opts.logger()
+	for _, warning := range cfg.Warnings {
+		logger.Warn(warning)
+	}
 	for _, repo := range cfg.Repos {
 		entry := InitRepoResult{Name: repo.Name}
 		if err := passwordFileReady(repo.PasswordFile); err != nil {
@@ -87,13 +90,13 @@ func Init(ctx context.Context, cfg Config, opts Options) (InitResult, error) {
 		result.Repos = append(result.Repos, entry)
 		logger.Info("backup repo initialized", "repo", repo.Name)
 	}
-	if err := seedScheduledStatus(cfg); err != nil {
-		logger.Warn("could not seed scheduled backup status", "path", cfg.StatusPath, "err", err)
+	if err := reconcileStatusWithConfig(cfg); err != nil {
+		logger.Warn("could not reconcile backup status with the configured repositories", "path", cfg.StatusPath, "err", err)
 	}
 	return result, nil
 }
 
-func seedScheduledStatus(cfg Config) error {
+func reconcileStatusWithConfig(cfg Config) error {
 	existing, err := readStatusFile(cfg.StatusPath)
 	if err != nil {
 		return err
@@ -117,10 +120,11 @@ func seedScheduledStatus(cfg Config) error {
 			OneFileSystem: &oneFileSystem,
 		})
 	}
-	if len(scheduled) == 0 {
+	next := withoutUnconfiguredRepos(mergeStatus(existing, scheduled), cfg.Repos)
+	if len(scheduled) == 0 && len(next.Repos) == len(existing.Repos) {
 		return nil
 	}
-	return writeStatusAtomic(cfg.StatusPath, mergeStatus(existing, scheduled))
+	return writeStatusAtomic(cfg.StatusPath, next)
 }
 
 func (r InitResult) Failed() bool {

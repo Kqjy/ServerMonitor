@@ -3,6 +3,8 @@ package collectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"math"
 	"strings"
 	"sync"
@@ -17,6 +19,14 @@ import (
 
 const dockerProbeBackoff = 30 * time.Second
 
+const (
+	dockerStateUnknown     = "unknown"
+	dockerStateOK          = "ok"
+	dockerStateNoPerm      = "permission_denied"
+	dockerStateAbsent      = "absent"
+	dockerStateUnreachable = "unreachable"
+)
+
 type cpuSample struct {
 	total  uint64
 	system uint64
@@ -26,6 +36,8 @@ type containerCollector struct {
 	mu        sync.Mutex
 	cli       *client.Client
 	nextProbe time.Time
+	state     string
+	stateMsg  string
 	prevMu    sync.Mutex
 	prev      map[string]cpuSample
 }
@@ -34,6 +46,31 @@ func init() { Register(&containerCollector{}) }
 
 func (c *containerCollector) Name() string        { return "containers" }
 func (c *containerCollector) Platforms() []string { return []string{"all"} }
+
+func (c *containerCollector) Status() wire.CollectorStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state := c.state
+	if state == "" {
+		state = dockerStateUnknown
+	}
+	return wire.CollectorStatus{State: state, Message: c.stateMsg}
+}
+
+func classifyDockerErr(err error) (string, string) {
+	if err == nil {
+		return dockerStateOK, ""
+	}
+	msg := truncateProbeMessage(err.Error(), 200)
+	low := strings.ToLower(msg)
+	switch {
+	case errors.Is(err, fs.ErrPermission) || strings.Contains(low, "permission denied") || strings.Contains(low, "access is denied"):
+		return dockerStateNoPerm, "docker endpoint is present but the agent may not read it: " + msg
+	case errors.Is(err, fs.ErrNotExist) || strings.Contains(low, "no such file or directory") || strings.Contains(low, "cannot find the file"):
+		return dockerStateAbsent, "no docker endpoint on this host"
+	}
+	return dockerStateUnreachable, msg
+}
 
 func (c *containerCollector) connect(ctx context.Context) *client.Client {
 	c.mu.Lock()
@@ -47,6 +84,7 @@ func (c *containerCollector) connect(ctx context.Context) *client.Client {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		c.nextProbe = time.Now().Add(dockerProbeBackoff)
+		c.state, c.stateMsg = classifyDockerErr(err)
 		return nil
 	}
 	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -54,19 +92,22 @@ func (c *containerCollector) connect(ctx context.Context) *client.Client {
 	if _, err := cli.Ping(pctx); err != nil {
 		_ = cli.Close()
 		c.nextProbe = time.Now().Add(dockerProbeBackoff)
+		c.state, c.stateMsg = classifyDockerErr(err)
 		return nil
 	}
 	c.cli = cli
+	c.state, c.stateMsg = dockerStateOK, ""
 	return cli
 }
 
-func (c *containerCollector) drop(cli *client.Client) {
+func (c *containerCollector) drop(cli *client.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cli == cli {
 		_ = c.cli.Close()
 		c.cli = nil
 	}
+	c.state, c.stateMsg = classifyDockerErr(err)
 }
 
 func (c *containerCollector) Collect(ctx context.Context) ([]wire.Point, error) {
@@ -77,7 +118,7 @@ func (c *containerCollector) Collect(ctx context.Context) ([]wire.Point, error) 
 	now := time.Now()
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		c.drop(cli)
+		c.drop(cli, err)
 		return nil, err
 	}
 	var running, stopped int
@@ -103,7 +144,7 @@ func (c *containerCollector) CollectContainers(ctx context.Context) ([]wire.Cont
 	now := time.Now()
 	list, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		c.drop(cli)
+		c.drop(cli, err)
 		return nil, err
 	}
 

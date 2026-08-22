@@ -235,6 +235,26 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 	return StatusFile{Version: statusVersion, Repos: out}
 }
 
+func withoutUnconfiguredRepos(status StatusFile, repos []Repo) StatusFile {
+	configured := make(map[string]bool, len(repos))
+	for _, repo := range repos {
+		configured[repo.Name] = true
+	}
+	orphaned := map[string]bool{}
+	for _, repo := range status.Repos {
+		if repo.Engine != "restic" {
+			continue
+		}
+		if !configured[repo.Name] {
+			orphaned[repo.Name] = true
+		}
+	}
+	if len(orphaned) == 0 {
+		return status
+	}
+	return removeRepoStatus(status, orphaned)
+}
+
 func removeRepoStatus(status StatusFile, removed map[string]bool) StatusFile {
 	out := make([]RepoStatus, 0, len(status.Repos))
 	for _, repo := range status.Repos {

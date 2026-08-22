@@ -790,6 +790,37 @@ func TestManagedDirectRepositoryNeverInheritsHostPruning(t *testing.T) {
 	}
 }
 
+func TestRunDropsStatusForRepositoriesRemovedFromConfig(t *testing.T) {
+	cfg := testConfig(t)
+	existing := StatusFile{
+		Version: statusVersion,
+		Repos: []RepoStatus{
+			{Name: "retired", Engine: "restic", Success: false, Error: "backup failed: destination unreachable", SnapshotCount: 36, Tunnel: true},
+			{Name: "foreign", Engine: "borg", Success: true},
+		},
+	}
+	if err := writeStatusAtomic(cfg.StatusPath, existing); err != nil {
+		t.Fatalf("writeStatusAtomic: %v", err)
+	}
+	if _, err := Run(context.Background(), cfg, Options{Runner: newFakeResticRunner()}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		t.Fatalf("readStatusFile: %v", err)
+	}
+	names := map[string]string{}
+	for _, repo := range got.Repos {
+		names[repo.Name] = repo.Engine
+	}
+	if _, ok := names["retired"]; ok {
+		t.Fatalf("status kept a repository that left the config: %#v", got.Repos)
+	}
+	if names["foreign"] != "borg" || names["repo1"] != "restic" {
+		t.Fatalf("repos = %#v", got.Repos)
+	}
+}
+
 func TestStatusMergePreservesChecksForeignReposAndLastSuccessOnFailure(t *testing.T) {
 	cfg := testConfig(t)
 	checkLast := time.Date(2026, 6, 28, 4, 0, 0, 0, time.UTC)

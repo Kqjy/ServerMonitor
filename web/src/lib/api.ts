@@ -270,10 +270,17 @@ export interface BackupNode {
   created_at: string;
 }
 
+export interface BackupManagedSecrets {
+  key_configured: boolean;
+  secure_delivery: boolean;
+  blocker?: string;
+}
+
 export interface BackupTargetsResp {
   configured: boolean;
   storage?: BackupTargetStorage;
   tls: BackupTargetTLS;
+  managed_secrets: BackupManagedSecrets;
   targets: BackupTarget[];
   repositories: BackupTarget[];
   destinations: BackupDestination[];
@@ -602,6 +609,40 @@ export interface IPBanEvent {
   repeat_count?: number;
   actor?: string;
   note?: string;
+}
+
+export interface IPBanStatsBucket {
+  time: string;
+  bans: number;
+  distinct_ips: number;
+}
+
+export interface IPBanOffender {
+  ip: string;
+  bans: number;
+  hosts: number;
+  failures: number;
+  user?: string;
+  first_seen: string;
+  last_seen: string;
+  enforced_bans: number;
+  fleet: boolean;
+  active: boolean;
+}
+
+export interface IPBanStats {
+  from: string;
+  to: string;
+  bucket_s: number;
+  retention_s: number;
+  window_clipped: boolean;
+  buckets: IPBanStatsBucket[];
+  total_bans: number;
+  enforced_bans: number;
+  distinct_ips: number;
+  repeat_ips: number;
+  hosts_seen: number;
+  offenders: IPBanOffender[];
 }
 
 export interface IPBanSummary {
@@ -1018,5 +1059,19 @@ export const api = {
     if (opts.before) q.set('before', opts.before);
     const qs = q.toString();
     return request<IPBanEvent[]>(`/api/v1/ipban/events${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+  },
+  ipbanEventsCsvUrl: (opts: { host?: number; ip?: string } = {}) => {
+    const q = new URLSearchParams({ format: 'csv' });
+    if (opts.host) q.set('host', String(opts.host));
+    if (opts.ip) q.set('ip', opts.ip);
+    return `/api/v1/ipban/events?${q.toString()}`;
+  },
+  ipbanStats: (opts: { host?: number; window?: string; top?: number; signal?: AbortSignal } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.host) q.set('host', String(opts.host));
+    if (opts.window) q.set('window', opts.window);
+    if (opts.top) q.set('top', String(opts.top));
+    const qs = q.toString();
+    return request<IPBanStats>(`/api/v1/ipban/stats${qs ? `?${qs}` : ''}`, { signal: opts.signal });
   }
 };

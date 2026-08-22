@@ -227,13 +227,16 @@
   const selectedDirectId = $derived(newDestination.startsWith('direct:') ? Number(newDestination.slice(7)) : null);
   const selectedNode = $derived(selectedNodeId == null ? null : (nodes.find((n) => n.host_id === selectedNodeId) ?? null));
   const selectedDirectDestination = $derived(selectedDirectId == null ? null : (data?.destinations.find((d) => d.id === selectedDirectId) ?? null));
+  const managedSecrets = $derived(data?.managed_secrets ?? null);
+  const directDestinationsAvailable = $derived(managedSecrets ? managedSecrets.key_configured && managedSecrets.secure_delivery : true);
+  const directDestinationsBlocker = $derived(managedSecrets?.blocker ?? '');
   const scopedCredentialsValid = $derived(scopedAccessKeyId.trim() !== '' && scopedSecretAccessKey.trim() !== '');
   const destinationReady = $derived(
     newDestination === 'server'
       ? (data?.configured ?? false)
       : selectedNode
         ? selectedNode.enrolled === true && nodeAvailability(selectedNode) === null
-        : selectedDirectDestination != null && (useScopedCredentials ? scopedCredentialsValid : selectedDirectDestination.credentials_configured)
+        : selectedDirectDestination != null && directDestinationsAvailable && (useScopedCredentials ? scopedCredentialsValid : selectedDirectDestination.credentials_configured)
   );
 
   async function loadHosts() {
@@ -1018,8 +1021,27 @@ restic -r ${publicRepoUrl} backup /etc`;
         <h2 class="text-sm font-medium text-zinc-100">Direct external S3 destinations</h2>
         <p class="mt-0.5 text-xs text-zinc-500">Reusable backend definitions. Repository namespaces and host assignments are created separately below.</p>
       </div>
-      <button type="button" onclick={() => { resetDestinationForm(); destinationCredentialsFor = null; addingDestination = true; }} class="text-xs px-3 py-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20">Add S3 destination</button>
+      <button
+        type="button"
+        disabled={!directDestinationsAvailable}
+        title={directDestinationsAvailable ? undefined : directDestinationsBlocker}
+        onclick={() => { resetDestinationForm(); destinationCredentialsFor = null; addingDestination = true; }}
+        class="text-xs px-3 py-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:bg-zinc-900 disabled:text-zinc-600 disabled:hover:bg-zinc-900">Add S3 destination</button>
     </header>
+
+    {#if !directDestinationsAvailable}
+      <div class="border-b border-zinc-800 bg-amber-950/20 px-4 sm:px-5 py-3 text-xs text-amber-200">
+        <div class="font-medium">Direct S3 destinations are unavailable on this server</div>
+        <p class="mt-1 text-amber-300/80">{directDestinationsBlocker}</p>
+        {#if !managedSecrets?.key_configured}
+          <p class="mt-1.5 text-zinc-400">
+            Generate a 32-byte key, set <span class="font-mono text-zinc-300">BACKUP_SECRETS_KEY</span> in the server environment and restart it, then add the destination.
+            Existing tunnel and storage-node repositories are unaffected.
+          </p>
+          <div class="mt-2 font-mono text-[11px] text-zinc-400">openssl rand -base64 32</div>
+        {/if}
+      </div>
+    {/if}
 
     {#if addingDestination || destinationCredentialsFor}
       <div class="border-b border-zinc-800 bg-zinc-950/30 p-4 sm:p-5">
@@ -1149,7 +1171,7 @@ restic -r ${publicRepoUrl} backup /etc`;
                 <option value={`node:${n.host_id}`} disabled={!n.enrolled || availability !== null}>Storage node · {n.hostname || `node ${n.host_id}`}{availability === 'removed' ? ' (host removed)' : availability === 'archived' ? ' (host archived)' : availability === 'offline' ? ' (offline)' : n.node_state === 'error' ? ' (endpoint failing)' : n.enrolled ? '' : ' (coming online…)'}</option>
               {/each}
               {#each data?.destinations ?? [] as destination (destination.id)}
-                <option value={`direct:${destination.id}`}>Direct external S3 · {destination.name}</option>
+                <option value={`direct:${destination.id}`} disabled={!directDestinationsAvailable}>Direct external S3 · {destination.name}{directDestinationsAvailable ? '' : ' (unavailable)'}</option>
               {/each}
             </select>
             <div class="mt-2 rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2 text-xs">

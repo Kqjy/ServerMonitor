@@ -524,3 +524,148 @@ func TestRecordTunnelEnrollmentFailure(t *testing.T) {
 		t.Fatalf("tunnel timestamps wrong: %+v", gotTunnel)
 	}
 }
+
+func stageProvisionFixture(t *testing.T, staleConfig string) (string, string, func(string) string) {
+	t.Helper()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "backup.toml")
+	statusPath := filepath.Join(dir, "backup-status.json")
+	t.Setenv("SM_BACKUP_STATUS_PATH", statusPath)
+	resticPath := filepath.Join(dir, "sm-restic")
+	if err := os.WriteFile(resticPath, []byte("restic"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(staleConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "backup.key"), []byte("existing-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "repo-credentials.env"), []byte("RESTIC_REST_PASSWORD=pw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{
+		"SM_BACKUP_CONFIG": configPath,
+		"SM_RESTIC_SOURCE": resticPath,
+		"SM_BACKUP_PATHS":  "/srv,/opt",
+	}
+	return dir, statusPath, envFrom(env)
+}
+
+const staleTunnelConfig = `status_path = "/tmp/backup-status.json"
+paths = ["/srv"]
+
+[[repo]]
+name = "archive"
+tunnel_name = "archive"
+tunnel_node = "DR-NY-SB"
+password_file = "/state/backup.key"
+`
+
+func assignManagedRepository(t *testing.T, statusPath string) {
+	t.Helper()
+	if err := ApplyManagedBackupConfig(statusPath, wire.ManagedBackupConfig{
+		Version: 4,
+		Repositories: []wire.ManagedBackupRepository{{
+			ID: 7, Name: "central", URL: "s3:https://s3.example.test/bucket/hosts/7",
+			AccessKeyID: "key", SecretAccessKey: "secret",
+		}},
+	}); err != nil {
+		t.Fatalf("ApplyManagedBackupConfig: %v", err)
+	}
+}
+
+func TestProvisionContainerizedDropsStaleReposWhenEnvIsBlanked(t *testing.T) {
+	dir, statusPath, env := stageProvisionFixture(t, staleTunnelConfig)
+	assignManagedRepository(t, statusPath)
+	getenv := func(key string) string {
+		if key == "SM_HOST_FS_ROOT" {
+			return "/host"
+		}
+		return env(key)
+	}
+
+	res, err := Provision(getenv)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if !res.Rewrote {
+		t.Fatal("containerized provisioning must re-render the generated config from the environment")
+	}
+	if res.TunnelRepos {
+		t.Fatal("no tunnel repository remains, so tunnel enrollment must not be requested")
+	}
+	data, err := os.ReadFile(res.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(data)
+	if strings.Contains(rendered, "[[repo]]") || strings.Contains(rendered, "DR-NY-SB") {
+		t.Fatalf("stale local repository survived the re-render\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `paths = ["/srv", "/opt"]`) {
+		t.Fatalf("re-render lost the operator scope settings\n%s", rendered)
+	}
+	if res.KeyGenerated {
+		t.Fatal("existing backup key must never be regenerated")
+	}
+	key, err := os.ReadFile(filepath.Join(dir, "backup.key"))
+	if err != nil || string(key) != "existing-key\n" {
+		t.Fatalf("backup key changed: %q err=%v", key, err)
+	}
+	creds, err := os.ReadFile(filepath.Join(dir, "repo-credentials.env"))
+	if err != nil || string(creds) != "RESTIC_REST_PASSWORD=pw\n" {
+		t.Fatalf("credentials file changed: %q err=%v", creds, err)
+	}
+}
+
+func TestProvisionContainerizedWithoutAnyRepositoryStillFails(t *testing.T) {
+	_, _, env := stageProvisionFixture(t, staleTunnelConfig)
+	getenv := func(key string) string {
+		if key == "SM_HOST_FS_ROOT" {
+			return "/host"
+		}
+		return env(key)
+	}
+
+	res, err := Provision(getenv)
+	if err == nil {
+		t.Fatal("blanked repositories without a managed assignment must fail instead of writing a repo-less config")
+	}
+	if res.Rewrote {
+		t.Fatal("failed provisioning must not rewrite the config")
+	}
+	data, err := os.ReadFile(res.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != staleTunnelConfig {
+		t.Fatalf("config was modified\n%s", data)
+	}
+}
+
+func TestProvisionHostInstallKeepsExistingConfig(t *testing.T) {
+	if DetectContainer(envFrom(nil), statPath) {
+		t.Skip("the host-install path cannot be exercised from inside a container")
+	}
+	_, statusPath, getenv := stageProvisionFixture(t, staleTunnelConfig)
+	assignManagedRepository(t, statusPath)
+
+	res, err := Provision(getenv)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.Rewrote {
+		t.Fatal("a reconfigure without --backup-repos must keep the existing backup.toml")
+	}
+	if !res.TunnelRepos {
+		t.Fatal("the preserved tunnel repository must still request enrollment")
+	}
+	data, err := os.ReadFile(res.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != staleTunnelConfig {
+		t.Fatalf("existing config must stay byte-identical\n%s", data)
+	}
+}

@@ -16,16 +16,22 @@
   const ipbanState = cs.ipban?.state;
   const ipbanWorking = ipbanState === 'ok' || ipbanState === 'observe';
   const ipbanMissing = ipbanState === 'no_journal' || ipbanState === 'no_caps';
+  const dockerState = cs.containers?.state;
+  const dockerWorking = dockerState === 'ok';
+  const dockerBlocked = dockerState === 'permission_denied';
+  const gpuState = cs.gpu?.state;
+  const gpuWorking = gpuState === 'ok';
+  const gpuBlocked = gpuState === 'query_failed';
 
   const osName = untrack(() => (host.os ?? '').toLowerCase());
   const isWindows = osName.includes('windows');
   const isLinux = osName.includes('linux');
 
   let enablePortOwners = $state(untrack(() => ownersMissing || ownersWorking));
-  let enableDocker = $state(false);
+  let enableDocker = $state(untrack(() => dockerWorking || dockerBlocked));
   let enableSmart = $state(untrack(() => smartFailing || smartWorking));
   let enableSmartNvme = $state(untrack(() => smartState === 'read_failed'));
-  let enableGpu = $state(false);
+  let enableGpu = $state(untrack(() => gpuWorking || gpuBlocked));
   let enableNetwork = $state(false);
   let enableIPBan = $state(untrack(() => ipbanWorking));
   let adminService = $state(untrack(() => smartFailing || smartWorking));
@@ -114,7 +120,7 @@
           </label>
           <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
             <input type="checkbox" bind:checked={enableDocker} class="mt-0.5 accent-emerald-500" />
-            <span><span class="text-zinc-100">Docker containers</span> <span class="text-zinc-500">— joins <span class="font-mono">docker</span> group (effectively root on host)</span></span>
+            <span><span class="text-zinc-100">Docker containers</span> <span class="text-zinc-500">— joins <span class="font-mono">docker</span> group (effectively root on host).{#if dockerBlocked}{' '}<span class="text-amber-300">This host reports a docker endpoint the agent can't read.</span>{:else if dockerState === 'absent'}{' '}<span class="text-zinc-600">No docker endpoint reported on this host.</span>{/if}</span></span>
           </label>
           <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
             <input type="checkbox" bind:checked={enableSmart} class="mt-0.5 accent-emerald-500" />
@@ -128,7 +134,7 @@
           {/if}
           <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
             <input type="checkbox" bind:checked={enableGpu} class="mt-0.5 accent-emerald-500" />
-            <span><span class="text-zinc-100">GPU (nvidia)</span> <span class="text-zinc-500">— joins <span class="font-mono">video</span> group</span></span>
+            <span><span class="text-zinc-100">GPU (nvidia)</span> <span class="text-zinc-500">— joins <span class="font-mono">video</span> group.{#if gpuBlocked}{' '}<span class="text-amber-300">This host reports <span class="font-mono">nvidia-smi</span> is present but failing.</span>{:else if gpuState === 'binary_missing'}{' '}<span class="text-zinc-600">No nvidia driver reported on this host.</span>{/if}</span></span>
           </label>
           <label class="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer select-none">
             <input type="checkbox" bind:checked={enableNetwork} class="mt-0.5 accent-emerald-500" />
@@ -162,7 +168,7 @@
             <button type="button" onclick={copy} class="text-[11px] px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 {copyFailed ? 'text-rose-300' : 'text-zinc-200'}">{copied ? 'copied' : copyFailed ? 'copy failed — select manually' : 'copy'}</button>
           </div>
           <pre class="text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto whitespace-pre text-zinc-200">{command}</pre>
-          <p class="mt-1.5 text-[11px] text-amber-300/80">Capabilities are set to exactly the boxes ticked above — anything unticked is removed if currently granted. {#if isLinux}Docker, GPU and network grants can't be detected from here; tick them if this agent already uses them.{/if}</p>
+          <p class="mt-1.5 text-[11px] text-amber-300/80">Capabilities are set to exactly the boxes ticked above — anything unticked is removed if currently granted. {#if isLinux}Privileged network can't be detected from here; tick it if this agent already uses it.{/if}</p>
           <p class="mt-1 text-[11px] text-zinc-500">Pass <span class="font-mono">SM_REINSTALL=1</span> for a full fresh install instead.</p>
         </div>
       {/if}

@@ -105,6 +105,9 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 		return RunResult{}, fmt.Errorf("restic path is not resolved")
 	}
 	logger := opts.logger()
+	for _, warning := range cfg.Warnings {
+		logger.Warn(warning)
+	}
 	release, skipped, err := acquireRunLock(cfg.StatusPath, opts.now())
 	if err != nil {
 		return RunResult{}, err
@@ -193,7 +196,7 @@ func Run(ctx context.Context, cfg Config, opts Options) (RunResult, error) {
 	}
 	stopHeartbeat()
 	if len(updates) > 0 {
-		if err := writeStatusAtomic(cfg.StatusPath, mergeStatus(existing, updates)); err != nil {
+		if err := writeStatusAtomic(cfg.StatusPath, withoutUnconfiguredRepos(mergeStatus(existing, updates), cfg.Repos)); err != nil {
 			return RunResult{Repos: updates}, fmt.Errorf("write backup status: %w", err)
 		}
 	}

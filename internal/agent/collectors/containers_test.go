@@ -2,6 +2,8 @@ package collectors
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"testing"
 	"time"
 )
@@ -24,6 +26,52 @@ func TestContainerConnectArmsBackoffOnFailure(t *testing.T) {
 	}
 	if c.cli != nil {
 		t.Fatal("expected no client cached after a failed probe")
+	}
+}
+
+func TestContainerStatusUnknownBeforeProbe(t *testing.T) {
+	c := &containerCollector{}
+	if got := c.Status().State; got != dockerStateUnknown {
+		t.Fatalf("state before any probe = %q, want %q", got, dockerStateUnknown)
+	}
+}
+
+func TestContainerStatusAfterFailedProbe(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+	c := &containerCollector{}
+	c.connect(context.Background())
+	if got := c.Status().State; got == dockerStateUnknown || got == dockerStateOK {
+		t.Fatalf("state after a failed probe = %q, want a failure state", got)
+	}
+}
+
+func TestClassifyDockerErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, dockerStateOK},
+		{"wrapped permission", fs.ErrPermission, dockerStateNoPerm},
+		{"unix permission text", errors.New("dial unix /var/run/docker.sock: connect: permission denied"), dockerStateNoPerm},
+		{"windows permission text", errors.New("open //./pipe/docker_engine: Access is denied."), dockerStateNoPerm},
+		{"wrapped not exist", fs.ErrNotExist, dockerStateAbsent},
+		{"missing socket text", errors.New("dial unix /var/run/docker.sock: connect: no such file or directory"), dockerStateAbsent},
+		{"refused", errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), dockerStateUnreachable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, msg := classifyDockerErr(tc.err)
+			if got != tc.want {
+				t.Fatalf("state = %q, want %q", got, tc.want)
+			}
+			if tc.want == dockerStateOK && msg != "" {
+				t.Fatalf("message = %q, want empty", msg)
+			}
+			if len(msg) > 260 {
+				t.Fatalf("message not truncated: %d chars", len(msg))
+			}
+		})
 	}
 }
 

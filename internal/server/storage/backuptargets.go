@@ -66,6 +66,22 @@ func NewBackupTargets(db *DB, boxes ...*secretbox.Box) *BackupTargets {
 	return b
 }
 
+func (b *BackupTargets) SecretsConfigured() bool { return b.secrets != nil }
+
+func (b *BackupTargets) HostReportsRepo(ctx context.Context, hostID int64, name string) (bool, error) {
+	var exists bool
+	err := b.db.Pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM backup_status
+			WHERE host_id = $1 AND lower(repo) = lower($2)
+		)
+	`, hostID, name).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (b *BackupTargets) Create(ctx context.Context, name string, hostID *int64, quota *int64, secret string, nodeHostID *int64) (int64, error) {
 	var id int64
 	err := b.db.Pool.QueryRow(ctx, `

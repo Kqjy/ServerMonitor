@@ -65,7 +65,9 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 
 	repos := splitCSV(getenv("SM_BACKUP_REPOS"))
 	if len(repos) == 0 {
-		if _, statErr := os.Stat(configPath); statErr == nil {
+		configExists := statPath(configPath) == nil
+		environmentIsAuthoritative := DetectContainer(getenv, statPath)
+		if configExists && !environmentIsAuthoritative {
 			needServer, nodes, demandErr := tunnelRepoDemand(configPath)
 			if demandErr == nil {
 				res.TunnelRepos = needServer || len(nodes) > 0
@@ -75,10 +77,7 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 		if !HasManagedBackupRepositories(DefaultStatusPath()) {
 			return res, fmt.Errorf("SM_BACKUP_REPOS is required to provision backups, or assign a centrally managed direct repository before starting the agent")
 		}
-		toml, renderErr := renderBackupTOML(getenv, keyPath, filepath.Join(dir, "repo-credentials.env"), false, func(path string) error {
-			_, statErr := os.Stat(path)
-			return statErr
-		})
+		toml, renderErr := renderBackupTOML(getenv, keyPath, filepath.Join(dir, "repo-credentials.env"), false, statPath)
 		if renderErr != nil {
 			return res, renderErr
 		}
@@ -95,10 +94,7 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 		return res, err
 	}
 
-	toml, err := renderBackupTOML(getenv, keyPath, credsPath, haveCreds, func(path string) error {
-		_, statErr := os.Stat(path)
-		return statErr
-	})
+	toml, err := renderBackupTOML(getenv, keyPath, credsPath, haveCreds, statPath)
 	if err != nil {
 		return res, err
 	}
@@ -113,6 +109,11 @@ func Provision(getenv func(string) string) (ProvisionResult, error) {
 		}
 	}
 	return res, nil
+}
+
+func statPath(path string) error {
+	_, err := os.Stat(path)
+	return err
 }
 
 func ensureBackupKey(path string) (bool, error) {

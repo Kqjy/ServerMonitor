@@ -76,6 +76,10 @@ type createBackupDestinationRequest struct {
 
 func createBackupDestinationHandler(targets *storage.BackupTargets) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !targets.SecretsConfigured() {
+			writeError(w, http.StatusServiceUnavailable, "set BACKUP_SECRETS_KEY before storing managed backup credentials")
+			return
+		}
 		var req createBackupDestinationRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
