@@ -148,6 +148,7 @@ export interface BackupRepoStatus {
   snapshot_count?: number;
   check_last?: string;
   check_success?: boolean;
+  check_error?: string;
   tunnel?: boolean;
   next_run?: string;
   paths?: string[];
@@ -547,7 +548,7 @@ export interface IPBanEffectivePolicy {
 export interface IPBanHost {
   host_id: number;
   hostname: string;
-  os: string;
+  os: string | null;
   agent_version: string;
   last_seen: string | null;
   sample_interval_s: number;
@@ -565,6 +566,8 @@ export interface IPBanHost {
   applied_version: number;
   reported_at: string | null;
   config_stale: boolean;
+  dropped_events: number;
+  dropped_failures: number;
 }
 
 export interface IPBanActive {
@@ -1051,12 +1054,15 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ host_id: hostId, ip })
     }),
-  ipbanEvents: (opts: { host?: number; ip?: string; limit?: number; before?: string; signal?: AbortSignal } = {}) => {
+  ipbanEvents: (
+    opts: { host?: number; ip?: string; limit?: number; before?: string; beforeId?: number; signal?: AbortSignal } = {}
+  ) => {
     const q = new URLSearchParams();
     if (opts.host) q.set('host', String(opts.host));
     if (opts.ip) q.set('ip', opts.ip);
     if (opts.limit) q.set('limit', String(opts.limit));
     if (opts.before) q.set('before', opts.before);
+    if (opts.before && opts.beforeId) q.set('before_id', String(opts.beforeId));
     const qs = q.toString();
     return request<IPBanEvent[]>(`/api/v1/ipban/events${qs ? `?${qs}` : ''}`, { signal: opts.signal });
   },

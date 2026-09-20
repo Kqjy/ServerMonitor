@@ -183,6 +183,28 @@ type createBackupTargetRequest struct {
 	S3Credentials *backupS3CredentialsRequest `json:"s3_credentials,omitempty"`
 }
 
+const (
+	directRepoNameConflict = "this host already backs up a repository with that name; the agent refuses a configuration holding two repositories of the same name, which would stop every backup on the host. Pick another name, or remove the existing repository from the host's backup.toml first"
+	nodeRepoNameConflict   = "this host already backs up a repository with that name. Storage nodes never delete blobs, so a new repository under that name would bind onto whatever the previous one left on the node: the host still holds the matching backup.key, restic would decrypt the surviving config instead of initializing a fresh repository, and the agent also refuses a configuration holding two repositories of the same name. Pick another name, or remove the repository from the host's backup.toml and delete its directory under the node's store_dir first"
+)
+
+type backupRepoNameReporter interface {
+	HostReportsRepo(context.Context, int64, string) (bool, error)
+}
+
+func refuseRepoNameHostAlreadyBacksUp(w http.ResponseWriter, r *http.Request, targets backupRepoNameReporter, hostID int64, name, conflict string) bool {
+	reported, err := targets.HostReportsRepo(r.Context(), hostID, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return true
+	}
+	if reported {
+		writeError(w, http.StatusConflict, conflict)
+		return true
+	}
+	return false
+}
+
 type backupCredentialResponse struct {
 	ID       int64  `json:"id"`
 	Name     string `json:"name"`
@@ -234,13 +256,7 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 				writeError(w, http.StatusBadRequest, "host_id does not refer to an active host")
 				return
 			}
-			collides, err := targets.HostReportsRepo(r.Context(), host.ID, name)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if collides {
-				writeError(w, http.StatusConflict, "this host already backs up a repository with that name; the agent refuses a configuration holding two repositories of the same name, which would stop every backup on the host. Pick another name, or remove the existing repository from the host's backup.toml first")
+			if refuseRepoNameHostAlreadyBacksUp(w, r, targets, host.ID, name, directRepoNameConflict) {
 				return
 			}
 			prefix, err := storage.ExpandDirectPrefix(destination.PrefixTemplate, host.ID, host.Hostname, name)
@@ -276,6 +292,9 @@ func createBackupTargetHandler(targets *storage.BackupTargets, server *restserve
 			}
 			if req.HostID == nil {
 				writeError(w, http.StatusBadRequest, "node-hosted repositories require host_id (the host that backs up to it) so the node can admit its tunnel peer")
+				return
+			}
+			if refuseRepoNameHostAlreadyBacksUp(w, r, targets, *req.HostID, name, nodeRepoNameConflict) {
 				return
 			}
 		} else if server == nil {

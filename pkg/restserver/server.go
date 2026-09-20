@@ -16,6 +16,8 @@ import (
 
 const restV2ContentType = "application/vnd.x.restic.rest.v2"
 
+const uploadIdleTimeout = 3 * time.Minute
+
 type Registry interface {
 	ResolveTarget(ctx context.Context, repo, secret string) (id int64, quotaBytes int64, usedBytes int64, ok bool, err error)
 	ReserveUsage(ctx context.Context, id int64, delta int64) (bool, error)
@@ -187,7 +189,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, repo strin
 		http.Error(w, "invalid type", http.StatusNotFound)
 		return
 	}
-	if typ != "locks" {
+	if !deletableType(typ) {
 		http.Error(w, "append-only: only locks may be removed", http.StatusForbidden)
 		return
 	}
@@ -241,33 +243,94 @@ func (s *Server) post(w http.ResponseWriter, r *http.Request, repo, typ, name st
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if !reserved {
+	if !reserved && (deletableType(typ) || !s.objectPresent(r.Context(), repo, typ, name)) {
 		http.Error(w, "quota exceeded", http.StatusRequestEntityTooLarge)
 		return
 	}
-	body := http.MaxBytesReader(w, r.Body, r.ContentLength)
-	if err := s.store.Create(r.Context(), repo, typ, name, r.ContentLength, body); err != nil {
-		var maxErr *http.MaxBytesError
-		definitelyNotCommitted := errors.Is(err, ErrExists) || errors.Is(err, ErrInvalidRef) || errors.As(err, &maxErr)
-		if definitelyNotCommitted {
-			if releaseErr := s.registry.ReleaseUsage(context.WithoutCancel(r.Context()), t.id, r.ContentLength); releaseErr != nil {
-				s.logger.Warn("backup usage reservation release", "err", releaseErr)
-			}
-		} else {
-			s.logger.Warn("backup usage reservation retained after ambiguous store failure", "err", err)
+
+	var body io.Reader = http.MaxBytesReader(w, r.Body, r.ContentLength)
+	ctrl := http.NewResponseController(w)
+	if deadlineErr := ctrl.SetReadDeadline(time.Now().Add(uploadIdleTimeout)); deadlineErr == nil {
+		defer func() { _ = ctrl.SetReadDeadline(time.Time{}) }()
+		body = &progressDeadlineReader{src: body, setDeadline: ctrl.SetReadDeadline, window: uploadIdleTimeout, extended: time.Now()}
+	}
+
+	createErr := s.store.Create(r.Context(), repo, typ, name, r.ContentLength, body)
+	if createErr == nil {
+		if !reserved {
+			s.reserveAfterUnaccountedCommit(r, t.id)
 		}
-		if errors.Is(err, ErrExists) {
-			http.Error(w, "object already exists", http.StatusForbidden)
-			return
-		}
-		if maxErr != nil {
-			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		s.storeError(w, err)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	if errors.Is(createErr, ErrExistsIdentical) {
+		if reserved {
+			s.releaseUsage(r, t.id, r.ContentLength)
+		}
+		_, _ = io.Copy(io.Discard, body)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	var maxErr *http.MaxBytesError
+	definitelyNotCommitted := errors.Is(createErr, ErrExists) || errors.Is(createErr, ErrExistsCorrupt) || errors.Is(createErr, ErrInvalidRef) || errors.As(createErr, &maxErr)
+	if definitelyNotCommitted {
+		if reserved {
+			s.releaseUsage(r, t.id, r.ContentLength)
+		}
+	} else if reserved {
+		s.logger.Warn("backup usage reservation retained after ambiguous store failure", "err", createErr)
+	} else {
+		s.logger.Error("possible unaccounted backup write after ambiguous store failure on a duplicate retry", "err", createErr, "bytes", r.ContentLength)
+	}
+	switch {
+	case errors.Is(createErr, ErrExistsCorrupt):
+		s.logger.Error("stored backup object does not match its own name; refusing idempotent retry", "repo", repo, "type", typ, "name", name, "err", createErr)
+		http.Error(w, "object already exists", http.StatusForbidden)
+	case errors.Is(createErr, ErrExists):
+		http.Error(w, "object already exists", http.StatusForbidden)
+	case maxErr != nil:
+		http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
+	default:
+		s.storeError(w, createErr)
+	}
+}
+
+func (s *Server) objectPresent(ctx context.Context, repo, typ, name string) bool {
+	_, err := s.store.Stat(ctx, repo, typ, name)
+	return err == nil
+}
+
+func (s *Server) releaseUsage(r *http.Request, id, delta int64) {
+	if err := s.registry.ReleaseUsage(context.WithoutCancel(r.Context()), id, delta); err != nil {
+		s.logger.Warn("backup usage reservation release", "err", err)
+	}
+}
+
+func (s *Server) reserveAfterUnaccountedCommit(r *http.Request, id int64) {
+	ok, err := s.registry.ReserveUsage(context.WithoutCancel(r.Context()), id, r.ContentLength)
+	if err != nil || !ok {
+		s.logger.Error("backup object committed without a usage reservation; recorded usage now under-reports the store", "err", err, "bytes", r.ContentLength)
+	}
+}
+
+type progressDeadlineReader struct {
+	src         io.Reader
+	setDeadline func(time.Time) error
+	window      time.Duration
+	extended    time.Time
+}
+
+func (p *progressDeadlineReader) Read(b []byte) (int, error) {
+	n, err := p.src.Read(b)
+	if n > 0 {
+		if now := time.Now(); now.Sub(p.extended) > p.window/4 {
+			if setErr := p.setDeadline(now.Add(p.window)); setErr == nil {
+				p.extended = now
+			}
+		}
+	}
+	return n, err
 }
 
 func (s *Server) storeError(w http.ResponseWriter, err error) {

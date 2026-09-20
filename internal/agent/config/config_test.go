@@ -19,9 +19,31 @@ func clearIdentityEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"SM_SERVER_URL", "SM_TOKEN", "SM_SERVER_PUBKEY",
-		"SM_INTERVAL_S", "SM_SMART_SAMPLE_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE", "SM_BACKUP_STATUS_PATH",
+		"SM_INTERVAL_S", "SM_SMART_SAMPLE_S", "SM_SPOOL_PATH", "SM_AUTO_UPGRADE", "SM_BACKUP_STATUS_PATH", "SM_ENABLE_IPBAN",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+func TestLoadIPBanRequiresExplicitOptIn(t *testing.T) {
+	clearIdentityEnv(t)
+	p := writeTempConfig(t, `server_url = "https://file.example.com"
+token = "filetok"
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EnableIPBan {
+		t.Fatal("ipban must default off")
+	}
+	t.Setenv("SM_ENABLE_IPBAN", "true")
+	c, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.EnableIPBan {
+		t.Fatal("SM_ENABLE_IPBAN=true must opt in")
 	}
 }
 

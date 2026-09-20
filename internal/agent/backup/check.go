@@ -15,6 +15,7 @@ import (
 
 const drillSampleLimit = 5
 const drillSizeLimit = 4 * 1024 * 1024
+const abandonedLockMinAge = 24 * time.Hour
 
 type CheckOptions struct {
 	Repo           string
@@ -116,7 +117,7 @@ func Check(ctx context.Context, cfg Config, co CheckOptions, opts Options) (Chec
 		}
 		entry := checkRepo(ctx, cfg, repo, cacheDir, co, opts)
 		out.Repos = append(out.Repos, entry)
-		status = applyCheckResult(status, repo.Name, utcSecond(opts.now()), entry.Success, repo.UsesTunnel())
+		status = applyCheckResult(status, repo.Name, utcSecond(opts.now()), entry.Success, entry.Error, repo.UsesTunnel())
 		if err := writeStatusAtomic(cfg.StatusPath, status); err != nil {
 			return out, fmt.Errorf("write backup status: %w", err)
 		}
@@ -128,7 +129,7 @@ func checkRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, co C
 	logger := opts.logger()
 	logger.Info("backup check started", "repo", repo.Name)
 	entry := CheckRepoResult{Name: repo.Name, Success: true}
-	if _, err := resticCommand(ctx, cfg, repo, cacheDir, checkArgs(co.ReadDataSubset), opts); err != nil {
+	if err := runCheckWithLockRecovery(ctx, cfg, repo, cacheDir, co, opts); err != nil {
 		entry.Success = false
 		entry.Error = err.Error()
 		logger.Error("backup check failed", "repo", repo.Name, "err", err)
@@ -145,6 +146,114 @@ func checkRepo(ctx context.Context, cfg Config, repo Repo, cacheDir string, co C
 		logger.Info("backup drill passed", "repo", repo.Name)
 	}
 	return entry
+}
+
+func runCheckWithLockRecovery(ctx context.Context, cfg Config, repo Repo, cacheDir string, co CheckOptions, opts Options) error {
+	logger := opts.logger()
+	_, err := resticCommand(ctx, cfg, repo, cacheDir, checkArgs(co.ReadDataSubset), opts)
+	if err == nil || !isRepositoryLockedError(err) {
+		return err
+	}
+	sweep, sweepErr := sweepLocks(ctx, cfg, repo, cacheDir, abandonedLockMinAge, false, opts)
+	if sweepErr != nil {
+		logger.Warn("could not inspect the repository locks that blocked the check", "repo", repo.Name, "err", sweepErr)
+		return err
+	}
+	if sweep.Removed == 0 {
+		if sweep.Held > 0 {
+			logger.Info("the repository lock that blocked the check is recent enough to belong to a live operation", "repo", repo.Name, "locks", sweep.Held)
+		}
+		return err
+	}
+	logger.Warn("removed abandoned repository locks and retried the check", "repo", repo.Name, "locks", sweep.Removed, "older_than", abandonedLockMinAge.String())
+	_, retryErr := resticCommand(ctx, cfg, repo, cacheDir, checkArgs(co.ReadDataSubset), opts)
+	return retryErr
+}
+
+func isRepositoryLockedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "already locked") || strings.Contains(message, "unable to create lock")
+}
+
+type lockSweep struct {
+	Total   int
+	Removed int
+	Held    int
+}
+
+type repositoryLock struct {
+	Time      time.Time `json:"time"`
+	Exclusive bool      `json:"exclusive"`
+	Hostname  string    `json:"hostname"`
+	Username  string    `json:"username"`
+	PID       int       `json:"pid"`
+}
+
+func sweepLocks(ctx context.Context, cfg Config, repo Repo, cacheDir string, minAge time.Duration, removeAll bool, opts Options) (lockSweep, error) {
+	listed, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"list", "locks"}, opts)
+	if err != nil {
+		return lockSweep{}, err
+	}
+	ids := lockIDs(listed.Stdout)
+	sweep := lockSweep{Total: len(ids)}
+	if sweep.Total == 0 {
+		return sweep, nil
+	}
+	if !removeAll {
+		cutoff := opts.now().Add(-minAge)
+		for _, id := range ids {
+			held, err := lockIsHeld(ctx, cfg, repo, cacheDir, id, cutoff, opts)
+			if err != nil {
+				return lockSweep{Total: sweep.Total}, err
+			}
+			if held {
+				sweep.Held++
+			}
+		}
+		if sweep.Held > 0 {
+			return sweep, nil
+		}
+	}
+	if _, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"unlock", "--remove-all"}, opts); err != nil {
+		return lockSweep{Total: sweep.Total}, err
+	}
+	sweep.Removed = sweep.Total
+	sweep.Held = 0
+	return sweep, nil
+}
+
+func lockIsHeld(ctx context.Context, cfg Config, repo Repo, cacheDir, id string, cutoff time.Time, opts Options) (bool, error) {
+	result, err := resticCommand(ctx, cfg, repo, cacheDir, []string{"cat", "lock", id}, opts)
+	if err != nil {
+		return false, fmt.Errorf("read lock %s: %w", id, err)
+	}
+	var lock repositoryLock
+	if err := json.Unmarshal(bytes.TrimSpace(result.Stdout), &lock); err != nil {
+		return false, fmt.Errorf("parse lock %s: %w", id, err)
+	}
+	if lock.Time.IsZero() {
+		return false, fmt.Errorf("lock %s has no creation time", id)
+	}
+	if lock.Time.After(cutoff) {
+		opts.logger().Info("repository lock is still recent", "repo", repo.Name, "lock", id, "created", lock.Time.UTC().Format(time.RFC3339), "hostname", lock.Hostname, "pid", lock.PID)
+		return true, nil
+	}
+	return false, nil
+}
+
+var lockIDRE = regexp.MustCompile(`^[0-9a-f]{8,64}$`)
+
+func lockIDs(data []byte) []string {
+	out := []string{}
+	for _, field := range strings.Fields(string(data)) {
+		if lockIDRE.MatchString(field) {
+			out = append(out, field)
+		}
+	}
+	return out
 }
 
 func checkArgs(readDataSubset string) []string {
@@ -199,7 +308,112 @@ func parsePositiveInt(value string) (int, bool) {
 	return n, true
 }
 
-func applyCheckResult(status StatusFile, name string, checkTime time.Time, success bool, tunnel bool) StatusFile {
+type UnlockOptions struct {
+	Repo      string
+	MinAge    time.Duration
+	RemoveAll bool
+}
+
+type UnlockRepoResult struct {
+	Name    string
+	Total   int
+	Removed int
+	Held    int
+	Error   string
+}
+
+type UnlockResult struct {
+	LockSkipped bool
+	Repos       []UnlockRepoResult
+}
+
+func (r UnlockResult) AllSucceeded() bool {
+	for _, repo := range r.Repos {
+		if repo.Error != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func UnlockFromConfigPath(ctx context.Context, path string, uo UnlockOptions, opts Options) (UnlockResult, error) {
+	cfg, err := Load(path)
+	if err != nil {
+		return UnlockResult{}, err
+	}
+	resticPath, err := ResolveResticPath(cfg)
+	if err != nil {
+		return UnlockResult{}, err
+	}
+	cfg.ResticPath = resticPath
+	return Unlock(ctx, cfg, uo, opts)
+}
+
+func Unlock(ctx context.Context, cfg Config, uo UnlockOptions, opts Options) (UnlockResult, error) {
+	cfg = normalizedConfig(cfg)
+	if err := cfg.Validate(); err != nil {
+		return UnlockResult{}, err
+	}
+	if cfg.ResticPath == "" {
+		return UnlockResult{}, fmt.Errorf("restic path is not resolved")
+	}
+	if uo.MinAge < 0 {
+		return UnlockResult{}, fmt.Errorf("--older-than must not be negative")
+	}
+	if _, err := snapshotTargets(cfg.Repos, uo.Repo); err != nil {
+		return UnlockResult{}, err
+	}
+
+	logger := opts.logger()
+	release, skipped, err := acquireRunLock(cfg.StatusPath, opts.now())
+	if err != nil {
+		return UnlockResult{}, err
+	}
+	if skipped {
+		logger.Info("another backup operation is in progress; unlock skipped")
+		return UnlockResult{LockSkipped: true}, nil
+	}
+	defer release()
+
+	cfg, session := PrepareTunnel(cfg, opts)
+	if session != nil {
+		defer session.Close()
+	}
+	targets, err := snapshotTargets(cfg.Repos, uo.Repo)
+	if err != nil {
+		return UnlockResult{}, err
+	}
+
+	cacheDir := filepath.Join(filepath.Dir(cfg.StatusPath), "restic-cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return UnlockResult{}, fmt.Errorf("create restic cache dir: %w", err)
+	}
+
+	out := UnlockResult{Repos: make([]UnlockRepoResult, 0, len(targets))}
+	for _, repo := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		entry := UnlockRepoResult{Name: repo.Name}
+		sweep, err := sweepLocks(ctx, cfg, repo, cacheDir, uo.MinAge, uo.RemoveAll, opts)
+		entry.Total = sweep.Total
+		entry.Removed = sweep.Removed
+		entry.Held = sweep.Held
+		if err != nil {
+			entry.Error = err.Error()
+			logger.Error("backup unlock failed", "repo", repo.Name, "err", err)
+		} else {
+			logger.Info("backup unlock finished", "repo", repo.Name, "locks", sweep.Total, "removed", sweep.Removed, "held", sweep.Held)
+		}
+		out.Repos = append(out.Repos, entry)
+	}
+	return out, nil
+}
+
+func applyCheckResult(status StatusFile, name string, checkTime time.Time, success bool, checkError string, tunnel bool) StatusFile {
+	if success {
+		checkError = ""
+	}
 	out := StatusFile{Version: statusVersion, Repos: make([]RepoStatus, 0, len(status.Repos)+1)}
 	found := false
 	for _, repo := range status.Repos {
@@ -208,6 +422,7 @@ func applyCheckResult(status StatusFile, name string, checkTime time.Time, succe
 			ok := success
 			repo.CheckLast = &last
 			repo.CheckSuccess = &ok
+			repo.CheckError = checkError
 			repo.Tunnel = tunnel
 			found = true
 		}
@@ -216,7 +431,7 @@ func applyCheckResult(status StatusFile, name string, checkTime time.Time, succe
 	if !found {
 		last := checkTime
 		ok := success
-		out.Repos = append(out.Repos, RepoStatus{Name: name, Engine: "restic", CheckLast: &last, CheckSuccess: &ok, Tunnel: tunnel})
+		out.Repos = append(out.Repos, RepoStatus{Name: name, Engine: "restic", CheckLast: &last, CheckSuccess: &ok, CheckError: checkError, Tunnel: tunnel})
 	}
 	return out
 }

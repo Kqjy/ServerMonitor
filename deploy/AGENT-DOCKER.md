@@ -11,8 +11,8 @@ The agent is a single static binary. This image runs it with host-namespace visi
 Once, on a build host that has the source:
 
 ```bash
-docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.5.1 .
-docker push registry.example.com/servermonitor-agent:0.5.1
+docker build -f deploy/agent.Dockerfile -t registry.example.com/servermonitor-agent:0.5.2 .
+docker push registry.example.com/servermonitor-agent:0.5.2
 ```
 
 The image reports its version from the compiled-in `pkg/version` constant.
@@ -42,7 +42,7 @@ Copy `deploy/.env.agent.example` to `.env.agent` beside the compose file and fil
 ```ini
 SM_SERVER_URL=https://monitor.example.com
 SM_TOKEN=<agent-token from step 2>
-SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.5.1
+SM_AGENT_IMAGE=registry.example.com/servermonitor-agent:0.5.2
 ```
 
 Treat `.env.agent` as a secret (`chmod 600`) and don't commit it — the token authenticates the agent.
@@ -125,7 +125,7 @@ On the host install, note that `--enable-smart` (`CAP_SYS_RAWIO` + `disk` group)
 
 ### IP banning
 
-Partially covered. The agent's `ipban` collector runs in the container, but two things differ from the host install:
+Partially covered. The `docker-compose.agent.ipban.yml` override explicitly opts the container into the `ipban` collector and enforcement; without that override the local safety gate keeps the feature entirely off. Two things differ from the host install:
 
 - **Detection reads files, not the journal.** The image has no `journalctl`, so the agent falls back to tailing `/host/var/log/auth.log` (then `secure`, `messages`) through the `/host` bind mount. That works on hosts that still run rsyslog (Ubuntu server, RHEL); journald-only hosts such as current Debian report `no auth log found` on the Security page, and the host install is the way to cover them.
 - **Enforcement needs `NET_ADMIN` in the host network namespace.** Add the override file, which appends exactly that capability:
@@ -134,7 +134,7 @@ Partially covered. The agent's `ipban` collector runs in the container, but two 
 docker compose -f deploy/docker-compose.agent.yml -f deploy/docker-compose.agent.ipban.yml --env-file .env.agent up -d --pull always --no-build
 ```
 
-Because the container shares the host network namespace, `NET_ADMIN` here is genuine authority over the host firewall — the same grant `--enable-ipban` makes on a host install, and worth the same scrutiny as the Docker socket note above. Without the override the agent still detects and reports, and the Security page shows it as needing `CAP_NET_ADMIN`. Bans live in the kernel table `inet sm_agent` and survive container restarts; `docker compose … exec sm-agent /usr/local/bin/sm-agent ipban teardown` removes them.
+Because the container shares the host network namespace, `NET_ADMIN` here is genuine authority over the host firewall — the same grant `--enable-ipban` makes on a host install, and worth the same scrutiny as the Docker socket note above. Bans live in the kernel table `inet sm_agent` and survive container restarts; `docker compose … exec sm-agent /usr/local/bin/sm-agent ipban teardown` removes them.
 
 ### Managed backups
 

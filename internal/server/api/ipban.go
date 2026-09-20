@@ -1,16 +1,22 @@
 package api
 
 import (
+	"compress/gzip"
+	"encoding/csv"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	serverconfig "servermonitor/internal/server/config"
 	"servermonitor/internal/server/ipban"
 )
 
@@ -132,7 +138,15 @@ func ipbanActiveHandler(svc *ipban.Service) http.HandlerFunc {
 			}
 			hostID = id
 		}
-		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		limit := 0
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 || parsed > 1000 {
+				writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+				return
+			}
+			limit = parsed
+		}
 		bans, err := svc.Active(r.Context(), hostID, limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -218,7 +232,14 @@ func ipbanEventsHandler(svc *ipban.Service) http.HandlerFunc {
 			f.HostID = id
 		}
 		f.IP = q.Get("ip")
-		f.Limit, _ = strconv.Atoi(q.Get("limit"))
+		if raw := q.Get("limit"); raw != "" {
+			limit, err := strconv.Atoi(raw)
+			if err != nil || limit <= 0 || limit > 1000 {
+				writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+				return
+			}
+			f.Limit = limit
+		}
 		if b := q.Get("before"); b != "" {
 			t, err := time.Parse(time.RFC3339Nano, b)
 			if err != nil {
@@ -226,15 +247,23 @@ func ipbanEventsHandler(svc *ipban.Service) http.HandlerFunc {
 				return
 			}
 			f.Before = t
+			if id := q.Get("before_id"); id != "" {
+				n, err := strconv.ParseInt(id, 10, 64)
+				if err != nil || n < 0 {
+					writeError(w, http.StatusBadRequest, "invalid before_id")
+					return
+				}
+				f.BeforeID = n
+			}
+		}
+		if q.Get("before") == "" && q.Get("before_id") != "" {
+			writeError(w, http.StatusBadRequest, "before_id requires before")
+			return
 		}
 		if strings.EqualFold(q.Get("format"), "csv") {
-			f.Export = true
-			events, err := svc.Events(r.Context(), f)
-			if err != nil {
+			if err := writeIPBanEventsCSV(w, r, svc, f); err != nil {
 				writeIPBanError(w, err)
-				return
 			}
-			writeIPBanEventsCSV(w, events)
 			return
 		}
 		events, err := svc.Events(r.Context(), f)
@@ -246,16 +275,27 @@ func ipbanEventsHandler(svc *ipban.Service) http.HandlerFunc {
 	}
 }
 
-func writeIPBanEventsCSV(w http.ResponseWriter, events []ipban.Event) {
+func writeIPBanEventsCSV(w http.ResponseWriter, r *http.Request, svc *ipban.Service, filter ipban.EventFilter) error {
 	filename := "ipban-events-" + time.Now().UTC().Format("20060102-150405") + ".csv"
-	cw := setCSVHeadersFilename(w, filename)
-	_ = cw.Write([]string{"time", "action", "ip", "host", "enforced", "failures", "user", "expires_at", "repeat_count", "source", "actor", "note"})
-	for _, e := range events {
+	tmp, err := os.CreateTemp("", "servermonitor-ipban-*.csv.gz")
+	if err != nil {
+		return err
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+	gz := gzip.NewWriter(tmp)
+	cw := csv.NewWriter(gz)
+	if err := cw.Write([]string{"time", "action", "ip", "host", "enforced", "failures", "user", "expires_at", "repeat_count", "source", "actor", "note"}); err != nil {
+		_ = gz.Close()
+		_ = tmp.Close()
+		return err
+	}
+	err = svc.StreamEvents(r.Context(), filter, func(e ipban.Event) error {
 		expires := ""
 		if e.ExpiresAt != nil {
 			expires = e.ExpiresAt.UTC().Format(time.RFC3339)
 		}
-		_ = cw.Write([]string{
+		return cw.Write([]string{
 			e.Time.UTC().Format(time.RFC3339),
 			csvSafe(e.Action),
 			csvSafe(e.IP),
@@ -269,8 +309,36 @@ func writeIPBanEventsCSV(w http.ResponseWriter, events []ipban.Event) {
 			csvSafe(e.Actor),
 			csvSafe(e.Note),
 		})
-	}
+	})
 	cw.Flush()
+	if err == nil {
+		err = cw.Error()
+	}
+	if closeErr := gz.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, file)
+	return err
 }
 
 func ipbanStatsHandler(svc *ipban.Service) http.HandlerFunc {
@@ -287,13 +355,24 @@ func ipbanStatsHandler(svc *ipban.Service) http.HandlerFunc {
 		}
 		if raw := q.Get("window"); raw != "" {
 			d, err := time.ParseDuration(raw)
+			if err != nil && !serverconfig.IsForever(raw) && serverconfig.ValidateInterval(raw) == nil {
+				d = serverconfig.IntervalToDuration(raw)
+				err = nil
+			}
 			if err != nil || d <= 0 {
-				writeError(w, http.StatusBadRequest, "window must be a positive Go duration such as 168h")
+				writeError(w, http.StatusBadRequest, "window must be a positive duration such as 168h or 7 days")
 				return
 			}
 			f.Window = d
 		}
-		f.Top, _ = strconv.Atoi(q.Get("top"))
+		if raw := q.Get("top"); raw != "" {
+			top, err := strconv.Atoi(raw)
+			if err != nil || top <= 0 || top > 200 {
+				writeError(w, http.StatusBadRequest, "top must be an integer between 1 and 200")
+				return
+			}
+			f.Top = top
+		}
 		stats, err := svc.Stats(r.Context(), f)
 		if err != nil {
 			writeIPBanError(w, err)

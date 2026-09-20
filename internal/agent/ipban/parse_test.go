@@ -1,6 +1,9 @@
 package ipban
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseSSHDNormal(t *testing.T) {
 	cases := []struct {
@@ -26,6 +29,7 @@ func TestParseSSHDNormal(t *testing.T) {
 		{"error: maximum authentication attempts exceeded for invalid user admin from 203.0.113.18 port 40006 ssh2 [preauth]", "203.0.113.18", "admin", "max_attempts"},
 		{"error: PAM: Authentication failure for root from 203.0.113.19", "203.0.113.19", "root", "pam_failure"},
 		{"error: PAM: User not known to the underlying authentication module for illegal user test from 203.0.113.20", "203.0.113.20", "test", "pam_failure"},
+		{"pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.23 user=root", "203.0.113.23", "root", "pam_unix_failure"},
 		{"User backup from 203.0.113.21 not allowed because not listed in AllowUsers", "203.0.113.21", "backup", "not_allowed"},
 		{"Received disconnect from 203.0.113.22 port 40007:3: com.jcraft.jsch.JSchException: Auth fail [preauth]", "203.0.113.22", "", "auth_fail_disconnect"},
 	}
@@ -47,6 +51,17 @@ func TestParseSSHDNormal(t *testing.T) {
 		if m.Aggressive {
 			t.Errorf("%q: should not be aggressive", c.line)
 		}
+	}
+}
+
+func TestParseFailedAuthUsesActualTrailingPeer(t *testing.T) {
+	line := "Failed password for invalid user x from 198.51.100.9 port 22 ssh2 from 203.0.113.44 port 4242 ssh2"
+	m, ok := ParseSSHD(line, false)
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if got := m.IP.String(); got != "203.0.113.44" {
+		t.Fatalf("parsed attacker-controlled username IP %s instead of peer", got)
 	}
 }
 
@@ -109,11 +124,20 @@ func TestStripSyslogPrefix(t *testing.T) {
 		{"Aug 21 13:35:01 web01 systemd[1]: Started OpenBSD Secure Shell server.", "", false},
 		{"Aug 21 13:35:01 web01 CRON[5]: pam_unix(cron:session): session opened", "", false},
 		{"Aug 21 13:35:01 web01 mysshd[5]: Failed password for root from 203.0.113.8 port 1 ssh2", "", false},
+		{"Aug 21 13:35:01 web01 CRON[5]: note sshd[6]: Failed password for root from 203.0.113.8 port 1 ssh2", "", false},
 	}
 	for _, c := range cases {
 		got, ok := StripSyslogPrefix(c.line)
 		if ok != c.ok || got != c.want {
 			t.Errorf("%q: got (%q, %v), want (%q, %v)", c.line, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+func TestParseSyslogLineUsesLoggedTimestamp(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 10, 0, time.UTC)
+	_, at, ok := ParseSyslogLine("Dec 31 23:59:59 web01 sshd[1]: Invalid user x from 203.0.113.1 port 2", now)
+	if !ok || at.Year() != 2025 || at.Month() != time.December {
+		t.Fatalf("timestamp = %v ok=%v", at, ok)
 	}
 }

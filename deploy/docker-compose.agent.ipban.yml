@@ -1,4 +1,6 @@
 services:
   sm-agent:
+    environment:
+      SM_ENABLE_IPBAN: "1"
     cap_add:
       - NET_ADMIN

@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy, untrack } from 'svelte';
-  import { api, type CollectorStatus, type IPBanHost, type IPBanActive, type IPBanEvent, type IPBanStats, type SeriesPoint, type SeriesEntry } from '$lib/api';
+  import { api, type CollectorStatus, type IPBanHost, type IPBanActive, type IPBanStats, type SeriesPoint, type SeriesEntry } from '$lib/api';
   import { timeAgo, timeUntil } from '$lib/format';
+  import { EventPager } from '$lib/ipban.svelte';
   import { announcer } from '$lib/announce.svelte';
   import { rangeToFrom, rangeToTo, rangeBoundsMs, rangeEquals, type Range } from '$lib/time';
   import { groupPoints, groupSeries } from '$lib/series';
   import MultiChart from '$lib/components/MultiChart.svelte';
+  import EventPagination from '$lib/components/EventPagination.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
   let {
@@ -42,7 +44,6 @@
 
   let view = $state<IPBanHost | null>(null);
   let active = $state<IPBanActive[]>([]);
-  let events = $state<IPBanEvent[]>([]);
   let stats = $state<IPBanStats | null>(null);
   const offenderWindow = '168h';
   let loading = $state(true);
@@ -68,23 +69,7 @@
 
   let toUnban = $state<IPBanActive | null>(null);
 
-  const evPageSizes = [8, 16, 50];
-  let evPage = $state(0);
-  let evPageSize = $state(evPageSizes[0]);
-  const evPageCount = $derived(Math.max(1, Math.ceil(events.length / evPageSize)));
-  const evPageIndex = $derived(Math.min(Math.max(evPage, 0), evPageCount - 1));
-  const evFrom = $derived(evPageIndex * evPageSize);
-  const evTo = $derived(Math.min(evFrom + evPageSize, events.length));
-  const pagedEvents = $derived(events.slice(evFrom, evTo));
-
-  function gotoEvPage(page: number) {
-    evPage = Math.min(Math.max(page, 0), evPageCount - 1);
-  }
-
-  function setEvPageSize(size: number) {
-    evPageSize = size;
-    evPage = 0;
-  }
+  const events = new EventPager({ host: () => hostId, chunk: 50 });
 
   const enableSnippet = $derived(
     `SM_ENABLE_IPBAN=1 sudo --preserve-env=SM_ENABLE_IPBAN bash -c "curl -fsSL ${baseUrl}/install.sh | bash"`
@@ -105,16 +90,17 @@
     const ac = new AbortController();
     inflight = ac;
     try {
+      const evDepth = events.refreshDepth;
       const [hosts, bansNow, recent, stt] = await Promise.all([
         api.ipbanHosts({ signal: ac.signal }),
         api.ipbanActive({ host: hostId, limit: 500, signal: ac.signal }),
-        api.ipbanEvents({ host: hostId, limit: 50, signal: ac.signal }),
+        evDepth ? api.ipbanEvents({ host: hostId, limit: evDepth, signal: ac.signal }) : Promise.resolve(null),
         api.ipbanStats({ host: hostId, window: offenderWindow, top: 10, signal: ac.signal })
       ]);
       if (gen !== refreshGen) return;
       view = hosts.find((h) => h.host_id === hostId) ?? null;
       active = bansNow;
-      events = recent;
+      if (recent) events.head(recent, evDepth);
       stats = stt;
       error = null;
     } catch (e) {
@@ -345,7 +331,7 @@
           </div>
         </div>
         <div class="px-4 sm:px-5 py-4">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500">{view?.effective.enforce ? 'Active bans' : 'Would-be bans'}</div>
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Tracked bans</div>
           <div class="mt-1 text-lg font-semibold text-zinc-100 numeric">{view?.active_local ?? active.length}</div>
           <div class="text-[11px] text-zinc-500 mt-0.5">
             {view?.fleet_applied ?? 0} fleet {(view?.fleet_applied ?? 0) === 1 ? 'entry' : 'entries'} applied
@@ -374,6 +360,11 @@
           {/if}
         </div>
       {/if}
+      {#if view && (view.dropped_events > 0 || view.dropped_failures > 0)}
+        <div class="px-4 sm:px-5 py-3 border-t border-amber-900/40 bg-amber-950/20 text-xs text-amber-100/90">
+          Agent queue overflow: {view.dropped_events} ban events and {view.dropped_failures} authentication failures were dropped. Check agent logs and load.
+        </div>
+      {/if}
     </section>
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -384,16 +375,16 @@
         </div>
       </section>
       <section class="rounded-xl border border-zinc-800 bg-zinc-900/40">
-        <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Bans per hour · active bans</header>
+        <header class="px-5 py-3 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-500">Bans per hour · tracked bans</header>
         <div class="px-3 py-3">
-          <MultiChart series={[{ label: 'bans / hour', points: bans, bars: true }, { label: 'active', points: activeSeries }]} {fromMs} {toMs} zoomed={chartZoom !== null} loading={chartsLoading} height={180} stepped yClampMin={0} yMinSpan={4} format={(v, e = 0) => v.toFixed(e)} onZoom={handleZoom} onResetZoom={handleReset} emptyText="No bans in this range" />
+          <MultiChart series={[{ label: 'bans / hour', points: bans, bars: true }, { label: 'tracked', points: activeSeries }]} {fromMs} {toMs} zoomed={chartZoom !== null} loading={chartsLoading} height={180} stepped yClampMin={0} yMinSpan={4} format={(v, e = 0) => v.toFixed(e)} onZoom={handleZoom} onResetZoom={handleReset} emptyText="No bans in this range" />
         </div>
       </section>
     </div>
 
     <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
       <header class="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
-        <div class="text-xs uppercase tracking-wider text-zinc-500">{view?.effective.enforce ? 'Active bans on this host' : 'Would-be bans on this host'}</div>
+        <div class="text-xs uppercase tracking-wider text-zinc-500">Tracked bans on this host</div>
         <div class="text-[11px] text-zinc-500 numeric">{active.length}</div>
       </header>
       {#if loading}
@@ -472,7 +463,7 @@
                   <td class="px-5 py-2.5 font-mono text-zinc-200">
                     {o.ip}
                     {#if o.fleet}<span class="ml-2 rounded border border-sky-500/30 bg-sky-500/10 px-1 py-px text-[10px] uppercase tracking-wider text-sky-300">fleet</span>{/if}
-                    {#if o.active}<span class="ml-2 rounded border border-zinc-700 bg-zinc-800/60 px-1 py-px text-[10px] uppercase tracking-wider text-zinc-400">active</span>{/if}
+                    {#if o.active}<span class="ml-2 rounded border border-zinc-700 bg-zinc-800/60 px-1 py-px text-[10px] uppercase tracking-wider text-zinc-400">tracked</span>{/if}
                   </td>
                   <td class="px-3 py-2.5 text-right numeric {o.bans > 1 ? 'text-amber-300' : 'text-zinc-300'}">{o.bans}</td>
                   <td class="px-3 py-2.5 font-mono text-xs text-zinc-400 hidden sm:table-cell">{o.user || '—'}</td>
@@ -502,11 +493,11 @@
       </header>
       {#if loading}
         <div class="p-4"><div class="h-16 rounded-lg shimmer"></div></div>
-      {:else if events.length === 0}
+      {:else if events.rows.length === 0}
         <div class="px-5 py-6 text-sm text-zinc-500">No ban activity recorded for this host yet.</div>
       {:else}
         <ul class="divide-y divide-zinc-800/70">
-          {#each pagedEvents as ev (ev.id)}
+          {#each events.visible as ev (ev.id)}
             {@const a = actionLabel(ev.action, ev.enforced)}
             <li class="px-5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
               <span class="text-[11px] text-zinc-500 numeric w-24 shrink-0" title={absTime(ev.time)}>{timeAgo(ev.time)}</span>
@@ -523,47 +514,7 @@
             </li>
           {/each}
         </ul>
-        {#if events.length > evPageSizes[0]}
-          <div class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-5 py-2.5 border-t border-zinc-800">
-            <div class="flex items-center gap-2">
-              <div class="text-[10px] uppercase tracking-wider text-zinc-500">Rows</div>
-              <div class="flex items-center gap-0.5">
-                {#each evPageSizes as size (size)}
-                  <button
-                    type="button"
-                    onclick={() => setEvPageSize(size)}
-                    aria-pressed={evPageSize === size}
-                    class="px-2 py-1 rounded-md text-xs font-medium numeric transition-colors {evPageSize === size ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">{size}</button>
-                {/each}
-              </div>
-            </div>
-            <div class="flex items-center gap-2">
-              <div class="text-xs text-zinc-500 numeric">{evFrom + 1}–{evTo} of {events.length} · page {evPageIndex + 1} of {evPageCount}</div>
-              <button
-                type="button"
-                onclick={() => gotoEvPage(evPageIndex - 1)}
-                disabled={evPageIndex === 0}
-                aria-label="Newer events"
-                title="Newer"
-                class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
-                <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
-                  <path d="M8 2.25 4.25 6 8 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                onclick={() => gotoEvPage(evPageIndex + 1)}
-                disabled={evPageIndex >= evPageCount - 1}
-                aria-label="Older events"
-                title="Older"
-                class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
-                <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
-                  <path d="M4 2.25 7.75 6 4 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-            </div>
-          </div>
-        {/if}
+        <EventPagination pager={events} />
       {/if}
     </section>
   {/if}

@@ -30,6 +30,7 @@ type Config struct {
 	BackupStatusPath string            `toml:"backup_status_path"`
 	HTTPTimeout      time.Duration     `toml:"http_timeout"`
 	InsecureSkip     bool              `toml:"insecure_skip_verify"`
+	EnableIPBan      bool              `toml:"enable_ipban"`
 	AutoUpgrade      *bool             `toml:"auto_upgrade"`
 	Tags             map[string]string `toml:"tags"`
 }
@@ -98,6 +99,11 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("SM_AUTO_UPGRADE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.AutoUpgrade = &b
+		}
+	}
+	if v := os.Getenv("SM_ENABLE_IPBAN"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.EnableIPBan = b
 		}
 	}
 }

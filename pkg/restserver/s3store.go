@@ -136,7 +136,14 @@ func (s *s3Store) Create(ctx context.Context, repo, typ, name string, size int64
 		return nil
 	}
 	if isPreconditionFailed(err) {
-		return ErrExists
+		storedSize, statErr := s.Stat(ctx, repo, typ, name)
+		if statErr != nil {
+			if errors.Is(statErr, ErrNotFound) {
+				return ErrExists
+			}
+			return existsUnverified(statErr)
+		}
+		return s.duplicateResult(ctx, key, typ, name, spool, size, storedSize)
 	}
 	if !isNotImplemented(err) {
 		return err
@@ -144,8 +151,8 @@ func (s *s3Store) Create(ctx context.Context, repo, typ, name string, size int64
 	if typ != "locks" {
 		return fmt.Errorf("append-only conditional create is unsupported for %s objects: %w", typ, err)
 	}
-	if _, statErr := s.Stat(ctx, repo, typ, name); statErr == nil {
-		return ErrExists
+	if storedSize, statErr := s.Stat(ctx, repo, typ, name); statErr == nil {
+		return s.duplicateResult(ctx, key, typ, name, spool, size, storedSize)
 	} else if !errors.Is(statErr, ErrNotFound) {
 		return statErr
 	}
@@ -159,6 +166,18 @@ func (s *s3Store) Create(ctx context.Context, repo, typ, name string, size int64
 		ContentLength: aws.Int64(size),
 	})
 	return err
+}
+
+func (s *s3Store) duplicateResult(ctx context.Context, key, typ, name string, spool *os.File, size, storedSize int64) error {
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return existsUnverified(err)
+	}
+	return classifyDuplicate(typ, name, spool, size, existingObject{
+		size: storedSize,
+		open: func() (io.ReadCloser, error) {
+			return &s3ReadSeeker{ctx: ctx, client: s.client, bucket: s.bucket, key: key, size: storedSize}, nil
+		},
+	})
 }
 
 func (s *s3Store) Open(ctx context.Context, repo, typ, name string) (io.ReadSeekCloser, int64, error) {

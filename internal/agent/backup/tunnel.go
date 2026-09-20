@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"servermonitor/pkg/wgtunnel"
@@ -212,19 +214,93 @@ func (s *TunnelSession) forward(local net.Conn, target string) {
 		return
 	}
 	defer remote.Close()
+	transfer := newTunnelTransfer()
+	stalled := make(chan struct{})
+	go s.watchStalledTransfer(target, transfer, tunnelStallWarnInterval, stalled)
 	done := make(chan struct{}, 2)
-	go proxyCopy(remote, local, done)
-	go proxyCopy(local, remote, done)
+	go s.proxyCopy(remote, local, target, "upload", &transfer.sent, transfer, done)
+	go s.proxyCopy(local, remote, target, "download", &transfer.received, transfer, done)
 	<-done
 	<-done
+	close(stalled)
+	s.logger.Debug("backup tunnel connection closed",
+		"target", target,
+		"sent_bytes", transfer.sent.Load(),
+		"received_bytes", transfer.received.Load(),
+		"duration_s", int(time.Since(transfer.started).Seconds()))
 }
 
-func proxyCopy(dst io.Writer, src io.Reader, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
+const tunnelStallWarnInterval = 2 * time.Minute
+
+type tunnelTransfer struct {
+	started      time.Time
+	lastProgress atomic.Int64
+	sent         atomic.Int64
+	received     atomic.Int64
+}
+
+func newTunnelTransfer() *tunnelTransfer {
+	t := &tunnelTransfer{started: time.Now()}
+	t.progressed()
+	return t
+}
+
+func (t *tunnelTransfer) progressed() { t.lastProgress.Store(time.Now().UnixNano()) }
+
+func (t *tunnelTransfer) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, t.lastProgress.Load()))
+}
+
+type tunnelProgressReader struct {
+	src      io.Reader
+	count    *atomic.Int64
+	transfer *tunnelTransfer
+}
+
+func (r *tunnelProgressReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.count.Add(int64(n))
+		r.transfer.progressed()
+	}
+	return n, err
+}
+
+func (s *TunnelSession) proxyCopy(dst io.Writer, src io.Reader, target, direction string, count *atomic.Int64, transfer *tunnelTransfer, done chan<- struct{}) {
+	_, err := io.Copy(dst, &tunnelProgressReader{src: src, count: count, transfer: transfer})
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		s.logger.Warn("backup tunnel copy failed",
+			"target", target,
+			"direction", direction,
+			"bytes", count.Load(),
+			"elapsed_s", int(time.Since(transfer.started).Seconds()),
+			"err", err)
+	}
 	if c, ok := dst.(interface{ CloseWrite() error }); ok {
 		_ = c.CloseWrite()
 	}
 	done <- struct{}{}
+}
+
+func (s *TunnelSession) watchStalledTransfer(target string, transfer *tunnelTransfer, interval time.Duration, stopped <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopped:
+			return
+		case now := <-ticker.C:
+			idle := transfer.idleFor(now)
+			if idle < interval {
+				continue
+			}
+			s.logger.Warn("backup tunnel connection made no progress",
+				"target", target,
+				"idle_s", int(idle.Seconds()),
+				"sent_bytes", transfer.sent.Load(),
+				"received_bytes", transfer.received.Load())
+		}
+	}
 }
 
 func (s *TunnelSession) repoURL(node, tunnelName string) (string, error) {

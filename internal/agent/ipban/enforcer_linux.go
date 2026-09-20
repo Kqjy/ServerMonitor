@@ -128,16 +128,34 @@ func (e *nftEnforcer) localSet(ip netip.Addr) *nftables.Set {
 func (e *nftEnforcer) AddLocal(ip netip.Addr, timeout time.Duration) error {
 	set := e.localSet(ip)
 	el := element(ip, timeout)
-	if err := e.conn.SetDeleteElements(set, []nftables.SetElement{{Key: el.Key}}); err != nil {
+	exists, err := setContains(e.conn, set, ip)
+	if err != nil {
 		return err
 	}
-	if err := e.conn.Flush(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	if exists {
+		if err := e.conn.SetDeleteElements(set, []nftables.SetElement{{Key: el.Key}}); err != nil {
+			return err
+		}
 	}
 	if err := e.conn.SetAddElements(set, []nftables.SetElement{el}); err != nil {
 		return err
 	}
 	return e.conn.Flush()
+}
+
+func setContains(conn *nftables.Conn, set *nftables.Set, want netip.Addr) (bool, error) {
+	elements, err := conn.GetSetElements(set)
+	if err != nil {
+		return false, err
+	}
+	want = want.Unmap()
+	for _, el := range elements {
+		ip, ok := netip.AddrFromSlice(el.Key)
+		if ok && ip.Unmap() == want {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (e *nftEnforcer) RemoveLocal(ip netip.Addr) error {
@@ -190,11 +208,6 @@ func (e *nftEnforcer) addChunked(set *nftables.Set, elements []nftables.SetEleme
 			return err
 		}
 		elements = elements[n:]
-		if len(elements) > 0 {
-			if err := e.conn.Flush(); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }

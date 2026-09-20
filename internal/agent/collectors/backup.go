@@ -527,6 +527,7 @@ type backupRepoFile struct {
 	SnapshotCount *int64                `json:"snapshot_count"`
 	CheckLast     *time.Time            `json:"check_last"`
 	CheckSuccess  *bool                 `json:"check_success"`
+	CheckError    string                `json:"check_error"`
 	Tunnel        bool                  `json:"tunnel"`
 	Paths         []string              `json:"paths,omitempty"`
 	Excludes      []string              `json:"excludes,omitempty"`
@@ -607,6 +608,7 @@ func backupRepoStatus(repo backupRepoFile) wire.BackupRepoStatus {
 		Error:         repo.Error,
 		CheckLast:     repo.CheckLast,
 		CheckSuccess:  repo.CheckSuccess,
+		CheckError:    repo.CheckError,
 		Tunnel:        repo.Tunnel,
 		Paths:         repo.Paths,
 		Excludes:      repo.Excludes,

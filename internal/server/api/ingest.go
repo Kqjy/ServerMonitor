@@ -62,7 +62,7 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			return
 		}
 
-		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 && (batch.IPBan == nil || len(batch.IPBan.Events) == 0) {
+		if len(batch.Points) == 0 && len(batch.Processes) == 0 && len(batch.Containers) == 0 && len(batch.Ports) == 0 && len(batch.Backups) == 0 && batch.IPBan == nil {
 			emptyAck := wire.IngestAck{Accepted: 0, HostID: hostID}
 			if browse != nil {
 				emptyAck.BackupBrowsePending = browse.HasPending(hostID)
@@ -131,6 +131,14 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			writeError(w, http.StatusBadRequest, "invalid backups: "+err.Error())
 			return
 		}
+		if bans != nil && batch.IPBan != nil {
+			if err := bans.Ingest(r.Context(), hostID, batch.IPBan); err != nil {
+				logger.Warn("ipban ingest", "err", err, "host", hostID, "events", len(batch.IPBan.Events))
+				w.Header().Set("Retry-After", "2")
+				writeError(w, http.StatusBadGateway, "ipban ingest failed")
+				return
+			}
+		}
 		if err := b.Reserve(len(points)); err != nil {
 			if errors.Is(err, ingest.ErrBackpressure) {
 				w.Header().Set("Retry-After", "2")
@@ -173,12 +181,6 @@ func ingestHandler(b *ingest.Batcher, hub *sse.Hub, hosts *storage.Hosts, signer
 			ShouldSelfUpgrade: shouldSelfUpgrade,
 		})
 		selfUpgradeStalled := stallSince != nil && time.Since(*stallSince) >= upgradeStallWindow
-
-		if bans != nil && batch.IPBan != nil {
-			if err := bans.Ingest(r.Context(), hostID, batch.IPBan); err != nil {
-				logger.Warn("ipban ingest", "err", err, "host", hostID, "events", len(batch.IPBan.Events))
-			}
-		}
 
 		hub.Broadcast(hostID, batch.Points)
 

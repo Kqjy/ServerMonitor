@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func TestValidateIntervalRejectsZeroMalformedAndOverflow(t *testing.T) {
+	for _, raw := range []string{"0 days", "90d", "999999999999999999999999 years"} {
+		if err := ValidateInterval(raw); err == nil {
+			t.Errorf("ValidateInterval(%q) unexpectedly passed", raw)
+		}
+	}
+	if err := ValidateInterval("90 days"); err != nil {
+		t.Fatalf("valid interval rejected: %v", err)
+	}
+}
+
 func TestLoadTLSGate(t *testing.T) {
 	required := map[string]string{
 		"DATABASE_URL": "postgres://x:y@h:5432/db",

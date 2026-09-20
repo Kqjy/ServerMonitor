@@ -53,6 +53,10 @@ type IPBanReporter interface {
 	CollectIPBan(ctx context.Context) *wire.IPBanReport
 }
 
+type IPBanAcknowledger interface {
+	AcknowledgeIPBan(events []wire.IPBanEvent)
+}
+
 type StatusReporter interface {
 	Status() wire.CollectorStatus
 }

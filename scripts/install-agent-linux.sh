@@ -71,7 +71,7 @@ extra collector's grant:
   --enable-docker       adds 'docker' group membership (containers collector)
   --enable-gpu          adds 'video' group membership (some nvidia-smi setups)
   --enable-network      adds CAP_NET_ADMIN and CAP_NET_RAW (full connections / wifi)
-  --enable-ipban        reactive IP banning: adds 'systemd-journal' + 'adm' group membership so the agent can follow sshd login failures, and CAP_NET_ADMIN so it can drop repeat offenders through its own nftables table (inet sm_agent). Thresholds, allowlist and fleet sharing are managed from the server's Security page; the agent needs no local config. Firewall-write authority for the resident agent, so NOT included in --enable-all
+  --enable-ipban        reactive IP banning: persists the agent's local opt-in gate, adds 'systemd-journal' + 'adm' group membership so it can follow sshd login failures, and adds CAP_NET_ADMIN so it can drop repeat offenders through its own nftables table (inet sm_agent). Thresholds, allowlist and fleet sharing are managed from the server's Security page. Firewall-write authority for the resident agent, so NOT included in --enable-all
   --enable-all          shortcut for all of the above EXCEPT --enable-smart-nvme, --enable-ipban and --enable-backup; CAP_SYS_ADMIN, firewall writes and whole-host backup read access must be opted into explicitly
   --enable-backup       provisions scheduled encrypted restic backups: installs a pinned restic to /usr/local/bin/sm-restic, writes /etc/servermonitor-backup/backup.toml, generates a repo key, runs 'sm-agent backup init', and adds an sm-backup systemd timer whose oneshot unit runs with CAP_DAC_READ_SEARCH so it can read every file on the host to back it up. That grant is confined to the backup unit, not the resident agent. NOT included in --enable-all. Requires local --backup-repos or a centrally assigned direct repository already synchronized by the agent
 
@@ -177,6 +177,21 @@ pin_agent_signing_pubkey() {
   printf '%s\n' "$configured" > "$pin"
   chown root:root "$pin"
   chmod 0400 "$pin"
+}
+
+set_agent_config_bool() {
+  local key="$1" value="$2" rendered=false tmp
+  [ "$value" = "1" ] && rendered=true
+  tmp="$(mktemp /etc/servermonitor/agent.toml.XXXXXX)"
+  awk -v key="$key" -v value="$rendered" '
+    BEGIN { found = 0 }
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print key " = " value; found = 1; next }
+    { print }
+    END { if (!found) print key " = " value }
+  ' /etc/servermonitor/agent.toml > "$tmp"
+  chown sm-agent:sm-agent "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" /etc/servermonitor/agent.toml
 }
 
 write_privileged_sync_units() {
@@ -1135,6 +1150,7 @@ fi
 if [ "$RECONFIGURE" != "1" ]; then
 ARGS=(--server "$SERVER_URL" --interval "$INTERVAL")
 [[ -n "$HOSTNAME_OVERRIDE" ]] && ARGS+=(--hostname "$HOSTNAME_OVERRIDE")
+[[ "$ENABLE_IPBAN" = "1" ]] && ARGS+=(--enable-ipban)
 SM_ADMIN_TOKEN="$ADMIN_TOKEN" /usr/local/bin/sm-agent register "${ARGS[@]}"
 unset ADMIN_TOKEN
 unset SM_ADMIN_TOKEN
@@ -1142,6 +1158,7 @@ unset SM_ADMIN_TOKEN
 chown sm-agent:sm-agent /etc/servermonitor/agent.toml
 chmod 0600 /etc/servermonitor/agent.toml
 fi
+set_agent_config_bool enable_ipban "$ENABLE_IPBAN"
 
 pin_agent_signing_pubkey
 write_privileged_sync_units

@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -321,5 +324,108 @@ password_file = "` + filepath.ToSlash(filepath.Join(dir, "backup.key")) + `"
 	}
 	if cfg.PruneMode != "external" {
 		t.Fatalf("prune mode lost after merge: %s", cfg.PruneMode)
+	}
+}
+
+type failingReader struct {
+	prefix string
+	err    error
+	sent   bool
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		n := copy(p, r.prefix)
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func TestProxyCopyLogsFailuresWithDirectionAndBytes(t *testing.T) {
+	var logged strings.Builder
+	session := &TunnelSession{logger: slog.New(slog.NewTextHandler(&logged, nil))}
+	transfer := newTunnelTransfer()
+	done := make(chan struct{}, 2)
+
+	var sent atomic.Int64
+	session.proxyCopy(io.Discard, &failingReader{prefix: "0123456789", err: errors.New("connection reset by peer")}, "10.83.0.2:8000", "upload", &sent, transfer, done)
+	<-done
+	if sent.Load() != 10 {
+		t.Fatalf("counted bytes = %d, want 10", sent.Load())
+	}
+	line := logged.String()
+	for _, want := range []string{"backup tunnel copy failed", "target=10.83.0.2:8000", "direction=upload", "bytes=10", "connection reset by peer"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log %q missing %q", line, want)
+		}
+	}
+
+	logged.Reset()
+	var received atomic.Int64
+	session.proxyCopy(io.Discard, &failingReader{err: net.ErrClosed}, "10.83.0.2:8000", "download", &received, transfer, done)
+	<-done
+	if logged.Len() != 0 {
+		t.Fatalf("shutdown close logged: %q", logged.String())
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestStalledTransferIsReportedWithoutCancelling(t *testing.T) {
+	logged := &syncBuffer{}
+	session := &TunnelSession{logger: slog.New(slog.NewTextHandler(logged, nil))}
+	transfer := newTunnelTransfer()
+	transfer.sent.Store(4096)
+	stopped := make(chan struct{})
+	go session.watchStalledTransfer("10.83.0.2:8000", transfer, 5*time.Millisecond, stopped)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logged.String(), "backup tunnel connection made no progress") {
+		if time.Now().After(deadline) {
+			close(stopped)
+			t.Fatalf("stall was never reported: %q", logged.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stopped)
+	if line := logged.String(); !strings.Contains(line, "sent_bytes=4096") || !strings.Contains(line, "target=10.83.0.2:8000") {
+		t.Fatalf("stall log = %q", line)
+	}
+	if transfer.idleFor(time.Now()) <= 0 {
+		t.Fatal("idle duration did not advance")
+	}
+}
+
+func TestTransferProgressResetsIdleClock(t *testing.T) {
+	transfer := newTunnelTransfer()
+	if idle := transfer.idleFor(time.Now().Add(5 * time.Minute)); idle < 5*time.Minute {
+		t.Fatalf("idle = %s, want at least 5m", idle)
+	}
+	var count atomic.Int64
+	reader := &tunnelProgressReader{src: strings.NewReader("0123456789"), count: &count, transfer: transfer}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if count.Load() != 10 {
+		t.Fatalf("counted bytes = %d, want 10", count.Load())
+	}
+	if idle := transfer.idleFor(time.Now()); idle > time.Second {
+		t.Fatalf("idle after progress = %s", idle)
 	}
 }

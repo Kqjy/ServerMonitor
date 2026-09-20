@@ -2,6 +2,9 @@ package ipban
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -126,6 +129,8 @@ func (m *Manager) Run(ctx context.Context) {
 	defer prune.Stop()
 	refresh := time.NewTicker(5 * time.Minute)
 	defer refresh.Stop()
+	configRefresh := time.NewTicker(5 * time.Minute)
+	defer configRefresh.Stop()
 
 	for {
 		select {
@@ -146,6 +151,8 @@ func (m *Manager) Run(ctx context.Context) {
 			m.retryEnforcer()
 		case <-refresh.C:
 			m.refreshLocalAddrs(ctx)
+		case <-configRefresh.C:
+			m.fetch(ctx, fetchTimer)
 		}
 	}
 }
@@ -202,9 +209,12 @@ func (m *Manager) apply(ctx context.Context, cfg *wire.IPBanConfig) {
 	}
 	m.guard.SetAllowlist(prefixes)
 	m.guard.SetBanPrivate(pol.BanPrivate)
+	if pol.Enforce && len(prefixes) == 0 {
+		pol.Enforce = false
+		m.logger.Error("ipban refused unsafe policy", "reason", "enforcement requires a non-empty local allowlist", "version", cfg.Version)
+	}
 
 	m.mu.Lock()
-	first := !m.havePolicy
 	prevEnforce := m.havePolicy && m.policy.Enforce
 	m.policy = pol
 	m.havePolicy = true
@@ -215,9 +225,7 @@ func (m *Manager) apply(ctx context.Context, cfg *wire.IPBanConfig) {
 	if source != nil {
 		source.aggressive.Store(pol.Mode == "aggressive")
 	}
-	if first {
-		m.refreshLocalAddrs(ctx)
-	}
+	m.refreshLocalAddrs(ctx)
 	if pol.Detect {
 		m.startSource(ctx, pol.Mode == "aggressive")
 	} else {
@@ -230,6 +238,7 @@ func (m *Manager) apply(ctx context.Context, cfg *wire.IPBanConfig) {
 	} else {
 		m.disableEnforcement()
 	}
+	m.reconcileProtected()
 	m.applyUnbans(cfg.Unban)
 	m.applyFleet(cfg.Fleet)
 	m.logger.Info("ipban policy applied", "version", cfg.Version, "detect", pol.Detect, "enforce", pol.Enforce, "fleet", len(cfg.Fleet), "allowlist", len(prefixes))
@@ -326,6 +335,14 @@ func (m *Manager) ensureEnforcer() bool {
 	}
 	now := m.now()
 	for _, entry := range local {
+		if _, protected := m.guard.Protected(entry.IP); protected {
+			if err := e.RemoveLocal(entry.IP); err != nil {
+				_ = e.Close()
+				m.setEnforceError(err)
+				return false
+			}
+			continue
+		}
 		if entry.Expires > 0 {
 			m.tracker.Import(entry.IP, now.Add(entry.Expires))
 		}
@@ -415,6 +432,9 @@ func (m *Manager) applyUnbans(list []wire.IPBanUnban) {
 	}
 	e := m.currentEnforcer()
 	now := m.now()
+	m.mu.Lock()
+	wantEnforcement := m.havePolicy && m.policy.Enforce
+	m.mu.Unlock()
 	for _, u := range list {
 		ip, err := netip.ParseAddr(u.IP)
 		if err != nil {
@@ -424,20 +444,24 @@ func (m *Manager) applyUnbans(list []wire.IPBanUnban) {
 		key := unbanKey{ip: ip, at: u.At.UTC()}
 		m.mu.Lock()
 		_, seen := m.seenUnbans[key]
-		if !seen {
-			m.seenUnbans[key] = now
-		}
 		m.mu.Unlock()
 		if seen {
 			continue
 		}
-		was := m.tracker.Unban(ip)
+		if wantEnforcement && e == nil {
+			continue
+		}
 		if e != nil {
 			if err := e.RemoveLocal(ip); err != nil {
 				m.setEnforceError(err)
 				e = nil
+				continue
 			}
 		}
+		was := m.tracker.Unban(ip)
+		m.mu.Lock()
+		m.seenUnbans[key] = now
+		m.mu.Unlock()
 		if was {
 			m.pushEvent(wire.IPBanEvent{Time: now, IP: ip.String(), Action: "unban", Source: "server"})
 			m.logger.Info("ipban unbanned by server", "ip", ip)
@@ -502,6 +526,13 @@ func (m *Manager) applyFleet(entries []wire.IPBanFleetEntry) {
 
 func (m *Manager) handleFailure(f Failure) {
 	now := m.now()
+	m.mu.Lock()
+	findTime := time.Duration(m.policy.FindTimeS) * time.Second
+	m.mu.Unlock()
+	if !f.Time.IsZero() && findTime > 0 && f.Time.Before(now.Add(-findTime)) {
+		m.logger.Debug("ipban ignoring stale auth failure", "ip", f.IP, "time", f.Time)
+		return
+	}
 	m.failuresWindow.Add(now)
 	if reason, protected := m.guard.Protected(f.IP); protected {
 		m.logger.Debug("ipban ignoring failure from protected address", "ip", f.IP, "reason", reason)
@@ -529,7 +560,7 @@ func (m *Manager) handleFailure(f Failure) {
 	}
 	until := ban.Until
 	m.pushEvent(wire.IPBanEvent{
-		Time:      now,
+		Time:      failureEventTime(f.Time, now),
 		IP:        ban.IP.String(),
 		Action:    "ban",
 		Source:    f.Source,
@@ -545,6 +576,9 @@ func (m *Manager) handleFailure(f Failure) {
 func (m *Manager) pushEvent(ev wire.IPBanEvent) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ev.ID == "" {
+		ev.ID = newEventID(m.now())
+	}
 	if len(m.events) >= maxBufferedEvents {
 		m.events = m.events[1:]
 		m.droppedEvents++
@@ -578,6 +612,43 @@ func (m *Manager) refreshLocalAddrs(ctx context.Context) {
 		}
 	}
 	m.guard.SetLocal(addrs)
+	m.reconcileProtected()
+	m.mu.Lock()
+	fleet := append([]wire.IPBanFleetEntry(nil), m.fleetEntries...)
+	m.mu.Unlock()
+	m.applyFleet(fleet)
+}
+
+func (m *Manager) reconcileProtected() {
+	e := m.currentEnforcer()
+	for _, ban := range m.tracker.ActiveBans(m.now()) {
+		if _, protected := m.guard.Protected(ban.IP); !protected {
+			continue
+		}
+		if e != nil {
+			if err := e.RemoveLocal(ban.IP); err != nil {
+				m.setEnforceError(err)
+				return
+			}
+		}
+		m.tracker.Unban(ban.IP)
+		m.logger.Info("ipban removed newly protected address", "ip", ban.IP)
+	}
+}
+
+func failureEventTime(at, now time.Time) time.Time {
+	if at.IsZero() || at.After(now.Add(2*time.Minute)) {
+		return now
+	}
+	return at
+}
+
+func newEventID(now time.Time) string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("%x", now.UnixNano())
 }
 
 func (m *Manager) shutdown() {
@@ -601,6 +672,8 @@ func (m *Manager) Report() *wire.IPBanReport {
 		AppliedVersion: m.applied,
 		ActiveLocal:    active,
 		FleetApplied:   m.fleetApplied,
+		DroppedEvents:  m.droppedEvents,
+		DroppedFails:   m.droppedFails,
 	}
 	switch {
 	case !m.supported:
@@ -639,9 +712,29 @@ func (m *Manager) Report() *wire.IPBanReport {
 	}
 	if n > 0 {
 		r.Events = append([]wire.IPBanEvent(nil), m.events[:n]...)
-		m.events = append([]wire.IPBanEvent(nil), m.events[n:]...)
 	}
 	return r
+}
+
+func (m *Manager) AcknowledgeEvents(events []wire.IPBanEvent) {
+	if len(events) == 0 {
+		return
+	}
+	acked := make(map[string]struct{}, len(events))
+	for _, ev := range events {
+		if ev.ID != "" {
+			acked[ev.ID] = struct{}{}
+		}
+	}
+	m.mu.Lock()
+	kept := m.events[:0]
+	for _, ev := range m.events {
+		if _, ok := acked[ev.ID]; !ok {
+			kept = append(kept, ev)
+		}
+	}
+	m.events = append([]wire.IPBanEvent(nil), kept...)
+	m.mu.Unlock()
 }
 
 func (m *Manager) Status() wire.CollectorStatus {

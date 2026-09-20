@@ -421,6 +421,122 @@ func TestCheckCreatesMinimalEntryForNewRepo(t *testing.T) {
 	}
 }
 
+func TestCheckRemovesAbandonedLockAndRetries(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
+	url := cfg.Repos[0].URL
+	runner := newFakeResticRunner()
+	runner.enqueue(url, "check", fakeResticResponse{stderr: "unable to create lock in backend: repository is already locked by PID 1450852 on ovh-sg", err: errors.New("exit status 11")})
+	runner.enqueue(url, "list", fakeResticResponse{stdout: "acbb474cd1\n"})
+	runner.enqueue(url, "cat", fakeResticResponse{stdout: `{"time":"2026-08-21T15:34:17.068522493Z","exclusive":false,"hostname":"ovh-sg","pid":1450852}`})
+	runner.enqueue(url, "unlock", fakeResticResponse{stdout: "successfully removed 1 locks"})
+	runner.enqueue(url, "check", fakeResticResponse{})
+	result, err := Check(context.Background(), cfg, CheckOptions{}, Options{Runner: runner, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if len(result.Repos) != 1 || !result.Repos[0].Success {
+		t.Fatalf("check should succeed after the abandoned lock is removed: %#v", result.Repos)
+	}
+	unlocked := false
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "unlock" && containsArg(call.Args, "--remove-all") {
+			unlocked = true
+		}
+	}
+	if !unlocked {
+		t.Fatalf("expected an unlock --remove-all call: %#v", runner.calls)
+	}
+	status, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		t.Fatalf("readStatusFile: %v", err)
+	}
+	if status.Repos[0].CheckError != "" {
+		t.Fatalf("check error should be cleared after a passing retry: %q", status.Repos[0].CheckError)
+	}
+}
+
+func TestCheckKeepsRecentLock(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
+	url := cfg.Repos[0].URL
+	runner := newFakeResticRunner()
+	runner.enqueue(url, "check", fakeResticResponse{stderr: "unable to create lock in backend: repository is already locked", err: errors.New("exit status 11")})
+	runner.enqueue(url, "list", fakeResticResponse{stdout: "acbb474cd1"})
+	runner.enqueue(url, "cat", fakeResticResponse{stdout: `{"time":"2026-09-07T07:40:00Z","exclusive":false,"hostname":"ovh-sg","pid":42}`})
+	result, err := Check(context.Background(), cfg, CheckOptions{}, Options{Runner: runner, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if result.Repos[0].Success {
+		t.Fatal("a recent lock must not be removed, so the check stays failed")
+	}
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "unlock" {
+			t.Fatalf("a lock younger than the threshold must not be removed: %#v", call.Args)
+		}
+	}
+	status, err := readStatusFile(cfg.StatusPath)
+	if err != nil {
+		t.Fatalf("readStatusFile: %v", err)
+	}
+	if !strings.Contains(status.Repos[0].CheckError, "already locked") {
+		t.Fatalf("check error not recorded: %q", status.Repos[0].CheckError)
+	}
+}
+
+func TestUnlockRemovesOnlyOldLocks(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Date(2026, 9, 7, 8, 0, 0, 0, time.UTC)
+	url := cfg.Repos[0].URL
+	runner := newFakeResticRunner()
+	runner.enqueue(url, "list", fakeResticResponse{stdout: "aaaa1111 bbbb2222"})
+	runner.enqueue(url, "cat", fakeResticResponse{stdout: `{"time":"2026-08-21T15:34:17Z","hostname":"ovh-sg","pid":1}`})
+	runner.enqueue(url, "cat", fakeResticResponse{stdout: `{"time":"2026-09-07T07:59:00Z","hostname":"ovh-sg","pid":2}`})
+	result, err := Unlock(context.Background(), cfg, UnlockOptions{MinAge: 24 * time.Hour}, Options{Runner: runner, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if len(result.Repos) != 1 {
+		t.Fatalf("repos = %d", len(result.Repos))
+	}
+	if result.Repos[0].Total != 2 || result.Repos[0].Removed != 0 || result.Repos[0].Held != 1 {
+		t.Fatalf("unexpected sweep: %#v", result.Repos[0])
+	}
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "unlock" {
+			t.Fatal("no lock may be removed while one is still recent")
+		}
+	}
+}
+
+func TestUnlockRemoveAllSkipsInspection(t *testing.T) {
+	cfg := testConfig(t)
+	url := cfg.Repos[0].URL
+	runner := newFakeResticRunner()
+	runner.enqueue(url, "list", fakeResticResponse{stdout: "aaaa1111"})
+	runner.enqueue(url, "unlock", fakeResticResponse{})
+	result, err := Unlock(context.Background(), cfg, UnlockOptions{MinAge: 24 * time.Hour, RemoveAll: true}, Options{Runner: runner})
+	if err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if result.Repos[0].Removed != 1 {
+		t.Fatalf("unexpected sweep: %#v", result.Repos[0])
+	}
+	for _, call := range runner.calls {
+		if resticSubcommand(call.Args) == "cat" {
+			t.Fatal("--remove-all must not inspect lock ages")
+		}
+	}
+}
+
+func TestLockIDs(t *testing.T) {
+	got := lockIDs([]byte("acbb474cd1\nnot-a-lock\n bbbb2222 \n"))
+	if !reflect.DeepEqual(got, []string{"acbb474cd1", "bbbb2222"}) {
+		t.Fatalf("lockIDs = %#v", got)
+	}
+}
+
 func TestCheckLockNoop(t *testing.T) {
 	cfg := testConfig(t)
 	lockPath := filepath.Join(filepath.Dir(cfg.StatusPath), "backup.lock")

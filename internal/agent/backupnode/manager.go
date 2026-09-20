@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,9 @@ type Manager struct {
 type nodeRuntime struct {
 	device   *wgtunnel.Device
 	srv      *http.Server
+	store    restserver.Store
 	registry *localRegistry
+	bindings *repositoryBindings
 	spec     runtimeSpec
 	peers    map[wgtunnel.Key]netip.Addr
 	pub      wgtunnel.Key
@@ -150,15 +153,10 @@ func (m *Manager) reconcile(ctx context.Context) {
 	defer m.mu.Unlock()
 
 	if m.runtime != nil && m.runtime.spec == spec {
+		m.runtime.bindings.forgetUnconfigured(cfg.Targets)
 		added := m.runtime.registry.replaceTargets(cfg.Targets)
 		if len(added) > 0 {
-			store, storeErr := restserver.NewDiskStore(spec.storeDir)
-			if storeErr != nil {
-				m.lastStartError = storeErr.Error()
-				m.logger.Error("backup node usage measurement failed", "err", storeErr)
-				return
-			}
-			if measureErr := measureTargetUsage(ctx, store, m.runtime.registry, added); measureErr != nil {
+			if measureErr := measureTargetUsage(ctx, m.runtime.store, m.runtime.registry, m.runtime.bindings, added); measureErr != nil {
 				m.lastStartError = measureErr.Error()
 				m.logger.Error("backup node usage measurement failed", "err", measureErr)
 				return
@@ -210,9 +208,10 @@ func (m *Manager) startRuntime(ctx context.Context, key wgtunnel.Key, spec runti
 		return nil, err
 	}
 	registry := newLocalRegistry(cfg.Targets)
+	bindings := loadRepositoryBindings(spec.storeDir, cfg.Targets, m.logger)
 	measureCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	if err := measureTargetUsage(measureCtx, store, registry, cfg.Targets); err != nil {
+	if err := measureTargetUsage(measureCtx, store, registry, bindings, cfg.Targets); err != nil {
 		device.Close()
 		return nil, err
 	}
@@ -234,7 +233,7 @@ func (m *Manager) startRuntime(ctx context.Context, key wgtunnel.Key, spec runti
 			m.logger.Warn("backup node http server", "err", serveErr)
 		}
 	}()
-	return &nodeRuntime{device: device, srv: srv, registry: registry, spec: spec, peers: peerMap, pub: key.Public()}, nil
+	return &nodeRuntime{device: device, srv: srv, store: store, registry: registry, bindings: bindings, spec: spec, peers: peerMap, pub: key.Public()}, nil
 }
 
 func peerStatsPayload(stats []wgtunnel.PeerStats, known map[wgtunnel.Key]netip.Addr, self wgtunnel.Key) []wire.NodePeerStat {
@@ -326,15 +325,151 @@ func (m *Manager) reconcilePeersLocked(infos []wire.NodePeerInfo) {
 	}
 }
 
-func measureTargetUsage(ctx context.Context, store restserver.Store, registry *localRegistry, targets []wire.NodeTargetInfo) error {
+func measureTargetUsage(ctx context.Context, store restserver.Store, registry *localRegistry, bindings *repositoryBindings, targets []wire.NodeTargetInfo) error {
 	for _, t := range targets {
 		used, err := store.RepoUsage(ctx, t.Name)
 		if err != nil {
 			return fmt.Errorf("measure repository %q: %w", t.Name, err)
 		}
+		bindings.observe(t, used)
 		registry.setUsed(t.Name, used)
 	}
+	bindings.save()
 	return nil
+}
+
+const repositoryBindingsFile = "repository-bindings.json"
+
+type repositoryBindings struct {
+	path     string
+	logger   *slog.Logger
+	saveMu   sync.Mutex
+	mu       sync.Mutex
+	bound    map[string]string
+	warnings map[string]string
+}
+
+func repositoryFingerprint(name, secretHash string) string {
+	sum := sha256.Sum256([]byte("servermonitor-backup-repository-binding\x00" + name + "\x00" + secretHash))
+	return hex.EncodeToString(sum[:])
+}
+
+func loadRepositoryBindings(storeDir string, configured []wire.NodeTargetInfo, logger *slog.Logger) *repositoryBindings {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	b := &repositoryBindings{
+		path:     filepath.Join(storeDir, repositoryBindingsFile),
+		logger:   logger,
+		bound:    map[string]string{},
+		warnings: map[string]string{},
+	}
+	raw, err := os.ReadFile(b.path)
+	switch {
+	case err == nil:
+		var bound map[string]string
+		if unmarshalErr := json.Unmarshal(raw, &bound); unmarshalErr != nil || bound == nil {
+			logger.Warn("backup node repository bindings unreadable; adopting the repositories configured now", "path", b.path, "err", unmarshalErr)
+			b.adopt(configured)
+			break
+		}
+		b.bound = bound
+	case os.IsNotExist(err):
+		b.adopt(configured)
+	default:
+		logger.Warn("backup node repository bindings unreadable; adopting the repositories configured now", "path", b.path, "err", err)
+		b.adopt(configured)
+	}
+	return b
+}
+
+func (b *repositoryBindings) adopt(configured []wire.NodeTargetInfo) {
+	b.mu.Lock()
+	b.bound = map[string]string{}
+	for _, t := range configured {
+		b.bound[t.Name] = repositoryFingerprint(t.Name, t.SecretHash)
+	}
+	b.mu.Unlock()
+	b.save()
+}
+
+func (b *repositoryBindings) observe(t wire.NodeTargetInfo, usedBytes int64) {
+	fingerprint := repositoryFingerprint(t.Name, t.SecretHash)
+	b.mu.Lock()
+	previous, known := b.bound[t.Name]
+	b.bound[t.Name] = fingerprint
+	delete(b.warnings, t.Name)
+	b.mu.Unlock()
+	if usedBytes <= 0 || (known && previous == fingerprint) {
+		return
+	}
+	dataPath := filepath.Join(filepath.Dir(b.path), t.Name)
+	b.logger.Error("backup node bound a repository onto a namespace that already holds data",
+		"repository", t.Name,
+		"existing_bytes", usedBytes,
+		"path", dataPath,
+		"credential_changed", known)
+	b.mu.Lock()
+	b.warnings[t.Name] = fmt.Sprintf("repository %q now serves %d bytes at %s that were written under that name by an earlier binding; expected after a credential rotation, but if the repository was deleted and recreated those snapshots belong to the old one and %s should be deleted", t.Name, usedBytes, dataPath, dataPath)
+	b.mu.Unlock()
+}
+
+func (b *repositoryBindings) forgetUnconfigured(configured []wire.NodeTargetInfo) {
+	keep := make(map[string]bool, len(configured))
+	for _, t := range configured {
+		keep[t.Name] = true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for name := range b.warnings {
+		if !keep[name] {
+			delete(b.warnings, name)
+		}
+	}
+}
+
+func (b *repositoryBindings) pendingWarnings() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, 0, len(b.warnings))
+	for _, message := range b.warnings {
+		out = append(out, message)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (b *repositoryBindings) save() {
+	b.saveMu.Lock()
+	defer b.saveMu.Unlock()
+	b.mu.Lock()
+	raw, err := json.Marshal(b.bound)
+	b.mu.Unlock()
+	if err != nil {
+		b.logger.Error("backup node repository bindings encode failed", "path", b.path, "err", err)
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(b.path), repositoryBindingsFile+".*")
+	if err != nil {
+		b.logger.Error("backup node repository bindings write failed", "path", b.path, "err", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, writeErr := tmp.Write(raw); writeErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		b.logger.Error("backup node repository bindings write failed", "path", b.path, "err", writeErr)
+		return
+	}
+	if closeErr := tmp.Close(); closeErr != nil {
+		_ = os.Remove(tmpName)
+		b.logger.Error("backup node repository bindings write failed", "path", b.path, "err", closeErr)
+		return
+	}
+	if renameErr := os.Rename(tmpName, b.path); renameErr != nil {
+		_ = os.Remove(tmpName)
+		b.logger.Error("backup node repository bindings write failed", "path", b.path, "err", renameErr)
+	}
 }
 
 func (m *Manager) stop() bool {
@@ -410,7 +545,9 @@ func (m *Manager) reportUsage(ctx context.Context) {
 	running := rt != nil
 	var entries []wire.NodeUsageEntry
 	var peers []wire.NodePeerStat
+	var warnings []string
 	if rt != nil {
+		warnings = rt.bindings.pendingWarnings()
 		entries = rt.registry.usageSnapshot()
 		stats, err := rt.device.PeerStats()
 		if err != nil {
@@ -427,13 +564,22 @@ func (m *Manager) reportUsage(ctx context.Context) {
 		Targets: entries,
 		Peers:   peers,
 		Running: &running,
-		Error:   lastStartError,
+		Error:   nodeStatusError(lastStartError, warnings),
 	}, nil); err != nil {
 		m.logger.Debug("backup node usage report failed", "err", err)
 		if rt != nil && len(entries) > 0 {
 			rt.registry.restoreDirty(entries)
 		}
 	}
+}
+
+func nodeStatusError(startError string, warnings []string) string {
+	parts := make([]string, 0, len(warnings)+1)
+	if startError != "" {
+		parts = append(parts, startError)
+	}
+	parts = append(parts, warnings...)
+	return strings.Join(parts, "; ")
 }
 
 func (m *Manager) doJSON(ctx context.Context, method, path string, body any, out any) error {
@@ -505,10 +651,11 @@ func (r *localRegistry) replaceTargets(targets []wire.NodeTargetInfo) []wire.Nod
 		var hash [32]byte
 		copy(hash[:], raw)
 		if existing, ok := r.byName[t.Name]; ok {
+			rebound := existing.hash != hash
 			existing.hash = hash
 			existing.quota = t.QuotaBytes
 			existing.revoked = t.Revoked
-			if !existing.ready {
+			if !existing.ready || rebound {
 				added = append(added, t)
 			}
 			continue

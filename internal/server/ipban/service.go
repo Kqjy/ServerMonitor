@@ -86,6 +86,8 @@ type HostView struct {
 	AppliedVersion  int64                    `json:"applied_version"`
 	ReportedAt      *time.Time               `json:"reported_at"`
 	ConfigStale     bool                     `json:"config_stale"`
+	DroppedEvents   int                      `json:"dropped_events"`
+	DroppedFailures int                      `json:"dropped_failures"`
 }
 
 type ActiveBan struct {
@@ -133,11 +135,12 @@ type Event struct {
 }
 
 type EventFilter struct {
-	HostID int64
-	IP     string
-	Limit  int
-	Before time.Time
-	Export bool
+	HostID   int64
+	IP       string
+	Limit    int
+	Before   time.Time
+	BeforeID int64
+	Export   bool
 }
 
 type Summary struct {
@@ -224,10 +227,21 @@ func (s *Service) bumpVersion(ctx context.Context, tx pgx.Tx) (int64, error) {
 }
 
 func (s *Service) publishVersion(v int64) {
-	s.version.Store(v)
-	s.mu.Lock()
-	s.settings.Version = v
-	s.mu.Unlock()
+	for {
+		current := s.version.Load()
+		if v <= current || s.version.CompareAndSwap(current, v) {
+			if v <= current {
+				return
+			}
+			s.mu.Lock()
+			if v > s.settings.Version {
+				s.settings.Version = v
+				s.settings.UpdatedAt = time.Now()
+			}
+			s.mu.Unlock()
+			return
+		}
+	}
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -297,14 +311,25 @@ func (s *Service) hostPolicy(ctx context.Context, q interface {
 }
 
 func (s *Service) AgentConfig(ctx context.Context, hostID int64) (*wire.IPBanConfig, error) {
-	st := s.Settings()
-	p, err := s.hostPolicy(ctx, s.pool, hostID)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	st, err := s.readSettings(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.hostPolicy(ctx, tx, hostID)
 	if err != nil {
 		return nil, err
 	}
 	eff := s.effectiveFor(st, p)
+	if eff.Enforce && len(st.Allowlist) == 0 {
+		eff.Enforce = false
+	}
 	cfg := &wire.IPBanConfig{
-		Version: s.Version(),
+		Version: st.Version,
 		Policy: wire.IPBanPolicy{
 			Detect:      eff.Detect,
 			Enforce:     eff.Enforce,
@@ -318,7 +343,7 @@ func (s *Service) AgentConfig(ctx context.Context, hostID int64) (*wire.IPBanCon
 		},
 		Allowlist: st.Allowlist,
 	}
-	rows, err := s.pool.Query(ctx, `SELECT ip, expires_at FROM ipban_fleet WHERE expires_at > now() ORDER BY ip`)
+	rows, err := tx.Query(ctx, `SELECT ip, expires_at FROM ipban_fleet WHERE expires_at > now() ORDER BY ip`)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +360,7 @@ func (s *Service) AgentConfig(ctx context.Context, hostID int64) (*wire.IPBanCon
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err = s.pool.Query(ctx, `SELECT ip, created_at FROM ipban_host_cmds WHERE host_id = $1 AND action = 'unban' ORDER BY created_at`, hostID)
+	rows, err = tx.Query(ctx, `SELECT ip, created_at FROM ipban_host_cmds WHERE host_id = $1 AND action = 'unban' ORDER BY created_at`, hostID)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +374,13 @@ func (s *Service) AgentConfig(ctx context.Context, hostID int64) (*wire.IPBanCon
 		cfg.Unban = append(cfg.Unban, wire.IPBanUnban{IP: ip.Unmap().String(), At: at})
 	}
 	rows.Close()
-	return cfg, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanReport) error {
@@ -365,8 +396,8 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 		return err
 	}
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO ipban_hosts (host_id, supported, detect_state, detect_message, enforce_state, enforce_message, sources, active_local, fleet_applied, applied_version, reported_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, now(), now())
+		INSERT INTO ipban_hosts (host_id, supported, detect_state, detect_message, enforce_state, enforce_message, sources, active_local, fleet_applied, applied_version, dropped_events, dropped_failures, reported_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, now(), now())
 		ON CONFLICT (host_id) DO UPDATE SET
 		  supported = EXCLUDED.supported,
 		  detect_state = EXCLUDED.detect_state,
@@ -377,9 +408,11 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 		  active_local = EXCLUDED.active_local,
 		  fleet_applied = EXCLUDED.fleet_applied,
 		  applied_version = EXCLUDED.applied_version,
+		  dropped_events = EXCLUDED.dropped_events,
+		  dropped_failures = EXCLUDED.dropped_failures,
 		  reported_at = now(),
 		  updated_at = now()
-	`, hostID, report.Supported, report.Detect, report.DetectMessage, report.Enforce, report.EnforceMessage, sourcesJSON, report.ActiveLocal, report.FleetApplied, report.AppliedVersion); err != nil {
+	`, hostID, report.Supported, report.Detect, report.DetectMessage, report.Enforce, report.EnforceMessage, sourcesJSON, report.ActiveLocal, report.FleetApplied, report.AppliedVersion, report.DroppedEvents, report.DroppedFails); err != nil {
 		return err
 	}
 	if len(report.Events) == 0 {
@@ -389,12 +422,15 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 	if len(events) > maxEventsPerPost {
 		events = events[:maxEventsPerPost]
 	}
-	st := s.Settings()
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	st, err := s.readSettings(ctx, tx)
+	if err != nil {
+		return err
+	}
 	policy, err := s.hostPolicy(ctx, tx, hostID)
 	if err != nil {
 		return err
@@ -404,6 +440,9 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 	bumped := false
 	now := time.Now()
 	for _, ev := range events {
+		if len(ev.ID) > 128 {
+			continue
+		}
 		ip, err := netip.ParseAddr(ev.IP)
 		if err != nil {
 			continue
@@ -419,10 +458,17 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 			if exp == nil {
 				continue
 			}
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO ipban_events (time, host_id, ip, action, source, failures, user_sample, expires_at, enforced, repeat_count)
-				VALUES ($1, $2, $3::inet, 'ban', $4, $5, $6, $7, $8, $9)
-			`, at, hostID, ip.String(), ev.Source, ev.Failures, ev.User, *exp, ev.Enforced, ev.Count); err != nil {
+			var eventID int64
+			err := tx.QueryRow(ctx, `
+				INSERT INTO ipban_events (time, host_id, ip, action, source, failures, user_sample, expires_at, enforced, repeat_count, agent_event_id, contributed)
+				VALUES ($1, $2, $3::inet, 'ban', $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (host_id, agent_event_id) WHERE host_id IS NOT NULL AND agent_event_id <> '' DO NOTHING
+				RETURNING id
+			`, at, hostID, ip.String(), ev.Source, ev.Failures, ev.User, *exp, ev.Enforced, ev.Count, ev.ID, contribute).Scan(&eventID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `
@@ -442,10 +488,17 @@ func (s *Service) Ingest(ctx context.Context, hostID int64, report *wire.IPBanRe
 				bumped = bumped || changed
 			}
 		case "unban":
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO ipban_events (time, host_id, ip, action, source)
-				VALUES ($1, $2, $3::inet, 'unban', $4)
-			`, at, hostID, ip.String(), ev.Source); err != nil {
+			var eventID int64
+			err := tx.QueryRow(ctx, `
+				INSERT INTO ipban_events (time, host_id, ip, action, source, agent_event_id, contributed)
+				VALUES ($1, $2, $3::inet, 'unban', $4, $5, $6)
+				ON CONFLICT (host_id, agent_event_id) WHERE host_id IS NOT NULL AND agent_event_id <> '' DO NOTHING
+				RETURNING id
+			`, at, hostID, ip.String(), ev.Source, ev.ID, contribute).Scan(&eventID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM ipban_active WHERE host_id = $1 AND ip = $2::inet`, hostID, ip.String()); err != nil {
@@ -473,7 +526,7 @@ func (s *Service) propagate(ctx context.Context, tx pgx.Tx, st Settings, ip neti
 	if err := tx.QueryRow(ctx, `
 		SELECT count(DISTINCT host_id), count(*)
 		FROM ipban_events
-		WHERE ip = $1::inet AND action = 'ban' AND host_id IS NOT NULL AND time > $2
+		WHERE ip = $1::inet AND action = 'ban' AND contributed AND host_id IS NOT NULL AND time > $2
 	`, ip.String(), now.Add(-evidenceWindow)).Scan(&hosts, &bans); err != nil {
 		return false, err
 	}
@@ -631,6 +684,12 @@ func NormalizeAllowlist(entries []string) ([]string, error) {
 		}
 		var text string
 		if p, err := netip.ParsePrefix(e); err == nil {
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("%w: mapped IPv6 prefix %q must be /96 or narrower", ErrValidation, raw)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			text = p.Masked().String()
 		} else if a, err := netip.ParseAddr(e); err == nil {
 			a = a.Unmap()
@@ -651,52 +710,67 @@ func NormalizeAllowlist(entries []string) ([]string, error) {
 }
 
 func (s *Service) UpdateSettings(ctx context.Context, in SettingsInput) (Settings, error) {
-	current := s.Settings()
-	next, err := Validate(applyInput(current, in))
-	if err != nil {
-		return Settings{}, err
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Settings{}, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `
+	var current Settings
+	err = tx.QueryRow(ctx, `
+		SELECT enabled, enforce, contribute, apply_fleet, mode, max_retry, find_time_s, ban_time_s, ban_time_max_s,
+		       ban_private, fleet_min_hosts, fleet_min_bans, fleet_ttl_s, allowlist, version, updated_at
+		FROM ipban_settings WHERE id = 1 FOR UPDATE
+	`).Scan(&current.Enabled, &current.Enforce, &current.Contribute, &current.ApplyFleet, &current.Mode, &current.MaxRetry, &current.FindTimeS, &current.BanTimeS, &current.BanTimeMaxS,
+		&current.BanPrivate, &current.FleetMinHosts, &current.FleetMinBans, &current.FleetTTLS, &current.Allowlist, &current.Version, &current.UpdatedAt)
+	if err != nil {
+		return Settings{}, err
+	}
+	next, err := Validate(applyInput(current, in))
+	if err != nil {
+		return Settings{}, err
+	}
+	if len(next.Allowlist) == 0 {
+		var hostEnforcing bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ipban_hosts WHERE enforce IS TRUE)`).Scan(&hostEnforcing); err != nil {
+			return Settings{}, err
+		}
+		if hostEnforcing {
+			return Settings{}, fmt.Errorf("%w: cannot empty the allowlist while a host-level enforcement override is on", ErrValidation)
+		}
+	}
+	if err := tx.QueryRow(ctx, `
 		UPDATE ipban_settings SET
 		  enabled = $1, enforce = $2, contribute = $3, apply_fleet = $4, mode = $5, max_retry = $6, find_time_s = $7,
 		  ban_time_s = $8, ban_time_max_s = $9, ban_private = $10, fleet_min_hosts = $11, fleet_min_bans = $12, fleet_ttl_s = $13,
-		  allowlist = $14, updated_at = now()
+		  allowlist = $14, version = version + 1, updated_at = now()
 		WHERE id = 1
+		RETURNING version, updated_at
 	`, next.Enabled, next.Enforce, next.Contribute, next.ApplyFleet, next.Mode, next.MaxRetry, next.FindTimeS,
-		next.BanTimeS, next.BanTimeMaxS, next.BanPrivate, next.FleetMinHosts, next.FleetMinBans, next.FleetTTLS, next.Allowlist); err != nil {
-		return Settings{}, err
-	}
-	v, err := s.bumpVersion(ctx, tx)
-	if err != nil {
+		next.BanTimeS, next.BanTimeMaxS, next.BanPrivate, next.FleetMinHosts, next.FleetMinBans, next.FleetTTLS, next.Allowlist).Scan(&next.Version, &next.UpdatedAt); err != nil {
 		return Settings{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Settings{}, err
 	}
-	next.Version = v
-	next.UpdatedAt = time.Now()
 	s.mu.Lock()
-	s.settings = cloneSettings(next)
+	if next.Version >= s.settings.Version {
+		s.settings = cloneSettings(next)
+	}
 	s.mu.Unlock()
-	s.version.Store(v)
+	for current := s.version.Load(); next.Version > current && !s.version.CompareAndSwap(current, next.Version); current = s.version.Load() {
+	}
 	return cloneSettings(next), nil
 }
 
 func (s *Service) UpdateHostPolicy(ctx context.Context, hostID int64, patch HostPolicy) (HostPolicy, error) {
-	st := s.Settings()
-	if patch.Enforce != nil && *patch.Enforce && len(st.Allowlist) == 0 {
-		return HostPolicy{}, fmt.Errorf("%w: add at least one allowlisted address or network before turning enforcement on", ErrValidation)
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return HostPolicy{}, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM ipban_settings WHERE id = 1 FOR UPDATE`); err != nil {
+		return HostPolicy{}, err
+	}
 	var exists bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM hosts WHERE id = $1 AND deleted_at IS NULL)`, hostID).Scan(&exists); err != nil {
 		return HostPolicy{}, err
@@ -704,12 +778,38 @@ func (s *Service) UpdateHostPolicy(ctx context.Context, hostID int64, patch Host
 	if !exists {
 		return HostPolicy{}, ErrNotFound
 	}
-	if _, err := tx.Exec(ctx, `
+	st, err := s.readSettings(ctx, tx)
+	if err != nil {
+		return HostPolicy{}, err
+	}
+	current, err := s.hostPolicy(ctx, tx, hostID)
+	if err != nil {
+		return HostPolicy{}, err
+	}
+	merged := current
+	if patch.Detect != nil {
+		merged.Detect = patch.Detect
+	}
+	if patch.Enforce != nil {
+		merged.Enforce = patch.Enforce
+	}
+	if patch.Contribute != nil {
+		merged.Contribute = patch.Contribute
+	}
+	if patch.ApplyFleet != nil {
+		merged.ApplyFleet = patch.ApplyFleet
+	}
+	if s.effectiveFor(st, merged).Enforce && len(st.Allowlist) == 0 {
+		return HostPolicy{}, fmt.Errorf("%w: add at least one allowlisted address or network before turning enforcement on", ErrValidation)
+	}
+	var saved HostPolicy
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO ipban_hosts (host_id, detect, enforce, contribute, apply_fleet, updated_at)
 		VALUES ($1, $2, $3, $4, $5, now())
 		ON CONFLICT (host_id) DO UPDATE SET
 		  detect = $2, enforce = $3, contribute = $4, apply_fleet = $5, updated_at = now()
-	`, hostID, patch.Detect, patch.Enforce, patch.Contribute, patch.ApplyFleet); err != nil {
+		RETURNING detect, enforce, contribute, apply_fleet
+	`, hostID, merged.Detect, merged.Enforce, merged.Contribute, merged.ApplyFleet).Scan(&saved.Detect, &saved.Enforce, &saved.Contribute, &saved.ApplyFleet); err != nil {
 		return HostPolicy{}, err
 	}
 	v, err := s.bumpVersion(ctx, tx)
@@ -720,7 +820,7 @@ func (s *Service) UpdateHostPolicy(ctx context.Context, hostID int64, patch Host
 		return HostPolicy{}, err
 	}
 	s.publishVersion(v)
-	return patch, nil
+	return saved, nil
 }
 
 func (s *Service) Hosts(ctx context.Context) ([]HostView, error) {
@@ -730,7 +830,8 @@ func (s *Service) Hosts(ctx context.Context) ([]HostView, error) {
 		       p.detect, p.enforce, p.contribute, p.apply_fleet,
 		       COALESCE(p.supported, false), COALESCE(p.detect_state, ''), COALESCE(p.detect_message, ''),
 		       COALESCE(p.enforce_state, ''), COALESCE(p.enforce_message, ''), COALESCE(p.sources, '[]'::jsonb),
-		       COALESCE(p.active_local, 0), COALESCE(p.fleet_applied, 0), COALESCE(p.applied_version, 0), p.reported_at
+		       COALESCE(p.active_local, 0), COALESCE(p.fleet_applied, 0), COALESCE(p.applied_version, 0), p.reported_at,
+		       COALESCE(p.dropped_events, 0), COALESCE(p.dropped_failures, 0)
 		FROM hosts h
 		LEFT JOIN ipban_hosts p ON p.host_id = h.id
 		WHERE h.deleted_at IS NULL
@@ -747,7 +848,7 @@ func (s *Service) Hosts(ctx context.Context) ([]HostView, error) {
 		if err := rows.Scan(&v.HostID, &v.Hostname, &v.OS, &v.AgentVersion, &v.LastSeen, &v.SampleIntervalS, &v.Archived,
 			&v.Override.Detect, &v.Override.Enforce, &v.Override.Contribute, &v.Override.ApplyFleet,
 			&v.Supported, &v.DetectState, &v.DetectMessage, &v.EnforceState, &v.EnforceMessage, &sources,
-			&v.ActiveLocal, &v.FleetApplied, &v.AppliedVersion, &v.ReportedAt); err != nil {
+			&v.ActiveLocal, &v.FleetApplied, &v.AppliedVersion, &v.ReportedAt, &v.DroppedEvents, &v.DroppedFailures); err != nil {
 			return nil, err
 		}
 		if sources == nil {
@@ -755,7 +856,7 @@ func (s *Service) Hosts(ctx context.Context) ([]HostView, error) {
 		}
 		v.Sources = sources
 		v.Effective = s.effectiveFor(st, v.Override)
-		v.ConfigStale = v.ReportedAt != nil && v.AppliedVersion < st.Version && time.Since(v.ReportedAt.Add(0)) < 10*time.Minute && time.Since(st.UpdatedAt) > 2*time.Minute
+		v.ConfigStale = v.ReportedAt != nil && v.AppliedVersion < st.Version && time.Since(st.UpdatedAt) > 2*time.Minute
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -889,6 +990,9 @@ func (s *Service) FleetUnban(ctx context.Context, rawIP, actor string) error {
 	if err != nil {
 		return err
 	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO ipban_suppress (ip, until) VALUES ($1::inet, $2)
 		ON CONFLICT (ip) DO UPDATE SET until = EXCLUDED.until
@@ -899,6 +1003,9 @@ func (s *Service) FleetUnban(ctx context.Context, rawIP, actor string) error {
 		INSERT INTO ipban_host_cmds (host_id, ip, action, created_at)
 		SELECT a.host_id, a.ip, 'unban', $2 FROM ipban_active a WHERE a.ip = $1::inet AND a.expires_at > now()
 	`, ip.String(), now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM ipban_active WHERE ip = $1::inet`, ip.String()); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -915,9 +1022,6 @@ func (s *Service) FleetUnban(ctx context.Context, rawIP, actor string) error {
 		return err
 	}
 	s.publishVersion(v)
-	if tag.RowsAffected() == 0 {
-		return nil
-	}
 	return nil
 }
 
@@ -960,13 +1064,9 @@ func (s *Service) HostUnban(ctx context.Context, hostID int64, rawIP, actor stri
 	return nil
 }
 
-const maxEventExport = 100000
-
 func (s *Service) Events(ctx context.Context, f EventFilter) ([]Event, error) {
 	limit := f.Limit
-	if f.Export {
-		limit = maxEventExport
-	} else if limit <= 0 || limit > 1000 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	var ipFilter *string
@@ -982,16 +1082,20 @@ func (s *Service) Events(ctx context.Context, f EventFilter) ([]Event, error) {
 	if !f.Before.IsZero() {
 		before = &f.Before
 	}
+	beforeID := f.BeforeID
+	if before == nil || beforeID < 0 {
+		beforeID = 0
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT e.id, e.time, e.host_id, COALESCE(h.hostname, ''), e.ip, e.action, e.source, e.failures, e.user_sample, e.expires_at, e.enforced, e.repeat_count, e.actor, e.note
 		FROM ipban_events e
 		LEFT JOIN hosts h ON h.id = e.host_id
 		WHERE ($1 = 0 OR e.host_id = $1)
 		  AND ($2::inet IS NULL OR e.ip = $2::inet)
-		  AND ($3::timestamptz IS NULL OR e.time < $3::timestamptz)
+		  AND ($3::timestamptz IS NULL OR ($5 = 0 AND e.time < $3::timestamptz) OR ($5 > 0 AND (e.time, e.id) < ($3::timestamptz, $5)))
 		ORDER BY e.time DESC, e.id DESC
 		LIMIT $4
-	`, f.HostID, ipFilter, before, limit)
+	`, f.HostID, ipFilter, before, limit, beforeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1007,6 +1111,28 @@ func (s *Service) Events(ctx context.Context, f EventFilter) ([]Event, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+func (s *Service) StreamEvents(ctx context.Context, f EventFilter, visit func(Event) error) error {
+	f.Export = false
+	f.Limit = 1000
+	for {
+		page, err := s.Events(ctx, f)
+		if err != nil {
+			return err
+		}
+		for _, event := range page {
+			if err := visit(event); err != nil {
+				return err
+			}
+		}
+		if len(page) < f.Limit {
+			return nil
+		}
+		last := page[len(page)-1]
+		f.Before = last.Time
+		f.BeforeID = last.ID
+	}
 }
 
 func (s *Service) Summary(ctx context.Context) (Summary, error) {
@@ -1085,6 +1211,9 @@ func parsePrefixes(entries []string) []netip.Prefix {
 	out := make([]netip.Prefix, 0, len(entries))
 	for _, e := range entries {
 		if p, err := netip.ParsePrefix(e); err == nil {
+			if p.Addr().Is4In6() && p.Bits() >= 96 {
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			out = append(out, p)
 		} else if a, err := netip.ParseAddr(e); err == nil {
 			a = a.Unmap()
@@ -1157,12 +1286,17 @@ func statsBucket(window time.Duration) time.Duration {
 }
 
 func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
-	window := f.Window
-	if window <= 0 {
-		window = 7 * 24 * time.Hour
+	requestedWindow := f.Window
+	if requestedWindow <= 0 {
+		requestedWindow = 7 * 24 * time.Hour
 	}
-	if window > 365*24*time.Hour {
-		window = 365 * 24 * time.Hour
+	if requestedWindow > 365*24*time.Hour {
+		requestedWindow = 365 * 24 * time.Hour
+	}
+	window := requestedWindow
+	windowClipped := s.eventRetention > 0 && window > s.eventRetention
+	if windowClipped {
+		window = s.eventRetention
 	}
 	top := f.Top
 	if top <= 0 || top > 200 {
@@ -1176,7 +1310,7 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 		To:            to,
 		BucketS:       int(bucket / time.Second),
 		RetentionS:    int(s.eventRetention / time.Second),
-		WindowClipped: s.eventRetention > 0 && window > s.eventRetention,
+		WindowClipped: windowClipped,
 		Buckets:       []StatsBucket{},
 		Offenders:     []Offender{},
 	}
@@ -1185,8 +1319,8 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH slots AS (
 			SELECT generate_series(
-				time_bucket($2::interval, $3::timestamptz),
-				time_bucket($2::interval, now()),
+				$3::timestamptz,
+				$4::timestamptz - interval '1 microsecond',
 				$2::interval) AS slot
 		)
 		SELECT slots.slot,
@@ -1194,13 +1328,13 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 		       COUNT(DISTINCT e.ip)
 		FROM slots
 		LEFT JOIN ipban_events e
-		  ON time_bucket($2::interval, e.time) = slots.slot
+		  ON e.time >= slots.slot
+		 AND e.time < LEAST(slots.slot + $2::interval, $4::timestamptz)
 		 AND e.action = 'ban'
-		 AND e.time >= $3::timestamptz
 		 AND ($1 = 0 OR e.host_id = $1)
 		GROUP BY slots.slot
 		ORDER BY slots.slot
-	`, f.HostID, bucketArg, from)
+	`, f.HostID, bucketArg, from, to)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -1210,6 +1344,7 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 			rows.Close()
 			return Stats{}, err
 		}
+		b.Time = b.Time.UTC()
 		out.Buckets = append(out.Buckets, b)
 	}
 	rows.Close()
@@ -1221,14 +1356,14 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 		WITH banned AS (
 			SELECT ip, host_id, enforced
 			FROM ipban_events
-			WHERE action = 'ban' AND time >= $2::timestamptz AND ($1 = 0 OR host_id = $1)
+			WHERE action = 'ban' AND time >= $2::timestamptz AND time < $3::timestamptz AND ($1 = 0 OR host_id = $1)
 		)
 		SELECT (SELECT COUNT(*) FROM banned),
 		       (SELECT COUNT(*) FROM banned WHERE enforced),
 		       (SELECT COUNT(DISTINCT ip) FROM banned),
 		       (SELECT COUNT(DISTINCT host_id) FROM banned WHERE host_id IS NOT NULL),
-		       (SELECT COUNT(*) FROM (SELECT ip FROM banned GROUP BY ip HAVING COUNT(*) > 1) r)
-	`, f.HostID, from).Scan(&out.TotalBans, &out.EnforcedBans, &out.DistinctIPs, &out.HostsSeen, &out.RepeatIPs)
+		       (SELECT COUNT(*) FROM (SELECT ip FROM banned GROUP BY ip HAVING CASE WHEN $1 = 0 THEN COUNT(DISTINCT host_id) > 1 ELSE COUNT(*) > 1 END) r)
+	`, f.HostID, from, to).Scan(&out.TotalBans, &out.EnforcedBans, &out.DistinctIPs, &out.HostsSeen, &out.RepeatIPs)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -1243,16 +1378,17 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 		       COUNT(*) FILTER (WHERE e.enforced),
 		       COALESCE((SELECT x.user_sample FROM ipban_events x
 		                 WHERE x.ip = e.ip AND x.action = 'ban' AND x.user_sample <> ''
+		                   AND x.time >= $2::timestamptz AND x.time < $4::timestamptz
 		                   AND ($1 = 0 OR x.host_id = $1)
 		                 ORDER BY x.time DESC LIMIT 1), ''),
 		       EXISTS (SELECT 1 FROM ipban_fleet f WHERE f.ip = e.ip AND f.expires_at > now()),
 		       EXISTS (SELECT 1 FROM ipban_active a WHERE a.ip = e.ip AND a.expires_at > now() AND ($1 = 0 OR a.host_id = $1))
 		FROM ipban_events e
-		WHERE e.action = 'ban' AND e.time >= $2::timestamptz AND ($1 = 0 OR e.host_id = $1)
+		WHERE e.action = 'ban' AND e.time >= $2::timestamptz AND e.time < $4::timestamptz AND ($1 = 0 OR e.host_id = $1)
 		GROUP BY e.ip
 		ORDER BY COUNT(*) DESC, MAX(e.time) DESC
 		LIMIT $3
-	`, f.HostID, from, top)
+	`, f.HostID, from, top, to)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -1264,6 +1400,8 @@ func (s *Service) Stats(ctx context.Context, f StatsFilter) (Stats, error) {
 			return Stats{}, err
 		}
 		o.IP = ip.Unmap().String()
+		o.FirstSeen = o.FirstSeen.UTC()
+		o.LastSeen = o.LastSeen.UTC()
 		out.Offenders = append(out.Offenders, o)
 	}
 	if err := orows.Err(); err != nil {

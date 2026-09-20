@@ -113,7 +113,7 @@ Staging lands under `%ProgramData%\ServerMonitor\restore\<snapshot-id>\`, with t
 
 A backup that has never been read back is a hope, not a backup. Two mechanisms verify the repositories on a schedule, both driven by `sm-agent backup check`.
 
-The installer provisions a **weekly** check: `sm-backup-check.timer` (`OnCalendar=weekly`, up to 6h of randomized delay, `Persistent=true`) triggers `sm-backup-check.service`, which runs `sm-agent backup check --read-data-subset 5%` under the same hardened, read-only sandbox as the backup unit. On Windows the equivalent is a weekly **ServerMonitor Backup Check** scheduled task running as SYSTEM with a 6-hour random delay. Each check runs against **every** configured repository sequentially and continues past a failing one; it exits non-zero if any repo failed, and writes only `check_last` + `check_success` per repo into the status file — the backup fields (last success, snapshots, added bytes, prior backup error) are left untouched, so a check never masks a backup problem. The Backups tab and the `backup_check_ok` metric key off those fields; the *repo check failing* alert preset fires on them.
+The installer provisions a **weekly** check: `sm-backup-check.timer` (`OnCalendar=weekly`, up to 6h of randomized delay, `Persistent=true`) triggers `sm-backup-check.service`, which runs `sm-agent backup check --read-data-subset 5%` under the same hardened, read-only sandbox as the backup unit. On Windows the equivalent is a weekly **ServerMonitor Backup Check** scheduled task running as SYSTEM with a 6-hour random delay. Each check runs against **every** configured repository sequentially and continues past a failing one; it exits non-zero if any repo failed, and writes only `check_last` + `check_success` + `check_error` per repo into the status file — the backup fields (last success, snapshots, added bytes, prior backup error) are left untouched, so a check never masks a backup problem. The Backups tab and the `backup_check_ok` metric key off those fields; the *repo check failing* alert preset fires on them.
 
 `restic check` always verifies repository structure and metadata. `--read-data-subset` additionally re-reads and re-hashes some fraction of the actual pack data, which is what catches silent bit-rot at the endpoint. It's a cost knob:
 
@@ -131,6 +131,22 @@ sm-agent backup check --repo repo2 --read-data-subset 100%
 **Check both repositories.** Two independent endpoints only protect you if both are known-good — an unverified second copy is not a second copy. The default check covers every repo for exactly this reason.
 
 `restic check` needs only the repository and its password, not the host's data, so it can run from **any** machine holding the recovery kit — a storage box, an admin workstation — to offload the read I/O from the production host entirely. That is the same append-only-friendly property used by the storage-VPS external prune pattern below.
+
+### Abandoned locks
+
+restic takes a lock for the duration of an operation and removes it on exit. A process that dies without exiting — a container redeploy or OOM kill mid-backup, a host that loses power, a `SIGKILL` after a hung endpoint — leaves that lock behind. It is not automatically reclaimed: restic only ignores a lock as stale when it can prove the owner is dead, which requires the recorded hostname to match the current one and the recorded PID to be gone. A lock written under a container's identity fails that test forever.
+
+The asymmetry to know about is that `restic backup` takes a *shared* lock while `restic check` takes an *exclusive* one, so an abandoned lock lets backups keep succeeding while every check fails with `unable to create lock in backend: repository is already locked`. Repositories reached through a storage node or the server's REST endpoint recover on their own, because that endpoint permits lock deletion even in append-only mode; a direct S3 destination has no such carve-out and stays blocked.
+
+A check that fails this way now removes locks older than 24h and retries once, logging what it removed. Locks younger than that are left alone — they may belong to a live operation on another host sharing the repository. To clear them by hand:
+
+```bash
+sm-agent backup unlock
+sm-agent backup unlock --repo repo2 --older-than 48h
+sm-agent backup unlock --remove-all
+```
+
+`--remove-all` removes every lock regardless of age, including one a running operation still holds, which aborts that operation. Use it only when no backup is running anywhere against that repository.
 
 ### The restore drill
 

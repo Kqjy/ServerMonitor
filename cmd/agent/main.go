@@ -102,6 +102,9 @@ func main() {
 		logger.Error("load config", "path", *configPath, "err", err)
 		os.Exit(1)
 	}
+	if !cfg.EnableIPBan {
+		cfg.Disabled = appendCollectorOnce(cfg.Disabled, "ipban")
+	}
 
 	if cfg.InsecureSkip {
 		logger.Warn("insecure_skip_verify=true: TLS certificate verification is DISABLED - never use in production",
@@ -491,7 +494,7 @@ func syncPrivilegedCmd(args []string) {
 }
 
 func maybeStartIPBan(ctx context.Context, cfg *config.Config, client *transport.Client, logger *slog.Logger) {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" || !cfg.EnableIPBan {
 		return
 	}
 	enabled := false
@@ -520,6 +523,15 @@ func maybeStartIPBan(ctx context.Context, cfg *config.Config, client *transport.
 			}
 		}
 	}()
+}
+
+func appendCollectorOnce(names []string, name string) []string {
+	for _, existing := range names {
+		if existing == name {
+			return names
+		}
+	}
+	return append(names, name)
 }
 
 type managedBackupSyncState struct {
@@ -625,7 +637,7 @@ func ipbanCmd(args []string) {
 
 func backupCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|unlock|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -775,6 +787,37 @@ func backupCmd(args []string) {
 		if !result.AllSucceeded() {
 			os.Exit(1)
 		}
+	case "unlock":
+		fs := flag.NewFlagSet("backup unlock", flag.ExitOnError)
+		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
+		repoName := fs.String("repo", "", "restrict the unlock to one repo by name")
+		olderThan := fs.Duration("older-than", 24*time.Hour, "only remove locks older than this")
+		removeAll := fs.Bool("remove-all", false, "remove every lock, including one a running operation may still hold")
+		_ = fs.Parse(args[1:])
+		result, err := agentbackup.UnlockFromConfigPath(ctx, *configPath, agentbackup.UnlockOptions{
+			Repo:      *repoName,
+			MinAge:    *olderThan,
+			RemoveAll: *removeAll,
+		}, agentbackup.BaseOptions(logger))
+		if err != nil {
+			logger.Error("backup unlock failed", "err", err)
+			os.Exit(1)
+		}
+		if result.LockSkipped {
+			os.Exit(0)
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "REPO\tLOCKS\tREMOVED\tHELD\tERROR")
+		for _, repo := range result.Repos {
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\n", repo.Name, repo.Total, repo.Removed, repo.Held, repo.Error)
+		}
+		if err := tw.Flush(); err != nil {
+			logger.Error("write backup unlock output failed", "err", err)
+			os.Exit(1)
+		}
+		if !result.AllSucceeded() {
+			os.Exit(1)
+		}
 	case "tunnel-enroll":
 		fs := flag.NewFlagSet("backup tunnel-enroll", flag.ExitOnError)
 		configPath := fs.String("config", agentbackup.DefaultConfigPath(), "path to backup.toml")
@@ -895,7 +938,7 @@ func backupCmd(args []string) {
 				result.Summary.BytesRestored, result.Summary.TotalBytes, result.Summary.FilesSkipped)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
+		fmt.Fprintln(os.Stderr, "usage: sm-agent backup {run|init|snapshots|ls|check|unlock|restore|tunnel-enroll|proxy|provision|recovery-kit} [options]")
 		os.Exit(2)
 	}
 }
@@ -1193,6 +1236,7 @@ func registerCmd(args []string) {
 	configPath := fs.String("config", defaultConfigPath(), "where to write the agent config")
 	insecure := fs.Bool("insecure", false, "skip TLS cert verification for the registration call only AND allow http:// (debug only)")
 	persistInsecure := fs.Bool("persist-insecure", false, "also write insecure_skip_verify=true into the agent config (sticky; debug only)")
+	enableIPBan := fs.Bool("enable-ipban", false, "opt in to the Linux sshd IP-ban collector")
 	_ = fs.Parse(args)
 
 	if *server == "" {
@@ -1243,7 +1287,8 @@ server_pubkey = %q
 interval_s    = %d
 spool_path    = %q
 insecure_skip_verify = %t
-`, *server, token, pubkey, *intervalS, defaultSpoolPath(), stickyInsecure)
+enable_ipban = %t
+`, *server, token, pubkey, *intervalS, defaultSpoolPath(), stickyInsecure, *enableIPBan)
 
 	cfgDir := filepath.Dir(*configPath)
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {

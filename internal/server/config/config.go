@@ -280,14 +280,8 @@ func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
 var intervalRE = regexp.MustCompile(`^(\d+)\s+(second|minute|hour|day|week|month|year)s?$`)
 
 func ValidateInterval(v string) error {
-	v = strings.TrimSpace(v)
-	if v == "" || strings.EqualFold(v, "forever") {
-		return nil
-	}
-	if !intervalRE.MatchString(v) {
-		return fmt.Errorf("must be empty, \"forever\", or N <unit> where unit is second|minute|hour|day|week|month|year (got %q)", v)
-	}
-	return nil
+	_, err := parseIntervalDuration(v)
+	return err
 }
 
 func IsForever(v string) bool {
@@ -298,35 +292,47 @@ func IsForever(v string) bool {
 const intervalForeverDuration = 100 * 365 * 24 * time.Hour
 
 func IntervalToDuration(v string) time.Duration {
+	d, err := parseIntervalDuration(v)
+	if err != nil {
+		return intervalForeverDuration
+	}
+	return d
+}
+
+func parseIntervalDuration(v string) (time.Duration, error) {
 	v = strings.TrimSpace(v)
 	if v == "" || strings.EqualFold(v, "forever") {
-		return intervalForeverDuration
+		return intervalForeverDuration, nil
 	}
 	m := intervalRE.FindStringSubmatch(v)
 	if m == nil {
-		return 0
+		return 0, fmt.Errorf("must be empty, \"forever\", or N <unit> where unit is second|minute|hour|day|week|month|year (got %q)", v)
 	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0
+	n, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("interval must be greater than zero and fit in a duration (got %q)", v)
 	}
+	var unit time.Duration
 	switch m[2] {
 	case "second":
-		return time.Duration(n) * time.Second
+		unit = time.Second
 	case "minute":
-		return time.Duration(n) * time.Minute
+		unit = time.Minute
 	case "hour":
-		return time.Duration(n) * time.Hour
+		unit = time.Hour
 	case "day":
-		return time.Duration(n) * 24 * time.Hour
+		unit = 24 * time.Hour
 	case "week":
-		return time.Duration(n) * 7 * 24 * time.Hour
+		unit = 7 * 24 * time.Hour
 	case "month":
-		return time.Duration(n) * 30 * 24 * time.Hour
+		unit = 30 * 24 * time.Hour
 	case "year":
-		return time.Duration(n) * 365 * 24 * time.Hour
+		unit = 365 * 24 * time.Hour
 	}
-	return 0
+	if n > uint64((1<<63-1)/unit) {
+		return 0, fmt.Errorf("interval is too large (got %q)", v)
+	}
+	return time.Duration(n) * unit, nil
 }
 
 func looksLikePlaceholder(v string) bool {

@@ -77,10 +77,15 @@ func TestTailFileFollowsAppendsTruncationAndRotation(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	if err := os.WriteFile(path, []byte("Aug 21 13:36:00 web01 sshd-session[99]: Invalid user x from 203.0.113.6 port 2\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("Aug 21 13:35:01 web01 sshd[1234]: Failed password for root from 203.0.113.5 port 1 ssh2\nAug 21 13:36:00 web01 sshd-session[99]: Invalid user x from 203.0.113.6 port 2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	expectFailure(t, got, "203.0.113.6", 6*time.Second)
+	select {
+	case f := <-got:
+		t.Fatalf("truncation replayed an old failure: %+v", f)
+	case <-time.After(200 * time.Millisecond):
+	}
 
 	if runtime.GOOS != "windows" {
 		if err := os.Rename(path, path+".1"); err != nil {
@@ -118,6 +123,7 @@ func TestJournalLineParsing(t *testing.T) {
 	src.handleJournalLine([]byte(`{"MESSAGE":[70,97],"__REALTIME_TIMESTAMP":"1"}`))
 	src.handleJournalLine([]byte(`not json`))
 	src.handleJournalLine([]byte(`{"MESSAGE":"Accepted publickey for deploy from 203.0.113.10 port 1 ssh2"}`))
+	src.handleJournalLine([]byte(`{"MESSAGE":"Failed password for root from 203.0.113.11 port 1 ssh2","SYSLOG_IDENTIFIER":"cron"}`))
 	select {
 	case f := <-got:
 		t.Fatalf("unexpected failure %+v", f)

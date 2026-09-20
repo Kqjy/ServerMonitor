@@ -162,17 +162,20 @@ func New(d Deps) *Router {
 
 				if d.IPBan != nil {
 					r.Get("/ipban/settings", ipbanSettingsHandler(d.IPBan, d.TrustedProxies))
-					r.Put("/ipban/settings", ipbanUpdateSettingsHandler(d.IPBan, d.TrustedProxies))
 					r.Get("/ipban/summary", ipbanSummaryHandler(d.IPBan))
 					r.Get("/ipban/hosts", ipbanHostsHandler(d.IPBan))
-					r.Put("/ipban/hosts/{id}", ipbanUpdateHostHandler(d.IPBan))
 					r.Get("/ipban/active", ipbanActiveHandler(d.IPBan))
 					r.Get("/ipban/fleet", ipbanFleetHandler(d.IPBan))
-					r.Post("/ipban/fleet", ipbanManualBanHandler(d.IPBan))
-					r.Delete("/ipban/fleet/{ip}", ipbanFleetUnbanHandler(d.IPBan))
-					r.Post("/ipban/unban", ipbanHostUnbanHandler(d.IPBan))
 					r.Get("/ipban/events", ipbanEventsHandler(d.IPBan))
 					r.Get("/ipban/stats", ipbanStatsHandler(d.IPBan))
+					r.Group(func(r chi.Router) {
+						r.Use(requireAdmin)
+						r.Put("/ipban/settings", ipbanUpdateSettingsHandler(d.IPBan, d.TrustedProxies))
+						r.Put("/ipban/hosts/{id}", ipbanUpdateHostHandler(d.IPBan))
+						r.Post("/ipban/fleet", ipbanManualBanHandler(d.IPBan))
+						r.Delete("/ipban/fleet/{ip}", ipbanFleetUnbanHandler(d.IPBan))
+						r.Post("/ipban/unban", ipbanHostUnbanHandler(d.IPBan))
+					})
 				}
 
 				if d.BackupTargets != nil {

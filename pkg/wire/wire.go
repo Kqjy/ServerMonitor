@@ -71,6 +71,7 @@ type BackupRepoStatus struct {
 	SnapshotCount int64            `json:"snapshot_count,omitempty"`
 	CheckLast     *time.Time       `json:"check_last,omitempty"`
 	CheckSuccess  *bool            `json:"check_success,omitempty"`
+	CheckError    string           `json:"check_error,omitempty"`
 	Tunnel        bool             `json:"tunnel,omitempty"`
 	NextRun       *time.Time       `json:"next_run,omitempty"`
 	Paths         []string         `json:"paths,omitempty"`
@@ -204,6 +205,7 @@ type IPBanSourceStatus struct {
 }
 
 type IPBanEvent struct {
+	ID        string     `json:"id,omitempty"`
 	Time      time.Time  `json:"time"`
 	IP        string     `json:"ip"`
 	Action    string     `json:"action"`
@@ -225,6 +227,8 @@ type IPBanReport struct {
 	ActiveLocal    int                 `json:"active_local"`
 	FleetApplied   int                 `json:"fleet_applied"`
 	AppliedVersion int64               `json:"applied_version"`
+	DroppedEvents  int                 `json:"dropped_events,omitempty"`
+	DroppedFails   int                 `json:"dropped_failures,omitempty"`
 	Events         []IPBanEvent        `json:"events,omitempty"`
 }
 

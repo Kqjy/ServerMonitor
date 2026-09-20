@@ -7,15 +7,16 @@
     type IPBanHost,
     type IPBanHostPolicy,
     type IPBanFleet,
-    type IPBanEvent,
     type IPBanSummary,
     type IPBanStats
   } from '$lib/api';
   import { timeAgo, timeUntil, statusFor } from '$lib/format';
+  import { EventPager } from '$lib/ipban.svelte';
   import { announcer } from '$lib/announce.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import StatusDot from '$lib/components/StatusDot.svelte';
   import MultiChart from '$lib/components/MultiChart.svelte';
+  import EventPagination from '$lib/components/EventPagination.svelte';
 
   type Tone = 'good' | 'warn' | 'bad' | 'info' | 'none';
   const toneText: Record<Tone, string> = {
@@ -43,15 +44,7 @@
   let summary = $state<IPBanSummary | null>(null);
   let hosts = $state<IPBanHost[]>([]);
   let fleet = $state<IPBanFleet[]>([]);
-  let events = $state<IPBanEvent[]>([]);
-  const evPageSizes = [8, 16, 50];
-  let evPage = $state(0);
-  let evPageSize = $state(evPageSizes[0]);
-  const evPageCount = $derived(Math.max(1, Math.ceil(events.length / evPageSize)));
-  const evPageIndex = $derived(Math.min(Math.max(evPage, 0), evPageCount - 1));
-  const evFrom = $derived(evPageIndex * evPageSize);
-  const evTo = $derived(Math.min(evFrom + evPageSize, events.length));
-  const pagedEvents = $derived(events.slice(evFrom, evTo));
+  const events = new EventPager();
   let stats = $state<IPBanStats | null>(null);
   let statsWindow = $state('168h');
   const statsWindows = [
@@ -60,15 +53,6 @@
     { label: '30 d', value: '720h' },
     { label: '90 d', value: '2160h' }
   ];
-  function gotoEvPage(page: number) {
-    evPage = Math.min(Math.max(page, 0), evPageCount - 1);
-  }
-
-  function setEvPageSize(size: number) {
-    evPageSize = size;
-    evPage = 0;
-  }
-
   const banSeries = $derived(
     stats
       ? [
@@ -114,6 +98,8 @@
   let banBusy = $state(false);
   let banError = $state<string | null>(null);
   let confirmManualBan = $state(false);
+  let banTarget = $state('');
+  let banFromDraft = $state(false);
   let toFleetUnban = $state<IPBanFleet | null>(null);
   let policyError = $state<string | null>(null);
   let policyBusy = $state<number | null>(null);
@@ -154,11 +140,12 @@
     const ac = new AbortController();
     inflight = ac;
     try {
+      const evDepth = events.refreshDepth;
       const [sum, hs, fl, ev, stt, st] = await Promise.all([
         api.ipbanSummary({ signal: ac.signal }),
         api.ipbanHosts({ signal: ac.signal }),
         api.ipbanFleet({ signal: ac.signal }),
-        api.ipbanEvents({ limit: 100, signal: ac.signal }),
+        evDepth ? api.ipbanEvents({ limit: evDepth, signal: ac.signal }) : Promise.resolve(null),
         api.ipbanStats({ window: statsWindow, top: 12, signal: ac.signal }),
         includeSettings || !settings ? api.ipbanSettings({ signal: ac.signal }) : Promise.resolve(null)
       ]);
@@ -166,7 +153,7 @@
       summary = sum;
       hosts = hs;
       fleet = fl;
-      events = ev;
+      if (ev) events.head(ev, evDepth);
       stats = stt;
       if (st) {
         settings = st;
@@ -202,7 +189,8 @@
   }
 
   function banOffender(ip: string) {
-    banIP = ip;
+    banTarget = ip;
+    banFromDraft = false;
     banError = null;
     confirmManualBan = true;
   }
@@ -278,13 +266,21 @@
   }
 
   async function doManualBan() {
+	if (banBusy || !banTarget) return;
     banError = null;
-    const ban = await api.ipbanManualBan({ ip: banIP.trim(), ttl_s: Number(banTTL), note: banNote.trim() });
-    announcer.say(`${ban.ip} added to the fleet blocklist`);
-    banIP = '';
-    banNote = '';
-    confirmManualBan = false;
-    void refresh();
+	banBusy = true;
+	try {
+		const ban = await api.ipbanManualBan({ ip: banTarget, ttl_s: Number(banTTL), note: banNote.trim() });
+		announcer.say(`${ban.ip} added to the fleet blocklist`);
+		if (banFromDraft) banIP = '';
+		banNote = '';
+		void refresh();
+	} catch (err) {
+		banError = (err as Error).message;
+		throw err;
+	} finally {
+		banBusy = false;
+	}
   }
 
   async function doFleetUnban() {
@@ -321,7 +317,7 @@
   }
 
   function detectInfo(h: IPBanHost): { label: string; tone: Tone } {
-    if (!h.os.toLowerCase().includes('linux')) return { label: 'Linux only', tone: 'none' };
+    if (!(h.os ?? '').toLowerCase().includes('linux')) return { label: 'Linux only', tone: 'none' };
     switch (h.detect_state) {
       case 'ok':
         return { label: 'watching sshd', tone: 'good' };
@@ -345,7 +341,7 @@
   }
 
   function enforceInfo(h: IPBanHost): { label: string; tone: Tone } {
-    if (!h.os.toLowerCase().includes('linux')) return { label: '—', tone: 'none' };
+    if (!(h.os ?? '').toLowerCase().includes('linux')) return { label: '—', tone: 'none' };
     if (h.enforce_state === '') return { label: '—', tone: 'none' };
     if (!h.effective.enforce) return { label: 'observing', tone: 'info' };
     switch (h.enforce_state) {
@@ -365,9 +361,10 @@
   const liveHosts = $derived(hosts.filter((h) => !h.archived));
   const attention = $derived(
     liveHosts.filter((h) => {
-      if (!h.os.toLowerCase().includes('linux')) return false;
+      if (!(h.os ?? '').toLowerCase().includes('linux')) return false;
       if (h.detect_state === 'no_permission' || h.detect_state === 'unavailable' || h.detect_state === 'error') return true;
       if (h.effective.enforce && (h.enforce_state === 'no_permission' || h.enforce_state === 'unsupported' || h.enforce_state === 'error')) return true;
+      if (h.dropped_events > 0 || h.dropped_failures > 0) return true;
       return h.config_stale;
     })
   );
@@ -379,6 +376,7 @@
     if (h.enforce_state === 'no_permission') return 'bans cannot be written to nftables — reinstall with SM_ENABLE_IPBAN=1';
     if (h.enforce_state === 'unsupported') return 'kernel has no nf_tables — ' + (h.enforce_message ?? '');
     if (h.enforce_state === 'error') return 'nftables error — ' + (h.enforce_message ?? '');
+    if (h.dropped_events > 0 || h.dropped_failures > 0) return `agent queue overflow — ${h.dropped_events} ban events and ${h.dropped_failures} auth failures dropped`;
     if (h.config_stale) return `still on policy version ${h.applied_version}, current is ${settings?.version ?? '?'}`;
     return '';
   }
@@ -442,7 +440,7 @@
           <div class="text-[11px] text-zinc-500 mt-0.5">{summary.hosts_observing} observing only{summary.hosts_blocked > 0 ? ` · ${summary.hosts_blocked} with errors` : ''}</div>
         </div>
         <div class="px-4 sm:px-5 py-4">
-          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Active bans</div>
+          <div class="text-[11px] uppercase tracking-wider text-zinc-500">Tracked bans</div>
           <div class="text-2xl font-semibold text-zinc-100 numeric mt-1">{summary.active_local}</div>
           <div class="text-[11px] text-zinc-500 mt-0.5">{summary.bans_24h} issued in the last 24 h</div>
         </div>
@@ -601,6 +599,8 @@
                 banError = 'Enter an IP address to ban.';
                 return;
               }
+              banTarget = banIP.trim();
+              banFromDraft = true;
               confirmManualBan = true;
             }}>
             <div class="min-w-[12rem] flex-1">
@@ -708,7 +708,7 @@
                   {#each liveHosts as h (h.host_id)}
                     {@const d = detectInfo(h)}
                     {@const en = enforceInfo(h)}
-                    {@const linux = h.os.toLowerCase().includes('linux')}
+                    {@const linux = (h.os ?? '').toLowerCase().includes('linux')}
                     <tr class="hover:bg-zinc-900/60 {policyBusy === h.host_id ? 'opacity-60' : ''}">
                       <td class="px-4 py-2.5">
                         <div class="flex items-center gap-2">
@@ -775,11 +775,11 @@
               {#each liveHosts as h (h.host_id)}
                 {@const d = detectInfo(h)}
                 {@const en = enforceInfo(h)}
-                {@const linux = h.os.toLowerCase().includes('linux')}
+                {@const linux = (h.os ?? '').toLowerCase().includes('linux')}
                 <div class="px-4 py-3 space-y-2">
                   <div class="flex items-center justify-between gap-3">
                     <a href="/hosts/{h.host_id}?tab=security" class="min-w-0 truncate font-mono text-sm text-zinc-200 hover:text-zinc-100">{h.hostname}</a>
-                    <span class="text-xs text-zinc-500 numeric">{h.active_local} active</span>
+                    <span class="text-xs text-zinc-500 numeric">{h.active_local} tracked</span>
                   </div>
                   <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
                     <span class="{toneText[d.tone]}">{d.label}</span>
@@ -930,11 +930,11 @@
           </a>
         </div>
         <div class="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
-          {#if events.length === 0}
+          {#if events.rows.length === 0}
             <div class="px-5 py-6 text-sm text-zinc-500">Nothing recorded yet.</div>
           {:else}
             <ul class="divide-y divide-zinc-800/70">
-              {#each pagedEvents as ev (ev.id)}
+              {#each events.visible as ev (ev.id)}
                 {@const a = actionLabel(ev.action, ev.enforced)}
                 <li class="px-4 sm:px-5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
                   <span class="text-[11px] text-zinc-500 numeric w-24 shrink-0" title={absTime(ev.time)}>{timeAgo(ev.time)}</span>
@@ -956,47 +956,7 @@
                 </li>
               {/each}
             </ul>
-            {#if events.length > evPageSizes[0]}
-              <div class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-5 py-2.5 border-t border-zinc-800">
-                <div class="flex items-center gap-2">
-                  <div class="text-[10px] uppercase tracking-wider text-zinc-500">Rows</div>
-                  <div class="flex items-center gap-0.5">
-                    {#each evPageSizes as size (size)}
-                      <button
-                        type="button"
-                        onclick={() => setEvPageSize(size)}
-                        aria-pressed={evPageSize === size}
-                        class="px-2 py-1 rounded-md text-xs font-medium numeric transition-colors {evPageSize === size ? 'bg-zinc-100/10 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40'}">{size}</button>
-                    {/each}
-                  </div>
-                </div>
-                <div class="flex items-center gap-2">
-                  <div class="text-xs text-zinc-500 numeric">{evFrom + 1}–{evTo} of {events.length} · page {evPageIndex + 1} of {evPageCount}</div>
-                  <button
-                    type="button"
-                    onclick={() => gotoEvPage(evPageIndex - 1)}
-                    disabled={evPageIndex === 0}
-                    aria-label="Newer events"
-                    title="Newer"
-                    class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
-                    <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
-                      <path d="M8 2.25 4.25 6 8 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    onclick={() => gotoEvPage(evPageIndex + 1)}
-                    disabled={evPageIndex >= evPageCount - 1}
-                    aria-label="Older events"
-                    title="Older"
-                    class="inline-flex items-center rounded-md border border-zinc-800 px-2 py-1.5 text-zinc-400 transition-colors hover:text-zinc-100 hover:bg-zinc-800/60 disabled:opacity-35 disabled:hover:text-zinc-400 disabled:hover:bg-transparent">
-                    <svg aria-hidden="true" viewBox="0 0 12 12" fill="none" class="h-3 w-3">
-                      <path d="M4 2.25 7.75 6 4 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </button>
-                </div>
-              </div>
-            {/if}
+            <EventPagination pager={events} />
           {/if}
         </div>
       </section>
@@ -1006,7 +966,7 @@
 
 {#snippet manualBanBody()}
   <p class="text-sm text-zinc-300">
-    Add <span class="font-mono text-zinc-100">{banIP.trim()}</span> to the fleet blocklist for {ttlLabel(banTTL)}. Every enforcing host that applies the fleet list drops its traffic within about a minute.
+    Add <span class="font-mono text-zinc-100">{banTarget}</span> to the fleet blocklist for {ttlLabel(banTTL)}. Every enforcing host that applies the fleet list drops its traffic within about a minute.
   </p>
   {#if !settings?.enforce}
     <p class="mt-2 text-xs text-amber-200/90">Enforcement is currently off fleet-wide, so the entry is recorded but no host blocks it until enforcement is turned on.</p>
@@ -1020,7 +980,7 @@
   confirmLabel="Ban"
   danger
   onconfirm={doManualBan}
-  onclose={() => (confirmManualBan = false)}
+  onclose={() => { confirmManualBan = false; banTarget = ''; banFromDraft = false; }}
 />
 
 {#snippet fleetUnbanBody()}

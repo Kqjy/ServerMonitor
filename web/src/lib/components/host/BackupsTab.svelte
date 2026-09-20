@@ -150,6 +150,17 @@
     return `backup failed: destination unreachable (${details.join('; ')})`;
   }
 
+  function condenseCheckError(error: string): string {
+    const lower = error.toLowerCase();
+    if (lower.includes('already locked') || lower.includes('unable to create lock')) {
+      return 'a previous operation left a lock behind, so the repository could not be verified';
+    }
+    const reasons = ['connection reset by peer', 'connection refused', 'i/o timeout', 'no route to host', 'context deadline exceeded'];
+    const reason = reasons.find((candidate) => lower.includes(candidate));
+    if (reason) return `destination unreachable (${reason})`;
+    return error.split('\n')[0].trim();
+  }
+
   const enableSnippet = $derived.by(() => {
     if (linkedDirectRepo) {
       return isWindows
@@ -181,6 +192,7 @@
     snapshotCount: number | null;
     checkLastIso?: string;
     checkSuccess?: boolean;
+    checkError?: string;
     checkAgeS: number | null;
     backupTone: Tone;
     checkTone: Tone;
@@ -354,6 +366,7 @@
           snapshotCount: s.snapshot_count ?? null,
           checkLastIso: s.check_last,
           checkSuccess: s.check_success,
+          checkError: s.check_error,
           checkAgeS,
           backupTone: backupTone(s.success, lastSuccessAgeS, pending),
           checkTone: checkTone(s.check_success, s.check_last, checkAgeS),
@@ -1022,7 +1035,7 @@
                 <td class="hidden sm:table-cell px-2 sm:px-3 py-2.5">
                   <div class="flex items-center gap-2">
                     <span class="numeric {toneText[v.checkTone]}">{v.checkLastIso ? timeAgo(v.checkLastIso) : 'never'}</span>
-                    {#if v.checkSuccess === false}<span class="text-[10px] uppercase tracking-wider text-rose-300">failed</span>{/if}
+                    {#if v.checkSuccess === false}<span class="text-[10px] uppercase tracking-wider text-rose-300" title={v.checkError ? condenseCheckError(v.checkError) : undefined}>failed</span>{/if}
                   </div>
                 </td>
                 <td class="hidden sm:table-cell px-2 sm:px-3 py-2.5 text-right numeric text-zinc-300" title={v.factsAsOf && v.totalBytes !== null ? `As of the last successful backup (${timeAgo(v.factsAsOf)})` : undefined}>{optionalBytes(v.totalBytes)}</td>
@@ -1115,6 +1128,19 @@
               {#if storageNode && storageNodeAvailability}
                 <p class="mt-2 text-xs text-amber-300">The storage node <span class="font-mono">{storageNode.hostname || `node ${storageNode.host_id}`}</span> hosting this repository appears {storageNodeAvailability}{#if storageNodeAvailability === 'offline' && storageNode.last_seen}{' '}(last seen <span class="numeric">{timeAgo(storageNode.last_seen)}</span>){/if}.{' '}Reconfigure this host to back up to a new repository; if the node's disk is recoverable, its store directory can be copied to a new destination to keep this history.</p>
               {/if}
+            {/if}
+            {#if v.checkSuccess === false && v.checkError}
+              {@const condensedCheckError = condenseCheckError(v.checkError)}
+              <div class="mt-3 rounded-md border border-rose-900/50 bg-rose-950/30 px-2.5 py-1.5 text-xs text-rose-300 break-words">
+                <div>Verification failed{#if v.checkLastIso}{' '}<span class="numeric">{timeAgo(v.checkLastIso)}</span>{/if}: {condensedCheckError}</div>
+                {#if condensedCheckError !== v.checkError}
+                  <details class="mt-1.5">
+                    <summary class="w-fit cursor-pointer select-none text-[11px] text-zinc-500 hover:text-zinc-300">full output</summary>
+                    <pre class="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words border-t border-zinc-800/80 pt-1.5 font-mono text-[11px] text-zinc-400 select-text">{v.checkError}</pre>
+                  </details>
+                {/if}
+                <p class="mt-1.5 text-zinc-400">The backups themselves are unaffected by this; it is their integrity that could not be confirmed.</p>
+              </div>
             {/if}
           </section>
         {/each}

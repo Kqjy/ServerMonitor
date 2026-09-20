@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,10 +199,14 @@ func isJournalPermissionHint(line string) bool {
 
 func (s *sshdSource) handleJournalLine(line []byte) {
 	var entry struct {
-		Message   json.RawMessage `json:"MESSAGE"`
-		Timestamp string          `json:"__REALTIME_TIMESTAMP"`
+		Message    json.RawMessage `json:"MESSAGE"`
+		Timestamp  string          `json:"__REALTIME_TIMESTAMP"`
+		Identifier string          `json:"SYSLOG_IDENTIFIER"`
 	}
 	if err := json.Unmarshal(line, &entry); err != nil {
+		return
+	}
+	if entry.Identifier != "sshd" && entry.Identifier != "sshd-session" {
 		return
 	}
 	var message string
@@ -266,7 +271,7 @@ func (s *sshdSource) runFile(ctx context.Context) (string, string) {
 
 func (s *sshdSource) tailFile(ctx context.Context, path string, f *os.File) (string, string) {
 	defer func() { _ = f.Close() }()
-	pos, err := f.Seek(0, io.SeekEnd)
+	latest, seenAtLatest, pos, err := seedFileCursor(f, s.now())
 	if err != nil {
 		return sourceError, path + ": " + err.Error()
 	}
@@ -286,8 +291,8 @@ func (s *sshdSource) tailFile(ctx context.Context, path string, f *os.File) (str
 				}
 				line := string(pending[:i])
 				pending = pending[i+1:]
-				if message, ok := StripSyslogPrefix(line); ok {
-					s.handleMessage(message, s.now())
+				if message, at, ok := ParseSyslogLine(line, s.now()); ok && acceptFileLine(line, at, &latest, &seenAtLatest) {
+					s.handleMessage(message, at)
 				}
 			}
 			if len(pending) > 1<<20 {
@@ -324,6 +329,64 @@ func (s *sshdSource) tailFile(ctx context.Context, path string, f *os.File) (str
 		f = nf
 		pos = 0
 		pending = pending[:0]
+	}
+}
+
+const fileSeedBytes = 2 << 20
+
+func seedFileCursor(f *os.File, now time.Time) (time.Time, map[[sha256.Size]byte]struct{}, int64, error) {
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return time.Time{}, nil, 0, err
+	}
+	start := end - fileSeedBytes
+	if start < 0 {
+		start = 0
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return time.Time{}, nil, 0, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, fileSeedBytes))
+	if err != nil {
+		return time.Time{}, nil, 0, err
+	}
+	if start > 0 {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		} else {
+			data = nil
+		}
+	}
+	var latest time.Time
+	seen := make(map[[sha256.Size]byte]struct{})
+	for _, raw := range bytes.Split(data, []byte{'\n'}) {
+		line := string(raw)
+		_, at, ok := ParseSyslogLine(line, now)
+		if ok {
+			acceptFileLine(line, at, &latest, &seen)
+		}
+	}
+	if _, err := f.Seek(end, io.SeekStart); err != nil {
+		return time.Time{}, nil, 0, err
+	}
+	return latest, seen, end, nil
+}
+
+func acceptFileLine(line string, at time.Time, latest *time.Time, seen *map[[sha256.Size]byte]struct{}) bool {
+	digest := sha256.Sum256([]byte(line))
+	switch {
+	case at.Before(*latest):
+		return false
+	case at.Equal(*latest):
+		if _, duplicate := (*seen)[digest]; duplicate {
+			return false
+		}
+		(*seen)[digest] = struct{}{}
+		return true
+	default:
+		*latest = at
+		*seen = map[[sha256.Size]byte]struct{}{digest: {}}
+		return true
 	}
 }
 

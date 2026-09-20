@@ -115,6 +115,13 @@ func ParseAllowlist(entries []string) ([]netip.Prefix, []string) {
 	var bad []string
 	for _, e := range entries {
 		if p, err := netip.ParsePrefix(e); err == nil {
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					bad = append(bad, e)
+					continue
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			out = append(out, p.Masked())
 			continue
 		}

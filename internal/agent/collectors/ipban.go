@@ -10,6 +10,7 @@ import (
 
 type IPBanSource interface {
 	Report() *wire.IPBanReport
+	AcknowledgeEvents([]wire.IPBanEvent)
 	Status() wire.CollectorStatus
 	Points(now time.Time) []wire.Point
 }
@@ -60,4 +61,11 @@ func (c *ipbanCollector) CollectIPBan(context.Context) *wire.IPBanReport {
 		return nil
 	}
 	return src.Report()
+}
+
+func (c *ipbanCollector) AcknowledgeIPBan(events []wire.IPBanEvent) {
+	src := c.current()
+	if src != nil {
+		src.AcknowledgeEvents(events)
+	}
 }

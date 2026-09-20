@@ -7,7 +7,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
+
+const staleUploadAge = 24 * time.Hour
 
 type diskStore struct {
 	root string
@@ -17,7 +21,30 @@ func NewDiskStore(root string) (*diskStore, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	return &diskStore{root: root}, nil
+	d := &diskStore{root: root}
+	d.sweepStaleUploads(time.Now().Add(-staleUploadAge))
+	return d, nil
+}
+
+func isUploadTemp(name string) bool {
+	return strings.HasPrefix(name, uploadTempPrefix)
+}
+
+func (d *diskStore) sweepStaleUploads(before time.Time) {
+	_ = filepath.WalkDir(d.root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if entry.IsDir() || !isUploadTemp(entry.Name()) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(before) {
+			return nil
+		}
+		_ = os.Remove(path)
+		return nil
+	})
 }
 
 func (d *diskStore) Backend() BackendInfo {
@@ -70,7 +97,7 @@ func (d *diskStore) Create(ctx context.Context, repo, typ, name string, size int
 		return err
 	}
 	if _, err := os.Lstat(path); err == nil {
-		return ErrExists
+		return d.duplicateResult(path, typ, name, r, size)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -78,17 +105,12 @@ func (d *diskStore) Create(ctx context.Context, repo, typ, name string, size int
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".upload-*")
+	tmp, err := os.CreateTemp(dir, uploadTempPrefix+"*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmpName)
-		}
-	}()
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := io.Copy(tmp, r); err != nil {
 		_ = tmp.Close()
 		return err
@@ -101,17 +123,37 @@ func (d *diskStore) Create(ctx context.Context, repo, typ, name string, size int
 		return err
 	}
 	if err := os.Link(tmpName, path); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return ErrExists
-		}
 		if _, statErr := os.Lstat(path); statErr == nil {
+			return d.duplicateResultFromFile(path, typ, name, tmpName, size)
+		}
+		if errors.Is(err, os.ErrExist) {
 			return ErrExists
 		}
 		return fmt.Errorf("commit backup object: %w", err)
 	}
-	committed = false
 	syncDir(dir)
 	return nil
+}
+
+func (d *diskStore) duplicateResult(path, typ, name string, incoming io.Reader, size int64) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return existsUnverified(err)
+	}
+	return classifyDuplicate(typ, name, incoming, size, existingObject{
+		size:               fi.Size(),
+		verifyStoredDigest: true,
+		open:               func() (io.ReadCloser, error) { return os.Open(path) },
+	})
+}
+
+func (d *diskStore) duplicateResultFromFile(path, typ, name, incomingPath string, size int64) error {
+	f, err := os.Open(incomingPath)
+	if err != nil {
+		return existsUnverified(err)
+	}
+	defer f.Close()
+	return d.duplicateResult(path, typ, name, f, size)
 }
 
 func (d *diskStore) Open(ctx context.Context, repo, typ, name string) (io.ReadSeekCloser, int64, error) {
@@ -176,6 +218,9 @@ func (d *diskStore) List(ctx context.Context, repo, typ string) ([]BlobInfo, err
 				return nil, err
 			}
 			for _, e := range entries {
+				if e.IsDir() || isUploadTemp(e.Name()) {
+					continue
+				}
 				info, err := e.Info()
 				if err != nil {
 					return nil, err
@@ -193,7 +238,7 @@ func (d *diskStore) List(ctx context.Context, repo, typ string) ([]BlobInfo, err
 		return nil, err
 	}
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || isUploadTemp(e.Name()) {
 			continue
 		}
 		info, err := e.Info()
@@ -238,7 +283,7 @@ func (d *diskStore) RepoUsage(ctx context.Context, repo string) (int64, error) {
 			}
 			return walkErr
 		}
-		if entry.IsDir() {
+		if entry.IsDir() || isUploadTemp(entry.Name()) {
 			return nil
 		}
 		info, err := entry.Info()
@@ -267,7 +312,7 @@ func (d *diskStore) RepoHasObjects(ctx context.Context, repo string) (bool, erro
 			}
 			return walkErr
 		}
-		if entry.IsDir() {
+		if entry.IsDir() || isUploadTemp(entry.Name()) {
 			return nil
 		}
 		found = true

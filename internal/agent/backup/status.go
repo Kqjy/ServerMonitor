@@ -45,6 +45,7 @@ type RepoStatus struct {
 	SnapshotCount int64      `json:"snapshot_count,omitempty"`
 	CheckLast     *time.Time `json:"check_last,omitempty"`
 	CheckSuccess  *bool      `json:"check_success,omitempty"`
+	CheckError    string     `json:"check_error,omitempty"`
 	Tunnel        bool       `json:"tunnel,omitempty"`
 	Paths         []string   `json:"paths,omitempty"`
 	Excludes      []string   `json:"excludes,omitempty"`
@@ -197,6 +198,7 @@ func mergeStatus(existing StatusFile, updates []RepoStatus) StatusFile {
 		if prev, ok := previous[update.Name]; ok {
 			update.CheckLast = prev.CheckLast
 			update.CheckSuccess = prev.CheckSuccess
+			update.CheckError = prev.CheckError
 			if !update.Success {
 				update.LastSuccess = prev.LastSuccess
 				if update.SnapshotCount == 0 {

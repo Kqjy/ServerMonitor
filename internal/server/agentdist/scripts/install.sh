@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SERVER_URL='__SERVER_URL__'
-CANONICAL_INSTALLER_SHA256='3a55057c3cf67d09a9cff7c5ecbc2fe4996c3561db149795649998fc83b68665'
+CANONICAL_INSTALLER_SHA256='a149facf0c3295abc9ed089c6c596b0003ba7b6695d8e449aa091a0fafb67eb7'
 TOKEN="${SM_TOKEN:-}"
 DOWNLOADED_SERVER_PUBKEY=""
 INTERVAL="${SM_INTERVAL:-10}"
@@ -148,6 +148,21 @@ pin_agent_signing_pubkey() {
     printf '%s\n' "$configured" > "$pin"
     chown root:root "$pin"
     chmod 0400 "$pin"
+}
+
+set_agent_config_bool() {
+    local key="$1" value="$2" rendered=false tmp
+    [ "$value" = "1" ] && rendered=true
+    tmp="$(mktemp /etc/servermonitor/agent.toml.XXXXXX)"
+    awk -v key="$key" -v value="$rendered" '
+      BEGIN { found = 0 }
+      $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print key " = " value; found = 1; next }
+      { print }
+      END { if (!found) print key " = " value }
+    ' /etc/servermonitor/agent.toml > "$tmp"
+    chown sm-agent:sm-agent "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" /etc/servermonitor/agent.toml
 }
 
 write_privileged_sync_units() {
@@ -1084,11 +1099,13 @@ server_pubkey = "$DOWNLOADED_SERVER_PUBKEY"
 interval_s = $INTERVAL
 spool_path = "/var/lib/servermonitor/spool.db"
 insecure_skip_verify = $INSECURE_LINE
+enable_ipban = false
 EOF
 chmod 0600 "$TMP_CFG"
 chown sm-agent:sm-agent "$TMP_CFG"
 mv -f "$TMP_CFG" /etc/servermonitor/agent.toml
 fi
+set_agent_config_bool enable_ipban "$ENABLE_IPBAN"
 
 pin_agent_signing_pubkey
 write_privileged_sync_units

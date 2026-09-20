@@ -221,3 +221,18 @@ func userFromContext(ctx context.Context) (auth.User, bool) {
 	u, ok := ctx.Value(ctxUser).(auth.User)
 	return u, ok
 }
+
+func requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, ok := userFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "not authenticated")
+			return
+		}
+		if u.Role != "admin" {
+			writeError(w, http.StatusForbidden, "admin role required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

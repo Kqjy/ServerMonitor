@@ -75,6 +75,21 @@ func TestGuardAllowlistAndLocal(t *testing.T) {
 	}
 }
 
+func TestMappedIPv6AllowlistPrefixMatchesIPv4(t *testing.T) {
+	prefixes, bad := ParseAllowlist([]string{"::ffff:203.0.113.0/120", "::ffff:198.51.100.1/80"})
+	if len(bad) != 1 || bad[0] != "::ffff:198.51.100.1/80" {
+		t.Fatalf("bad = %v", bad)
+	}
+	if len(prefixes) != 1 || prefixes[0].String() != "203.0.113.0/24" {
+		t.Fatalf("prefixes = %v", prefixes)
+	}
+	g := NewGuard()
+	g.SetAllowlist(prefixes)
+	if reason, ok := g.Protected(netip.MustParseAddr("203.0.113.77")); !ok || reason != "allowlisted" {
+		t.Fatalf("mapped prefix did not protect IPv4 address: %q %v", reason, ok)
+	}
+}
+
 func TestIsRoutable(t *testing.T) {
 	for _, addr := range []string{"10.0.0.1", "127.0.0.1", "fe80::1", "100.64.1.1", "::"} {
 		if IsRoutable(netip.MustParseAddr(addr)) {

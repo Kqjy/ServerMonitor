@@ -167,13 +167,14 @@ func (r *Runner) tick(ctx context.Context) {
 	defer cancel()
 
 	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		procs []wire.Process
-		conts []wire.Container
-		ports []wire.Port
-		baks  []wire.BackupRepoStatus
-		bans  *wire.IPBanReport
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		procs  []wire.Process
+		conts  []wire.Container
+		ports  []wire.Port
+		baks   []wire.BackupRepoStatus
+		bans   *wire.IPBanReport
+		banAck collectors.IPBanAcknowledger
 	)
 
 	for _, c := range r.collectors {
@@ -229,6 +230,7 @@ func (r *Runner) tick(ctx context.Context) {
 				if report := ir.CollectIPBan(tickCtx); report != nil {
 					mu.Lock()
 					bans = report
+					banAck, _ = col.(collectors.IPBanAcknowledger)
 					mu.Unlock()
 				}
 			}
@@ -243,7 +245,7 @@ func (r *Runner) tick(ctx context.Context) {
 	batch.Backups = baks
 	batch.IPBan = bans
 
-	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(baks) == 0 && (bans == nil || len(bans.Events) == 0) {
+	if len(batch.Points) == 0 && len(procs) == 0 && len(conts) == 0 && len(ports) == 0 && len(baks) == 0 && bans == nil {
 		return
 	}
 
@@ -252,6 +254,9 @@ func (r *Runner) tick(ctx context.Context) {
 	if err := r.client.Send(sendCtx, batch); err != nil {
 		r.logger.Error("send failed", "err", err, "points", len(batch.Points))
 		return
+	}
+	if banAck != nil && bans != nil && len(bans.Events) > 0 {
+		banAck.AcknowledgeIPBan(bans.Events)
 	}
 	r.logger.Debug("send ok", "points", len(batch.Points), "procs", len(procs), "containers", len(conts), "ports", len(ports), "backups", len(baks))
 }
